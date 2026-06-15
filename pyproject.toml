@@ -1,0 +1,25 @@
+[project]
+name = "stl-to-gcode"
+version = "0.1.0"
+description = "Gradio app for slicing STL files into TIFF image stacks."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "gradio>=5.23.0",
+    "matplotlib>=3.11.0",
+    "networkx>=3.4.2",
+    "numpy>=2.2.0",
+    "pillow>=11.1.0",
+    "plotly>=6.7.0",
+    "scipy>=1.15.2",
+    "shapely>=2.0.7",
+    "trimesh>=4.6.5",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.5",
+]
+
+[tool.uv]
+package = false
