@@ -41,7 +41,7 @@ Then open the local Gradio URL in your browser, upload STL files or load the bun
 - Loads bundled sample STL files
 - Shows interactive 3D viewers for rotating each model
 - Shows model extents, face count, vertex count, and watertight status
-- Optionally scales loaded STLs per shape, either by fitting target X/Y/Z dimensions or by applying one uniform scale factor to all axes
+- Optionally scales loaded STLs per shape, either with independent target X/Y/Z dimensions or by keeping proportions while target dimensions update together
 - Lets you choose layer height and XY pixel size
 - Produces one `.tif` image per slice
 - Encodes material as black (`0`) and empty space as white (`255`) in each TIFF slice

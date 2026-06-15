@@ -41,9 +41,9 @@ ViewerState = dict[str, Any]
 SAMPLE_STL_FILENAMES = ("Hollow_Pyramid.stl", "Rounded_Cube_Through_Holes.stl", "halfsphere.stl")
 SAMPLE_STL_DIR = Path(__file__).resolve().parent / "sample_stls"
 DEFAULT_TARGET_EXTENTS = (20.0, 20.0, 20.0)
-DEFAULT_UNIFORM_SCALE = 1.0
-SCALE_MODE_TARGET_DIMENSIONS = "Fit X/Y/Z Targets"
-SCALE_MODE_UNIFORM_FACTOR = "Uniform Scale Factor"
+UNIFORM_TARGET_AXES = ("X", "Y", "Z")
+SCALE_MODE_TARGET_DIMENSIONS = "Independent X/Y/Z"
+SCALE_MODE_UNIFORM_FACTOR = "Keep Proportions"
 FRONT_CAMERA = (90, 80, None)
 APP_CSS = """
 .gradio-container {
@@ -979,21 +979,40 @@ def _resolve_target_extents(
     return (target[0], target[1], target[2])
 
 
-def _resolve_uniform_scale(
+def _axis_index(axis: str | None) -> int:
+    normalized = (axis or "X").upper()
+    if normalized not in UNIFORM_TARGET_AXES:
+        raise ValueError("Uniform target side must be X, Y, or Z.")
+    return UNIFORM_TARGET_AXES.index(normalized)
+
+
+def _resolve_uniform_scale_from_targets(
+    mesh: trimesh.Trimesh,
     scale_to_target: bool | None,
-    uniform_scale: float | None,
+    target_x: float | None,
+    target_y: float | None,
+    target_z: float | None,
+    anchor_axis: str | None = "X",
 ) -> float | None:
     if not scale_to_target:
         return None
 
-    if uniform_scale is None:
-        raise ValueError("Uniform scale factor is required when uniform STL scaling is enabled.")
+    targets = (target_x, target_y, target_z)
+    anchor_index = _axis_index(anchor_axis)
+    target_size = targets[anchor_index]
+    if target_size is None:
+        raise ValueError("Target side length is required when uniform STL scaling is enabled.")
 
-    scale = float(uniform_scale)
-    if not math.isfinite(scale) or scale <= 0:
-        raise ValueError("Uniform scale factor must be greater than zero.")
+    target_size = float(target_size)
+    if not math.isfinite(target_size) or target_size <= 0:
+        raise ValueError("Target side length must be greater than zero.")
 
-    return scale
+    current_size = float(mesh.extents[anchor_index])
+    if current_size <= 0:
+        axis = UNIFORM_TARGET_AXES[anchor_index]
+        raise ValueError(f"Cannot scale uniformly from a zero-sized {axis} extent.")
+
+    return target_size / current_size
 
 
 def _normalize_scale_mode(scale_mode: str | None) -> str:
@@ -1020,14 +1039,6 @@ def _shape_target_values(
     )
 
 
-def _shape_uniform_values(
-    uniform1: float | None,
-    uniform2: float | None,
-    uniform3: float | None,
-) -> tuple[float | None, float | None, float | None]:
-    return (uniform1, uniform2, uniform3)
-
-
 def _resolve_mesh_scale_factors(
     mesh: trimesh.Trimesh,
     scale_to_target: bool | None,
@@ -1035,19 +1046,58 @@ def _resolve_mesh_scale_factors(
     target_x: float | None,
     target_y: float | None,
     target_z: float | None,
-    uniform_scale: float | None,
 ) -> tuple[float, float, float] | None:
     if not scale_to_target:
         return None
 
     if _normalize_scale_mode(scale_mode) == SCALE_MODE_UNIFORM_FACTOR:
-        scale = _resolve_uniform_scale(True, uniform_scale)
+        scale = _resolve_uniform_scale_from_targets(
+            mesh,
+            True,
+            target_x,
+            target_y,
+            target_z,
+            anchor_axis="X",
+        )
         return (scale, scale, scale)
 
     target_extents = _resolve_target_extents(True, target_x, target_y, target_z)
     if target_extents is None:
         return None
     return scale_factors_for_target_extents(mesh, target_extents)
+
+
+def _uniform_target_extents_from_anchor(
+    mesh: trimesh.Trimesh,
+    anchor_axis: str | None,
+    target_x: float | None,
+    target_y: float | None,
+    target_z: float | None,
+) -> tuple[float, float, float]:
+    scale = _resolve_uniform_scale_from_targets(
+        mesh,
+        True,
+        target_x,
+        target_y,
+        target_z,
+        anchor_axis=anchor_axis,
+    )
+    extents = np.asarray(mesh.extents, dtype=float)
+    return (
+        float(extents[0] * scale),
+        float(extents[1] * scale),
+        float(extents[2] * scale),
+    )
+
+
+def _dimension_update(current: float | None, target: float) -> dict[str, Any]:
+    rounded = round(float(target), 6)
+    try:
+        if current is not None and math.isclose(float(current), rounded, rel_tol=1e-9, abs_tol=1e-6):
+            return gr.update()
+    except (TypeError, ValueError):
+        pass
+    return gr.update(value=rounded)
 
 
 def _load_model_mesh(
@@ -1057,7 +1107,6 @@ def _load_model_mesh(
     target_x: float | None = DEFAULT_TARGET_EXTENTS[0],
     target_y: float | None = DEFAULT_TARGET_EXTENTS[1],
     target_z: float | None = DEFAULT_TARGET_EXTENTS[2],
-    uniform_scale: float | None = DEFAULT_UNIFORM_SCALE,
 ) -> tuple[trimesh.Trimesh, tuple[float, float, float]]:
     mesh = load_mesh(stl_file)
     scale_factors = _resolve_mesh_scale_factors(
@@ -1067,7 +1116,6 @@ def _load_model_mesh(
         target_x,
         target_y,
         target_z,
-        uniform_scale,
     )
     if scale_factors is None:
         return mesh, (1.0, 1.0, 1.0)
@@ -1076,6 +1124,55 @@ def _load_model_mesh(
 
 def _viewer_update(model_path: str | None) -> dict[str, Any]:
     return gr.update(value=model_path, camera_position=FRONT_CAMERA)
+
+
+def update_scaling_controls_visibility(
+    scale_to_target: bool | None,
+    scale_mode: str | None,
+) -> tuple[dict[str, Any], ...]:
+    enabled = bool(scale_to_target)
+
+    return (
+        gr.update(visible=enabled),
+        gr.update(visible=enabled),
+        gr.update(visible=enabled),
+        gr.update(visible=enabled),
+    )
+
+
+def sync_uniform_target_dimensions(
+    stl_file: str | None,
+    scale_to_target: bool | None,
+    scale_mode: str | None,
+    changed_axis: str,
+    target_x: float | None,
+    target_y: float | None,
+    target_z: float | None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    if (
+        not stl_file
+        or not scale_to_target
+        or _normalize_scale_mode(scale_mode) != SCALE_MODE_UNIFORM_FACTOR
+    ):
+        return gr.update(), gr.update(), gr.update()
+
+    try:
+        mesh = load_mesh(stl_file)
+        x_value, y_value, z_value = _uniform_target_extents_from_anchor(
+            mesh,
+            changed_axis,
+            target_x,
+            target_y,
+            target_z,
+        )
+    except Exception:
+        return gr.update(), gr.update(), gr.update()
+
+    return (
+        _dimension_update(target_x, x_value),
+        _dimension_update(target_y, y_value),
+        _dimension_update(target_z, z_value),
+    )
 
 
 def _build_annotated_scene(mesh: trimesh.Trimesh, opacity: float = 1.0) -> str:
@@ -1203,7 +1300,6 @@ def load_single_model(
     target_x: float | None = DEFAULT_TARGET_EXTENTS[0],
     target_y: float | None = DEFAULT_TARGET_EXTENTS[1],
     target_z: float | None = DEFAULT_TARGET_EXTENTS[2],
-    uniform_scale: float | None = DEFAULT_UNIFORM_SCALE,
 ) -> tuple[str | None, str]:
     if not stl_file:
         return _viewer_update(None), "No model loaded."
@@ -1214,7 +1310,6 @@ def load_single_model(
         target_x=target_x,
         target_y=target_y,
         target_z=target_z,
-        uniform_scale=uniform_scale,
     )
     glb_path = _build_annotated_scene(mesh, opacity=_resolve_model_opacity(opacity))
     return _viewer_update(glb_path), _format_model_details(Path(stl_file).name, mesh, scale_factors)
@@ -1227,15 +1322,12 @@ def preload_sample_models(
     target1_x: float | None = DEFAULT_TARGET_EXTENTS[0],
     target1_y: float | None = DEFAULT_TARGET_EXTENTS[1],
     target1_z: float | None = DEFAULT_TARGET_EXTENTS[2],
-    uniform1: float | None = DEFAULT_UNIFORM_SCALE,
     target2_x: float | None = DEFAULT_TARGET_EXTENTS[0],
     target2_y: float | None = DEFAULT_TARGET_EXTENTS[1],
     target2_z: float | None = DEFAULT_TARGET_EXTENTS[2],
-    uniform2: float | None = DEFAULT_UNIFORM_SCALE,
     target3_x: float | None = DEFAULT_TARGET_EXTENTS[0],
     target3_y: float | None = DEFAULT_TARGET_EXTENTS[1],
     target3_z: float | None = DEFAULT_TARGET_EXTENTS[2],
-    uniform3: float | None = DEFAULT_UNIFORM_SCALE,
 ) -> tuple:
     outputs: list[Any] = []
     resolved_opacity = _resolve_model_opacity(opacity)
@@ -1250,7 +1342,6 @@ def preload_sample_models(
         target3_y,
         target3_z,
     )
-    uniform_values = _shape_uniform_values(uniform1, uniform2, uniform3)
 
     for index, filename in enumerate(SAMPLE_STL_FILENAMES):
         stl_path = SAMPLE_STL_DIR / filename
@@ -1270,7 +1361,6 @@ def preload_sample_models(
                 target_x=target_values[index][0],
                 target_y=target_values[index][1],
                 target_z=target_values[index][2],
-                uniform_scale=uniform_values[index],
             )
         except Exception as exc:
             outputs.extend([
@@ -1299,15 +1389,12 @@ def refresh_all_model_viewers(
     target1_x: float | None = DEFAULT_TARGET_EXTENTS[0],
     target1_y: float | None = DEFAULT_TARGET_EXTENTS[1],
     target1_z: float | None = DEFAULT_TARGET_EXTENTS[2],
-    uniform1: float | None = DEFAULT_UNIFORM_SCALE,
     target2_x: float | None = DEFAULT_TARGET_EXTENTS[0],
     target2_y: float | None = DEFAULT_TARGET_EXTENTS[1],
     target2_z: float | None = DEFAULT_TARGET_EXTENTS[2],
-    uniform2: float | None = DEFAULT_UNIFORM_SCALE,
     target3_x: float | None = DEFAULT_TARGET_EXTENTS[0],
     target3_y: float | None = DEFAULT_TARGET_EXTENTS[1],
     target3_z: float | None = DEFAULT_TARGET_EXTENTS[2],
-    uniform3: float | None = DEFAULT_UNIFORM_SCALE,
 ) -> tuple:
     outputs: list[Any] = []
     resolved_opacity = _resolve_model_opacity(opacity)
@@ -1322,9 +1409,8 @@ def refresh_all_model_viewers(
         target3_y,
         target3_z,
     )
-    uniform_values = _shape_uniform_values(uniform1, uniform2, uniform3)
 
-    for stl_file, values, uniform_scale in zip((stl1, stl2, stl3), target_values, uniform_values):
+    for stl_file, values in zip((stl1, stl2, stl3), target_values):
         if not stl_file:
             outputs.extend([_viewer_update(None), "No model loaded."])
             continue
@@ -1337,7 +1423,6 @@ def refresh_all_model_viewers(
                 values[0],
                 values[1],
                 values[2],
-                uniform_scale,
             )
         )
     return tuple(outputs)
@@ -1354,15 +1439,12 @@ def generate_all_stacks(
     target1_x: float | None = DEFAULT_TARGET_EXTENTS[0],
     target1_y: float | None = DEFAULT_TARGET_EXTENTS[1],
     target1_z: float | None = DEFAULT_TARGET_EXTENTS[2],
-    uniform1: float | None = DEFAULT_UNIFORM_SCALE,
     target2_x: float | None = DEFAULT_TARGET_EXTENTS[0],
     target2_y: float | None = DEFAULT_TARGET_EXTENTS[1],
     target2_z: float | None = DEFAULT_TARGET_EXTENTS[2],
-    uniform2: float | None = DEFAULT_UNIFORM_SCALE,
     target3_x: float | None = DEFAULT_TARGET_EXTENTS[0],
     target3_y: float | None = DEFAULT_TARGET_EXTENTS[1],
     target3_z: float | None = DEFAULT_TARGET_EXTENTS[2],
-    uniform3: float | None = DEFAULT_UNIFORM_SCALE,
     progress: gr.Progress = gr.Progress(),
 ):
     files = [stl1, stl2, stl3]
@@ -1377,12 +1459,11 @@ def generate_all_stacks(
         target3_y,
         target3_z,
     )
-    uniform_values = _shape_uniform_values(uniform1, uniform2, uniform3)
     valid_count = max(1, sum(1 for f in files if f))
     results: list = []
     completed = 0
 
-    for stl_file, values, uniform_scale in zip(files, target_values, uniform_values):
+    for stl_file, values in zip(files, target_values):
         if not stl_file:
             results.extend([
                 _empty_state(),
@@ -1411,7 +1492,6 @@ def generate_all_stacks(
                 values[0],
                 values[1],
                 values[2],
-                uniform_scale,
             )
 
         stack = slice_stl_to_tiffs(
@@ -1930,7 +2010,7 @@ def build_demo() -> gr.Blocks:
             gr.Markdown(
                 """
                 # STL to TIFF Slicer
-                Upload up to three STL files, choose per-shape STL dimensions, layer height, and XY pixel size, then generate TIFF stacks for all uploaded models.
+                Upload up to three STL files, optionally scale each shape, choose layer height and XY pixel size, then generate TIFF stacks for all uploaded models.
                 """
             )
 
@@ -1950,24 +2030,27 @@ def build_demo() -> gr.Blocks:
                     )
                 with gr.Column(scale=0, min_width=260):
                     scale_to_target = gr.Checkbox(
-                        label="Apply STL Scaling",
+                        label="Scale STLs",
                         value=False,
                     )
-                with gr.Column(scale=0, min_width=260):
-                    scale_mode = gr.Radio(
-                        choices=[SCALE_MODE_TARGET_DIMENSIONS, SCALE_MODE_UNIFORM_FACTOR],
-                        value=SCALE_MODE_TARGET_DIMENSIONS,
-                        label="Scaling Mode",
-                    )
+
+            with gr.Group(visible=False) as scaling_details_group:
+                with gr.Row():
+                    with gr.Column(scale=0, min_width=260):
+                        scale_mode = gr.Radio(
+                            choices=[SCALE_MODE_TARGET_DIMENSIONS, SCALE_MODE_UNIFORM_FACTOR],
+                            value=SCALE_MODE_TARGET_DIMENSIONS,
+                            label="Scaling Mode",
+                        )
 
             # --- Upload + 3D viewer row ---
             stl_files: list[gr.File] = []
             model_viewers: list[gr.Model3D] = []
             model_details_list: list[gr.Markdown] = []
+            target_groups: list[gr.Group] = []
             target_xs: list[gr.Number] = []
             target_ys: list[gr.Number] = []
             target_zs: list[gr.Number] = []
-            uniform_scales: list[gr.Number] = []
 
             with gr.Row():
                 for i in range(3):
@@ -1985,38 +2068,33 @@ def build_demo() -> gr.Blocks:
                             height=270,
                         )
                         model_details = gr.Markdown(f"No model {i + 1} loaded.")
-                        with gr.Row():
-                            target_x = gr.Number(
-                                label="Target X (mm)",
-                                value=DEFAULT_TARGET_EXTENTS[0],
-                                minimum=0.0001,
-                                step=0.1,
-                            )
-                            target_y = gr.Number(
-                                label="Target Y (mm)",
-                                value=DEFAULT_TARGET_EXTENTS[1],
-                                minimum=0.0001,
-                                step=0.1,
-                            )
-                            target_z = gr.Number(
-                                label="Target Z (mm)",
-                                value=DEFAULT_TARGET_EXTENTS[2],
-                                minimum=0.0001,
-                                step=0.1,
-                            )
-                        uniform_scale = gr.Number(
-                            label="Uniform Scale",
-                            value=DEFAULT_UNIFORM_SCALE,
-                            minimum=0.0001,
-                            step=0.01,
-                        )
+                        with gr.Group(visible=False) as target_group:
+                            with gr.Row():
+                                target_x = gr.Number(
+                                    label="Target X (mm)",
+                                    value=DEFAULT_TARGET_EXTENTS[0],
+                                    minimum=0.0001,
+                                    step=0.1,
+                                )
+                                target_y = gr.Number(
+                                    label="Target Y (mm)",
+                                    value=DEFAULT_TARGET_EXTENTS[1],
+                                    minimum=0.0001,
+                                    step=0.1,
+                                )
+                                target_z = gr.Number(
+                                    label="Target Z (mm)",
+                                    value=DEFAULT_TARGET_EXTENTS[2],
+                                    minimum=0.0001,
+                                    step=0.1,
+                                )
                         stl_files.append(stl_file)
                         model_viewers.append(model_viewer)
                         model_details_list.append(model_details)
+                        target_groups.append(target_group)
                         target_xs.append(target_x)
                         target_ys.append(target_y)
                         target_zs.append(target_z)
-                        uniform_scales.append(uniform_scale)
 
             # --- Shared slicing controls ---
             with gr.Row():
@@ -2140,15 +2218,12 @@ def build_demo() -> gr.Blocks:
                 target_xs[0],
                 target_ys[0],
                 target_zs[0],
-                uniform_scales[0],
                 target_xs[1],
                 target_ys[1],
                 target_zs[1],
-                uniform_scales[1],
                 target_xs[2],
                 target_ys[2],
                 target_zs[2],
-                uniform_scales[2],
             ]
 
             for i in range(3):
@@ -2162,7 +2237,6 @@ def build_demo() -> gr.Blocks:
                         target_xs[i],
                         target_ys[i],
                         target_zs[i],
-                        uniform_scales[i],
                     ],
                     outputs=[model_viewers[i], model_details_list[i]],
                 )
@@ -2186,7 +2260,7 @@ def build_demo() -> gr.Blocks:
                     model_details_list[i],
                 ])
 
-            load_samples_button.click(
+            sample_load_event = load_samples_button.click(
                 fn=preload_sample_models,
                 inputs=[model_opacity, scale_to_target, scale_mode, *all_scale_inputs],
                 outputs=preload_outputs,
@@ -2211,7 +2285,90 @@ def build_demo() -> gr.Blocks:
                 inputs=refresh_inputs,
                 outputs=refresh_outputs,
             )
-            for scale_control in (scale_to_target, scale_mode, *all_scale_inputs):
+
+            visibility_outputs = [scaling_details_group, *target_groups]
+            scale_to_target.change(
+                fn=update_scaling_controls_visibility,
+                inputs=[scale_to_target, scale_mode],
+                outputs=visibility_outputs,
+                queue=False,
+            )
+            scale_mode.change(
+                fn=update_scaling_controls_visibility,
+                inputs=[scale_to_target, scale_mode],
+                outputs=visibility_outputs,
+                queue=False,
+            )
+            for i, stl_file in enumerate(stl_files):
+                target_xs[i].change(
+                    fn=lambda stl, enabled, mode, x, y, z: sync_uniform_target_dimensions(
+                        stl, enabled, mode, "X", x, y, z
+                    ),
+                    inputs=[stl_file, scale_to_target, scale_mode, target_xs[i], target_ys[i], target_zs[i]],
+                    outputs=[target_xs[i], target_ys[i], target_zs[i]],
+                    queue=False,
+                ).then(
+                    fn=refresh_all_model_viewers,
+                    inputs=refresh_inputs,
+                    outputs=refresh_outputs,
+                )
+                target_ys[i].change(
+                    fn=lambda stl, enabled, mode, x, y, z: sync_uniform_target_dimensions(
+                        stl, enabled, mode, "Y", x, y, z
+                    ),
+                    inputs=[stl_file, scale_to_target, scale_mode, target_xs[i], target_ys[i], target_zs[i]],
+                    outputs=[target_xs[i], target_ys[i], target_zs[i]],
+                    queue=False,
+                ).then(
+                    fn=refresh_all_model_viewers,
+                    inputs=refresh_inputs,
+                    outputs=refresh_outputs,
+                )
+                target_zs[i].change(
+                    fn=lambda stl, enabled, mode, x, y, z: sync_uniform_target_dimensions(
+                        stl, enabled, mode, "Z", x, y, z
+                    ),
+                    inputs=[stl_file, scale_to_target, scale_mode, target_xs[i], target_ys[i], target_zs[i]],
+                    outputs=[target_xs[i], target_ys[i], target_zs[i]],
+                    queue=False,
+                ).then(
+                    fn=refresh_all_model_viewers,
+                    inputs=refresh_inputs,
+                    outputs=refresh_outputs,
+                )
+                scale_to_target.change(
+                    fn=lambda stl, enabled, mode, x, y, z: sync_uniform_target_dimensions(
+                        stl, enabled, mode, "X", x, y, z
+                    ),
+                    inputs=[stl_file, scale_to_target, scale_mode, target_xs[i], target_ys[i], target_zs[i]],
+                    outputs=[target_xs[i], target_ys[i], target_zs[i]],
+                    queue=False,
+                )
+                scale_mode.change(
+                    fn=lambda stl, enabled, mode, x, y, z: sync_uniform_target_dimensions(
+                        stl, enabled, mode, "X", x, y, z
+                    ),
+                    inputs=[stl_file, scale_to_target, scale_mode, target_xs[i], target_ys[i], target_zs[i]],
+                    outputs=[target_xs[i], target_ys[i], target_zs[i]],
+                    queue=False,
+                )
+                stl_file.change(
+                    fn=lambda stl, enabled, mode, x, y, z: sync_uniform_target_dimensions(
+                        stl, enabled, mode, "X", x, y, z
+                    ),
+                    inputs=[stl_file, scale_to_target, scale_mode, target_xs[i], target_ys[i], target_zs[i]],
+                    outputs=[target_xs[i], target_ys[i], target_zs[i]],
+                    queue=False,
+                )
+                sample_load_event.then(
+                    fn=lambda stl, enabled, mode, x, y, z: sync_uniform_target_dimensions(
+                        stl, enabled, mode, "X", x, y, z
+                    ),
+                    inputs=[stl_file, scale_to_target, scale_mode, target_xs[i], target_ys[i], target_zs[i]],
+                    outputs=[target_xs[i], target_ys[i], target_zs[i]],
+                    queue=False,
+                )
+            for scale_control in (scale_to_target, scale_mode):
                 scale_control.change(
                     fn=refresh_all_model_viewers,
                     inputs=refresh_inputs,
