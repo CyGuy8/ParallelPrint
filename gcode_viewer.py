@@ -515,14 +515,15 @@ def build_toolpath_figure(
 def build_parallel_figure(
     parts: list[dict],
     gap: float = 5.0,
+    part_offsets: dict[int, tuple[float, float]] | None = None,
     filament_width: float = 0.8,
     travel_width: float = 0.2,
     travel_opacity: float = 0.2,
     print_opacity: float = 1.0,
     tube: bool = True,
 ) -> go.Figure:
-    """Render several parsed shapes side by side, offset along X so they don't
-    overlap. `tube` True draws filament tubes with a shared-time animation
+    """Render several parsed shapes with optional explicit X/Y nozzle offsets.
+    `tube` True draws filament tubes with a shared-time animation
     timeline; False draws fast thin scatter lines (no animation).
 
     `parts` is a list of {"idx": int, "color": str, "parsed": dict}. Each part's
@@ -548,8 +549,12 @@ def build_parallel_figure(
 
         (pxmin, pymin, pzmin), (pxmax, pymax, pzmax) = parsed["bounds"]
         width = pxmax - pxmin
-        x_off = running_x - pxmin
-        running_x += width + gap
+        if part_offsets is None:
+            x_off = running_x - pxmin
+            y_off = 0.0
+            running_x += width + gap
+        else:
+            x_off, y_off = part_offsets.get(idx, (0.0, 0.0))
 
         if tube:
             print_tube = _build_path_tube(moves, radius=max(filament_width, 0.05) / 2.0, kind="print")
@@ -557,13 +562,16 @@ def build_parallel_figure(
             path = _path_arrays(moves)
 
             px = [v + x_off for v in print_tube["x"]]
+            py = [v + y_off for v in print_tube["y"]]
             tx = [v + x_off for v in travel_tube["x"]]
+            ty = [v + y_off for v in travel_tube["y"]]
             path_x = [v + x_off for v in path["x"]]
+            path_y = [v + y_off for v in path["y"]]
 
             if travel_tube["i"]:
                 fig.add_trace(
                     go.Mesh3d(
-                        x=tx, y=travel_tube["y"], z=travel_tube["z"],
+                        x=tx, y=ty, z=travel_tube["z"],
                         i=travel_tube["i"], j=travel_tube["j"], k=travel_tube["k"],
                         color=color, opacity=travel_opacity, name=f"Travel {idx}",
                         showlegend=False, hoverinfo="skip",
@@ -573,7 +581,7 @@ def build_parallel_figure(
             if print_tube["i"]:
                 fig.add_trace(
                     go.Mesh3d(
-                        x=px, y=print_tube["y"], z=print_tube["z"],
+                        x=px, y=py, z=print_tube["z"],
                         i=print_tube["i"], j=print_tube["j"], k=print_tube["k"],
                         color=color, opacity=print_opacity, name=f"Shape {idx}",
                         showlegend=True, hoverinfo="skip",
@@ -582,7 +590,7 @@ def build_parallel_figure(
                 )
             fig.add_trace(
                 go.Scatter3d(
-                    x=[path_x[-1]], y=[path["y"][-1]], z=[path["z"][-1]],
+                    x=[path_x[-1]], y=[path_y[-1]], z=[path["z"][-1]],
                     mode="markers", name=f"Nozzle {idx}",
                     marker=dict(size=4, color=color), showlegend=False, hoverinfo="skip",
                 )
@@ -596,13 +604,15 @@ def build_parallel_figure(
                 "nozzleName": f"Nozzle {idx}",
                 "print_face_t": print_tube["face_t"],
                 "travel_face_t": travel_tube["face_t"],
-                "path_x": path_x, "path_y": path["y"], "path_z": path["z"], "path_t": path["t"],
+                "path_x": path_x, "path_y": path_y, "path_z": path["z"], "path_t": path["t"],
             })
         else:
             t_xs, t_ys, t_zs = _segments_to_xyz(parsed["travel_segments"])
             p_xs, p_ys, p_zs = _segments_to_xyz(parsed["print_segments"])
             t_xs = [v + x_off if v is not None else None for v in t_xs]
             p_xs = [v + x_off if v is not None else None for v in p_xs]
+            t_ys = [v + y_off if v is not None else None for v in t_ys]
+            p_ys = [v + y_off if v is not None else None for v in p_ys]
             if t_xs:
                 fig.add_trace(
                     go.Scatter3d(
@@ -623,7 +633,7 @@ def build_parallel_figure(
         rendered = True
         n_parts += 1
         bx0 = min(bx0, pxmin + x_off); bx1 = max(bx1, pxmax + x_off)
-        by0 = min(by0, pymin); by1 = max(by1, pymax)
+        by0 = min(by0, pymin + y_off); by1 = max(by1, pymax + y_off)
         bz0 = min(bz0, pzmin); bz1 = max(bz1, pzmax)
 
     if not rendered:
@@ -650,10 +660,90 @@ def build_parallel_figure(
     return fig
 
 
+def build_nozzle_spacing_figure(
+    parts: list[dict],
+    part_offsets: dict[int, tuple[float, float]],
+    spacings: list[dict],
+) -> go.Figure:
+    fig = go.Figure()
+    bx0 = by0 = float("inf")
+    bx1 = by1 = float("-inf")
+
+    for part in parts:
+        idx = part["idx"]
+        color = part["color"]
+        parsed = part["parsed"]
+        (pxmin, pymin, _), (pxmax, pymax, _) = parsed["bounds"]
+        x_off, y_off = part_offsets.get(idx, (0.0, 0.0))
+        xs = [pxmin + x_off, pxmax + x_off, pxmax + x_off, pxmin + x_off, pxmin + x_off]
+        ys = [pymin + y_off, pymin + y_off, pymax + y_off, pymax + y_off, pymin + y_off]
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="lines",
+                name=f"Shape {idx} bounds",
+                line=dict(color=color, width=2),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[x_off],
+                y=[y_off],
+                mode="markers+text",
+                name=f"Nozzle {idx}",
+                marker=dict(color=color, size=12),
+                text=[f"N{idx}"],
+                textposition="top center",
+            )
+        )
+        bx0 = min(bx0, min(xs), x_off)
+        bx1 = max(bx1, max(xs), x_off)
+        by0 = min(by0, min(ys), y_off)
+        by1 = max(by1, max(ys), y_off)
+
+    for spacing in spacings:
+        start = spacing["from"]
+        end = spacing["to"]
+        x0, y0 = part_offsets.get(start, (0.0, 0.0))
+        x1, y1 = part_offsets.get(end, (0.0, 0.0))
+        fig.add_trace(
+            go.Scatter(
+                x=[x0, x1],
+                y=[y0, y1],
+                mode="lines+markers+text",
+                name=f"Nozzle {start}->{end}",
+                line=dict(color="#444444", width=2, dash="dash"),
+                marker=dict(color="#444444", size=6),
+                text=["", f"dx {spacing['dx']:.2f}, dy {spacing['dy']:.2f}"],
+                textposition="middle right",
+            )
+        )
+
+    if bx0 == float("inf"):
+        bx0 = by0 = -1.0
+        bx1 = by1 = 1.0
+
+    pad = max(bx1 - bx0, by1 - by0, 1.0) * 0.08
+    fig.update_layout(
+        height=420,
+        uirevision="nozzle-spacing",
+        xaxis_title="X (mm)",
+        yaxis_title="Y (mm)",
+        xaxis=dict(range=[bx0 - pad, bx1 + pad], scaleanchor="y", scaleratio=1),
+        yaxis=dict(range=[by0 - pad, by1 + pad]),
+        margin=dict(l=0, r=0, t=30, b=0),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
+        title="Nozzle spacing layout",
+    )
+    return fig
+
+
 def build_parallel_gif(
     parts: list[dict],
     out_path: str | Path,
     gap: float = 5.0,
+    part_offsets: dict[int, tuple[float, float]] | None = None,
     duration: float = 6.0,
     fps: int = 10,
     travel_opacity: float = 0.15,
@@ -689,14 +779,18 @@ def build_parallel_gif(
         if not moves:
             continue
         (pxmin, pymin, pzmin), (pxmax, pymax, pzmax) = parsed["bounds"]
-        x_off = running_x - pxmin
-        running_x += (pxmax - pxmin) + gap
+        if part_offsets is None:
+            x_off = running_x - pxmin
+            y_off = 0.0
+            running_x += (pxmax - pxmin) + gap
+        else:
+            x_off, y_off = part_offsets.get(part["idx"], (0.0, 0.0))
 
         cum = 0.0
         mlist: list[tuple] = []
         for m in moves:
-            s = (m["start"][0] + x_off, m["start"][1], m["start"][2])
-            e = (m["end"][0] + x_off, m["end"][1], m["end"][2])
+            s = (m["start"][0] + x_off, m["start"][1] + y_off, m["start"][2])
+            e = (m["end"][0] + x_off, m["end"][1] + y_off, m["end"][2])
             seg_len = math.dist(s, e)
             mlist.append((m["kind"], s, e, cum, cum + seg_len))
             cum += seg_len
@@ -707,7 +801,7 @@ def build_parallel_gif(
         })
 
         bx0 = min(bx0, pxmin + x_off); bx1 = max(bx1, pxmax + x_off)
-        by0 = min(by0, pymin); by1 = max(by1, pymax)
+        by0 = min(by0, pymin + y_off); by1 = max(by1, pymax + y_off)
         bz0 = min(bz0, pzmin); bz1 = max(bz1, pzmax)
 
     if not pdata or total_length <= 0:

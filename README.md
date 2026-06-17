@@ -50,10 +50,11 @@ Then open the local Gradio URL in your browser, upload STL files or load the bun
 - Combines generated stacks into a reference TIFF stack
 - Converts generated TIFF ZIPs into G-code files with pressure, valve, and port settings per shape
 - Offers two G-code generation options: **Use G1 for all moves** (no rapid travel command) and **Use Reference Stack for motion** (all shapes share one nozzle path; each dispenses only its own geometry)
+- Calculates X/Y nozzle spacing from shared or separate Shape 1->2 and Shape 2->3 spacing values, then visualizes the resulting nozzle layout
 - Previews each shape's generated G-code inline (text boxes under the downloads)
 - Visualizes generated or uploaded G-code tool paths, with the source selectable from Shape 1/2/3 or an uploaded file
 - Renders the tool path as a fast line plot or an animated 3D tube plot (play/pause, speed, scrub, frame-step, nozzle marker)
-- Plots all three shapes side by side (offset in X) and animates them printing in parallel, with a server-side GIF export of that animation
+- Plots all three shapes using the configured nozzle spacing and animates them printing in parallel, with a server-side GIF export of that animation
 
 ## Behavior and Implementation Notes
 
@@ -99,7 +100,7 @@ The G-code visualization tab renders the generated Shape 1/2/3 G-code or an uplo
 
 ### Parallel Printing Visualization
 
-The fourth tab plots all three shapes' G-code at once, offset along X so they do not overlap, each in its own color. Like the visualization tab it has a fast **Line Plot** and an animated **Tube Plot**; the animation advances all parts on a shared cumulative-path-length timeline, so a shorter part finishes first.
+The fourth tab plots all three shapes' G-code at once using the nozzle spacing configured on the TIFF-to-G-code tab, each in its own color. Like the visualization tab it has a fast **Line Plot** and an animated **Tube Plot**; the animation advances all parts on a shared cumulative-path-length timeline, so a shorter part finishes first.
 
 It can also **export the animation as a GIF**, rendered server-side with Matplotlib (the `Agg` CPU backend — no WebGL, no headless browser, and no `ffmpeg`, so it works locally and on Hugging Face). The GIF is line-style with faint grey travel and white, black-outlined nozzle markers drawn on top; controls cover duration, frames per second, elevation/azimuth viewing angle, and travel opacity (0 hides travel).
 

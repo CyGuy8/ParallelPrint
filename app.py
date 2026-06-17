@@ -22,6 +22,7 @@ from PIL import Image, ImageDraw, ImageFont
 import trimesh
 
 from gcode_viewer import (
+    build_nozzle_spacing_figure,
     build_parallel_figure,
     build_parallel_gif,
     build_toolpath_figure,
@@ -91,20 +92,26 @@ APP_CSS = """
 }
 
 #load-sample-stls-button,
-#load-sample-stls-button button {
+#load-sample-stls-button button,
+#visualize-nozzle-spacing-button,
+#visualize-nozzle-spacing-button button {
     background: #f97316 !important;
     border-color: #ea580c !important;
     color: #ffffff !important;
 }
 
 #load-sample-stls-button:hover,
-#load-sample-stls-button button:hover {
+#load-sample-stls-button button:hover,
+#visualize-nozzle-spacing-button:hover,
+#visualize-nozzle-spacing-button button:hover {
     background: #ea580c !important;
     border-color: #c2410c !important;
 }
 
 #load-sample-stls-button:focus-visible,
-#load-sample-stls-button button:focus-visible {
+#load-sample-stls-button button:focus-visible,
+#visualize-nozzle-spacing-button:focus-visible,
+#visualize-nozzle-spacing-button button:focus-visible {
     box-shadow: 0 0 0 2px rgba(249, 115, 22, 0.35) !important;
 }
 
@@ -744,7 +751,8 @@ def _format_model_details(
     lines = [
         "### Model Details",
         f"- Source: `{source_name}`",
-        f"- Extents: `{extents[0]:.3f} x {extents[1]:.3f} x {extents[2]:.3f}`",
+        f"- Dimensions (mm): `X {extents[0]:.3f}, Y {extents[1]:.3f}, Z {extents[2]:.3f}`",
+        f"- Footprint (mm): `X {extents[0]:.3f} x Y {extents[1]:.3f}`",
     ]
 
     if scale_factors and not all(math.isclose(value, 1.0) for value in scale_factors):
@@ -1740,21 +1748,17 @@ PARALLEL_COLOR_CHOICES = [
     ("Red", "#d62728"), ("Purple", "#9467bd"), ("Pink", "#e377c2"),
     ("Teal", "#17becf"), ("Black", "#000000"),
 ]
+DEFAULT_PARALLEL_COLORS = ("#ff7f0e", "#1f77b4", "#2ca02c")
 
 
-def render_parallel(
+def _load_parallel_parts(
     path1: str | None,
     path2: str | None,
     path3: str | None,
     color1: str,
     color2: str,
     color3: str,
-    travel_opacity: float,
-    filament_width: float,
-    travel_width: float,
-    gap: float,
-    tube: bool = True,
-) -> tuple[Any, str]:
+) -> tuple[list[dict], list[str]]:
     specs = [(1, path1, color1), (2, path2, color2), (3, path3, color3)]
     parts: list[dict] = []
     messages: list[str] = []
@@ -1774,17 +1778,188 @@ def render_parallel(
         parts.append({"idx": idx, "color": color, "parsed": parsed})
         messages.append(f"Shape {idx}: {parsed['point_count']} moves, {parsed.get('layer_count', 0)} layer(s).")
 
+    return parts, messages
+
+
+def _resolve_nozzle_layout(
+    parts: list[dict],
+    same_spacing: bool | None,
+    part_gap_12_x: float | None,
+    part_gap_12_y: float | None,
+    part_gap_23_x: float | None,
+    part_gap_23_y: float | None,
+) -> tuple[dict[int, tuple[float, float]], list[dict]]:
+    offsets: dict[int, tuple[float, float]] = {}
+    spacings: list[dict] = []
+    if not parts:
+        return offsets, spacings
+
+    ordered = sorted(parts, key=lambda part: part["idx"])
+    offsets[ordered[0]["idx"]] = (0.0, 0.0)
+
+    pair_spacing = {
+        (1, 2): (float(part_gap_12_x or 0.0), float(part_gap_12_y or 0.0)),
+        (2, 3): (
+            float(part_gap_12_x or 0.0) if same_spacing else float(part_gap_23_x or 0.0),
+            float(part_gap_12_y or 0.0) if same_spacing else float(part_gap_23_y or 0.0),
+        ),
+    }
+
+    def spacing_between(prev_idx: int, cur_idx: int) -> tuple[float, float]:
+        if (prev_idx, cur_idx) in pair_spacing:
+            return pair_spacing[(prev_idx, cur_idx)]
+        if prev_idx == 1 and cur_idx == 3:
+            x12, y12 = pair_spacing[(1, 2)]
+            x23, y23 = pair_spacing[(2, 3)]
+            return x12 + x23, y12 + y23
+        return 0.0, 0.0
+
+    for previous, current in zip(ordered, ordered[1:]):
+        prev_idx = previous["idx"]
+        cur_idx = current["idx"]
+        gap_x, y_step = spacing_between(prev_idx, cur_idx)
+        prev_offset_x, prev_offset_y = offsets[prev_idx]
+        (_, _, _), (prev_xmax, _prev_ymax, _) = previous["parsed"]["bounds"]
+        (cur_xmin, _cur_ymin, _), (_, _, _) = current["parsed"]["bounds"]
+        dx = (prev_xmax + prev_offset_x + gap_x) - cur_xmin
+        dy = prev_offset_y + y_step
+        offsets[cur_idx] = (dx, dy)
+        spacings.append({
+            "from": prev_idx,
+            "to": cur_idx,
+            "dx": dx - prev_offset_x,
+            "dy": y_step,
+        })
+
+    return offsets, spacings
+
+
+def _same_spacing_from_individual(use_individual_spacing: bool | None) -> bool:
+    return not bool(use_individual_spacing)
+
+
+def update_individual_nozzle_spacing_visibility(
+    use_individual_spacing: bool | None,
+) -> dict[str, Any]:
+    return gr.update(visible=bool(use_individual_spacing))
+
+
+def _format_shape_dimensions(parts: list[dict]) -> list[str]:
+    lines = ["**Shape dimensions from generated G-code:**"]
+    for part in sorted(parts, key=lambda item: item["idx"]):
+        (xmin, ymin, zmin), (xmax, ymax, zmax) = part["parsed"]["bounds"]
+        lines.append(
+            f"Shape {part['idx']}: X {xmax - xmin:.2f} mm, "
+            f"Y {ymax - ymin:.2f} mm, Z {zmax - zmin:.2f} mm."
+        )
+    return lines
+
+
+def _format_nozzle_spacing_status(
+    parts: list[dict],
+    offsets: dict[int, tuple[float, float]],
+    spacings: list[dict],
+) -> str:
+    lines = _format_shape_dimensions(parts)
+    ordered_nozzles = sorted(offsets)
+    if ordered_nozzles:
+        lines.append("**Nozzle coordinates:**")
+        for idx in ordered_nozzles:
+            x, y = offsets[idx]
+            lines.append(f"Nozzle {idx}: X {x:.2f} mm, Y {y:.2f} mm.")
+
+    if not spacings:
+        lines.append("Generate G-code for at least two shapes to calculate nozzle spacing.")
+        return "  \n".join(lines)
+
+    lines.append("**Nozzle-to-nozzle distances:**")
+    for first_pos, first_idx in enumerate(ordered_nozzles):
+        for second_idx in ordered_nozzles[first_pos + 1:]:
+            x0, y0 = offsets[first_idx]
+            x1, y1 = offsets[second_idx]
+            dx = x1 - x0
+            dy = y1 - y0
+            distance = math.hypot(dx, dy)
+            angle = math.degrees(math.atan2(dy, dx)) if distance else 0.0
+            lines.append(
+                f"Nozzle {first_idx} -> {second_idx}: "
+                f"Delta X {dx:.2f} mm, Delta Y {dy:.2f} mm; "
+                f"distance {distance:.2f} mm at {angle:.1f} deg."
+            )
+
+    lines.append("**Adjacent spacing inputs:**")
+    for spacing in spacings:
+        lines.append(
+            f"Nozzle {spacing['from']} -> {spacing['to']}: "
+            f"X {spacing['dx']:.2f} mm, Y {spacing['dy']:.2f} mm."
+        )
+    return "  \n".join(lines)
+
+
+def render_nozzle_spacing_preview(
+    path1: str | None,
+    path2: str | None,
+    path3: str | None,
+    use_individual_spacing: bool,
+    part_gap_12_x: float,
+    part_gap_12_y: float,
+    part_gap_23_x: float,
+    part_gap_23_y: float,
+) -> tuple[Any, str]:
+    parts, _messages = _load_parallel_parts(path1, path2, path3, *DEFAULT_PARALLEL_COLORS)
+    if not parts:
+        return None, "No shape G-code available. Generate G-code first."
+    offsets, spacings = _resolve_nozzle_layout(
+        parts,
+        _same_spacing_from_individual(use_individual_spacing),
+        part_gap_12_x,
+        part_gap_12_y,
+        part_gap_23_x,
+        part_gap_23_y,
+    )
+    figure = build_nozzle_spacing_figure(parts, offsets, spacings)
+    return figure, _format_nozzle_spacing_status(parts, offsets, spacings)
+
+
+def render_parallel(
+    path1: str | None,
+    path2: str | None,
+    path3: str | None,
+    color1: str,
+    color2: str,
+    color3: str,
+    travel_opacity: float,
+    filament_width: float,
+    travel_width: float,
+    use_individual_spacing: bool,
+    part_gap_12_x: float,
+    part_gap_12_y: float,
+    part_gap_23_x: float,
+    part_gap_23_y: float,
+    tube: bool = True,
+) -> tuple[Any, str]:
+    parts, messages = _load_parallel_parts(path1, path2, path3, color1, color2, color3)
+
     if not parts:
         return None, "No shape G-code available. Generate G-code on the TIFF Slices to GCode tab first."
+    offsets, spacings = _resolve_nozzle_layout(
+        parts,
+        _same_spacing_from_individual(use_individual_spacing),
+        part_gap_12_x,
+        part_gap_12_y,
+        part_gap_23_x,
+        part_gap_23_y,
+    )
 
     figure = build_parallel_figure(
         parts,
-        gap=float(gap),
+        part_offsets=offsets,
         filament_width=float(filament_width),
         travel_width=float(travel_width),
         travel_opacity=float(travel_opacity),
         tube=tube,
     )
+    messages.append(_format_nozzle_spacing_status(parts, offsets, spacings))
     return figure, "  \n".join(messages)
 
 
@@ -1824,7 +1999,11 @@ def export_parallel_gif(
     color2: str,
     color3: str,
     travel_opacity: float,
-    gap: float,
+    use_individual_spacing: bool,
+    part_gap_12_x: float,
+    part_gap_12_y: float,
+    part_gap_23_x: float,
+    part_gap_23_y: float,
     duration: float,
     fps: float,
     elev: float,
@@ -1836,20 +2015,18 @@ def export_parallel_gif(
     CPU-only (Agg backend) — no WebGL or headless browser — so it works locally
     and on Hugging Face. Each shape grows as colored lines on a shared timeline.
     """
-    specs = [(path1, color1), (path2, color2), (path3, color3)]
-    parts: list[dict] = []
-    for idx, (path, color) in enumerate(specs, start=1):
-        if not path:
-            continue
-        try:
-            parsed = parse_gcode_path(Path(path).read_text())
-        except OSError:
-            continue
-        if parsed.get("point_count"):
-            parts.append({"idx": idx, "color": color, "parsed": parsed})
+    parts, _messages = _load_parallel_parts(path1, path2, path3, color1, color2, color3)
 
     if not parts:
         return None
+    offsets, _spacings = _resolve_nozzle_layout(
+        parts,
+        _same_spacing_from_individual(use_individual_spacing),
+        part_gap_12_x,
+        part_gap_12_y,
+        part_gap_23_x,
+        part_gap_23_y,
+    )
 
     def report(frame: int, total: int) -> None:
         progress(frame / total, desc=f"Rendering frame {frame + 1}/{total}")
@@ -1858,7 +2035,7 @@ def export_parallel_gif(
     result = build_parallel_gif(
         parts,
         out_path=out_path,
-        gap=float(gap),
+        part_offsets=offsets,
         duration=float(duration),
         fps=int(fps),
         travel_opacity=float(travel_opacity),
@@ -2104,9 +2281,9 @@ def build_demo() -> gr.Blocks:
 
             # --- Shared slicing controls ---
             with gr.Row():
-                layer_height = gr.Number(label="Layer Height", value=0.8, minimum=0.0001, step=0.01)
+                layer_height = gr.Number(label="Layer Height (mm)", value=0.8, minimum=0.0001, step=0.01)
                 pixel_size = gr.Number(
-                    label="Pixel Size/Fill Width",
+                    label="Pixel Size/Fill Width (mm)",
                     value=0.8,
                     minimum=0.0001,
                     step=0.01,
@@ -2504,6 +2681,7 @@ def build_demo() -> gr.Blocks:
                 ),
                 value=True,
             )
+
             gcode_button = gr.Button("Generate G-Code", variant="primary")
 
             with gr.Row():
@@ -2528,6 +2706,47 @@ def build_demo() -> gr.Blocks:
                 )
 
             gcode_status = gr.Markdown("")
+
+            with gr.Group():
+                gr.Markdown("### Nozzle Spacing")
+                nozzle_use_individual_spacing = gr.Checkbox(
+                    label="Use Individual Spacing",
+                    value=False,
+                )
+                with gr.Row():
+                    nozzle_part_gap_12_x = gr.Number(
+                        label="Shared / Shape 1 -> 2 X edge spacing (mm)",
+                        value=5.0,
+                        step=0.5,
+                    )
+                    nozzle_part_gap_12_y = gr.Number(
+                        label="Shared / Nozzle 1 -> 2 Y spacing (mm)",
+                        value=0.0,
+                        step=0.5,
+                    )
+                with gr.Row(visible=False) as individual_nozzle_spacing_row:
+                    nozzle_part_gap_23_x = gr.Number(
+                        label="Shape 2 -> 3 X edge spacing (mm)",
+                        value=5.0,
+                        step=0.5,
+                    )
+                    nozzle_part_gap_23_y = gr.Number(
+                        label="Nozzle 2 -> 3 Y spacing (mm)",
+                        value=0.0,
+                        step=0.5,
+                    )
+                nozzle_preview_button = gr.Button(
+                    "Visualize Nozzle Spacing",
+                    variant="secondary",
+                    elem_id="visualize-nozzle-spacing-button",
+                )
+                with gr.Row():
+                    with gr.Column(scale=3, min_width=420):
+                        nozzle_spacing_plot = gr.Plot(label="Nozzle Spacing")
+                    with gr.Column(scale=1, min_width=260):
+                        nozzle_spacing_status = gr.Markdown(
+                            "Generate G-code, then visualize nozzle spacing."
+                        )
 
             gcode_button.click(
                 fn=run_all_tiff_to_gcode,
@@ -2587,6 +2806,27 @@ def build_demo() -> gr.Blocks:
                     apply(0);
                     return [];
                 }""",
+            )
+            nozzle_spacing_inputs = [
+                gcode_file_1,
+                gcode_file_2,
+                gcode_file_3,
+                nozzle_use_individual_spacing,
+                nozzle_part_gap_12_x,
+                nozzle_part_gap_12_y,
+                nozzle_part_gap_23_x,
+                nozzle_part_gap_23_y,
+            ]
+            nozzle_use_individual_spacing.change(
+                fn=update_individual_nozzle_spacing_visibility,
+                inputs=[nozzle_use_individual_spacing],
+                outputs=[individual_nozzle_spacing_row],
+                queue=False,
+            )
+            nozzle_preview_button.click(
+                fn=render_nozzle_spacing_preview,
+                inputs=nozzle_spacing_inputs,
+                outputs=[nozzle_spacing_plot, nozzle_spacing_status],
             )
 
         with gr.Tab("G-Code Visualization"):
@@ -2862,10 +3102,6 @@ def build_demo() -> gr.Blocks:
                             label="Travel width (mm)", minimum=0.05, maximum=3.0,
                             value=0.2, step=0.05, min_width=150,
                         )
-                    pp_gap = gr.Slider(
-                        label="Gap between parts (mm)",
-                        minimum=0.0, maximum=50.0, value=5.0, step=0.5,
-                    )
                     parallel_status = gr.Markdown("")
 
                     with gr.Group(visible=False) as pp_export_group:
@@ -2906,7 +3142,10 @@ def build_demo() -> gr.Blocks:
             parallel_render_inputs = [
                 gcode_file_1, gcode_file_2, gcode_file_3,
                 pp_color_1, pp_color_2, pp_color_3,
-                pp_travel_opacity, pp_filament_width, pp_travel_width, pp_gap,
+                pp_travel_opacity, pp_filament_width, pp_travel_width,
+                nozzle_use_individual_spacing,
+                nozzle_part_gap_12_x, nozzle_part_gap_12_y,
+                nozzle_part_gap_23_x, nozzle_part_gap_23_y,
             ]
             parallel_outputs = [
                 parallel_plot, parallel_status, parallel_mode,
@@ -2922,9 +3161,29 @@ def build_demo() -> gr.Blocks:
                 inputs=parallel_render_inputs,
                 outputs=parallel_outputs,
             )
-            # Width and gap changes rebuild the figure in the last-used mode.
-            for _slider in (pp_filament_width, pp_travel_width, pp_gap):
+            # Width changes rebuild the figure in the last-used mode after the slider is released.
+            for _slider in (
+                pp_filament_width,
+                pp_travel_width,
+            ):
                 _slider.release(
+                    fn=rerender_parallel_current_mode,
+                    inputs=[parallel_mode] + parallel_render_inputs,
+                    outputs=[parallel_plot, parallel_status],
+                )
+            # Number inputs do not support release() in this Gradio build.
+            nozzle_use_individual_spacing.change(
+                fn=rerender_parallel_current_mode,
+                inputs=[parallel_mode] + parallel_render_inputs,
+                outputs=[parallel_plot, parallel_status],
+            )
+            for _number in (
+                nozzle_part_gap_12_x,
+                nozzle_part_gap_12_y,
+                nozzle_part_gap_23_x,
+                nozzle_part_gap_23_y,
+            ):
+                _number.change(
                     fn=rerender_parallel_current_mode,
                     inputs=[parallel_mode] + parallel_render_inputs,
                     outputs=[parallel_plot, parallel_status],
@@ -2974,7 +3233,11 @@ def build_demo() -> gr.Blocks:
                 inputs=[
                     gcode_file_1, gcode_file_2, gcode_file_3,
                     pp_color_1, pp_color_2, pp_color_3,
-                    pp_gif_travel_opacity, pp_gap, pp_gif_duration, pp_gif_fps,
+                    pp_gif_travel_opacity,
+                    nozzle_use_individual_spacing,
+                    nozzle_part_gap_12_x, nozzle_part_gap_12_y,
+                    nozzle_part_gap_23_x, nozzle_part_gap_23_y,
+                    pp_gif_duration, pp_gif_fps,
                     pp_elev, pp_azim,
                 ],
                 outputs=[pp_gif_file],
