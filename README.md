@@ -1,5 +1,5 @@
 ---
-title: STL to G-Code Slicer
+title: ParallelPrint
 sdk: gradio
 sdk_version: 6.10.0
 python_version: "3.12"
