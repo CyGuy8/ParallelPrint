@@ -2033,6 +2033,12 @@ def build_demo() -> gr.Blocks:
                         label="Scale STLs",
                         value=False,
                     )
+                with gr.Column(scale=0, min_width=180):
+                    regenerate_models_button = gr.Button(
+                        "Regenerate Images",
+                        variant="secondary",
+                        size="sm",
+                    )
 
             with gr.Group(visible=False) as scaling_details_group:
                 with gr.Row():
@@ -2307,10 +2313,6 @@ def build_demo() -> gr.Blocks:
                     inputs=[stl_file, scale_to_target, scale_mode, target_xs[i], target_ys[i], target_zs[i]],
                     outputs=[target_xs[i], target_ys[i], target_zs[i]],
                     queue=False,
-                ).then(
-                    fn=refresh_all_model_viewers,
-                    inputs=refresh_inputs,
-                    outputs=refresh_outputs,
                 )
                 target_ys[i].change(
                     fn=lambda stl, enabled, mode, x, y, z: sync_uniform_target_dimensions(
@@ -2319,10 +2321,6 @@ def build_demo() -> gr.Blocks:
                     inputs=[stl_file, scale_to_target, scale_mode, target_xs[i], target_ys[i], target_zs[i]],
                     outputs=[target_xs[i], target_ys[i], target_zs[i]],
                     queue=False,
-                ).then(
-                    fn=refresh_all_model_viewers,
-                    inputs=refresh_inputs,
-                    outputs=refresh_outputs,
                 )
                 target_zs[i].change(
                     fn=lambda stl, enabled, mode, x, y, z: sync_uniform_target_dimensions(
@@ -2331,10 +2329,6 @@ def build_demo() -> gr.Blocks:
                     inputs=[stl_file, scale_to_target, scale_mode, target_xs[i], target_ys[i], target_zs[i]],
                     outputs=[target_xs[i], target_ys[i], target_zs[i]],
                     queue=False,
-                ).then(
-                    fn=refresh_all_model_viewers,
-                    inputs=refresh_inputs,
-                    outputs=refresh_outputs,
                 )
                 scale_to_target.change(
                     fn=lambda stl, enabled, mode, x, y, z: sync_uniform_target_dimensions(
@@ -2368,12 +2362,11 @@ def build_demo() -> gr.Blocks:
                     outputs=[target_xs[i], target_ys[i], target_zs[i]],
                     queue=False,
                 )
-            for scale_control in (scale_to_target, scale_mode):
-                scale_control.change(
-                    fn=refresh_all_model_viewers,
-                    inputs=refresh_inputs,
-                    outputs=refresh_outputs,
-                )
+            regenerate_models_button.click(
+                fn=refresh_all_model_viewers,
+                inputs=refresh_inputs,
+                outputs=refresh_outputs,
+            )
 
             generate_button.click(
                 fn=generate_all_stacks,
