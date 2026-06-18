@@ -3,7 +3,15 @@ from __future__ import annotations
 import numpy as np
 
 from app import (
+    ADVANCED_NOZZLE_SPACING_HEADERS,
+    SCALE_MODE_UNIFORM_FACTOR,
+    SIMPLE_NOZZLE_SPACING_HEADERS,
+    delete_shape_from_settings,
     _format_nozzle_spacing_status,
+    _shape_settings_rows,
+    _spacing_args_from_table,
+    _spacing_table_update,
+    normalize_shape_dimensions_for_mode,
     _resolve_nozzle_layout,
 )
 
@@ -82,6 +90,43 @@ def test_same_spacing_reuses_first_pair_values_for_second_pair() -> None:
     assert spacings[1] == {"from": 2, "to": 3, "dx": 7.0, "dy": 2.0}
 
 
+def test_individual_spacing_has_no_fixed_shape_limit() -> None:
+    parts = [
+        _part(1, ((0.0, 0.0, 0.0), (10.0, 10.0, 1.0))),
+        _part(2, ((0.0, 0.0, 0.0), (4.0, 10.0, 1.0))),
+        _part(3, ((0.0, 0.0, 0.0), (6.0, 10.0, 1.0))),
+        _part(4, ((0.0, 0.0, 0.0), (2.0, 10.0, 1.0))),
+        _part(5, ((0.0, 0.0, 0.0), (3.0, 10.0, 1.0))),
+        _part(6, ((0.0, 0.0, 0.0), (4.0, 10.0, 1.0))),
+        _part(7, ((0.0, 0.0, 0.0), (5.0, 10.0, 1.0))),
+    ]
+
+    offsets, spacings = _resolve_nozzle_layout(
+        parts,
+        False,
+        1.0,
+        0.0,
+        2.0,
+        3.0,
+        4.0,
+        -1.0,
+        6.0,
+        2.0,
+        1.0,
+        1.0,
+        -3.0,
+        0.5,
+    )
+
+    np.testing.assert_allclose(offsets[1], (0.0, 0.0))
+    np.testing.assert_allclose(offsets[2], (11.0, 0.0))
+    np.testing.assert_allclose(offsets[3], (17.0, 3.0))
+    np.testing.assert_allclose(offsets[4], (27.0, 2.0))
+    np.testing.assert_allclose(offsets[7], (40.0, 5.5))
+    assert spacings[2] == {"from": 3, "to": 4, "dx": 10.0, "dy": -1.0}
+    assert spacings[5] == {"from": 6, "to": 7, "dx": 1.0, "dy": 0.5}
+
+
 def test_spacing_status_lists_all_nozzle_pair_distances() -> None:
     parts = [
         _part(1, ((0.0, 0.0, 0.0), (10.0, 10.0, 1.0))),
@@ -103,3 +148,115 @@ def test_spacing_status_lists_all_nozzle_pair_distances() -> None:
     assert "Nozzle 1 -> 2: Delta X 13.00 mm, Delta Y 2.00 mm" in status
     assert "Nozzle 1 -> 3: Delta X 20.00 mm, Delta Y 4.00 mm" in status
     assert "Nozzle 2 -> 3: Delta X 7.00 mm, Delta Y 2.00 mm" in status
+
+
+def test_keep_proportions_uses_most_recently_edited_dimension() -> None:
+    records = [
+        {
+            "idx": 1,
+            "name": "wide_part",
+            "stl_path": "wide_part.stl",
+            "original_x": 10.0,
+            "original_y": 20.0,
+            "original_z": 5.0,
+            "target_x": 10.0,
+            "target_y": 20.0,
+            "target_z": 5.0,
+            "pressure": 25.0,
+            "valve": 4,
+            "port": 1,
+            "color": "#000000",
+            "last_scaled_axis": "target_x",
+        }
+    ]
+    settings = _shape_settings_rows(records)
+    settings[0][3] = 50.0
+
+    updated_records, updated_settings = normalize_shape_dimensions_for_mode(
+        records,
+        settings,
+        SCALE_MODE_UNIFORM_FACTOR,
+    )
+
+    assert updated_records[0]["last_scaled_axis"] == "target_y"
+    assert updated_settings[0][2:5] == [25.0, 50.0, 12.5]
+
+
+def test_simple_spacing_table_uses_one_shared_spacing_row() -> None:
+    records = [
+        {"idx": 1, "name": "first"},
+        {"idx": 2, "name": "second"},
+        {"idx": 3, "name": "third"},
+    ]
+
+    update = _spacing_table_update(records, [["Shape 1", "Shape 2", 7.0, -1.5]], False)
+    gap12x, gap12y, gap23x, gap23y, extra = _spacing_args_from_table(update["value"], False)
+
+    assert update["headers"] == SIMPLE_NOZZLE_SPACING_HEADERS
+    assert update["value"] == [["Same spacing", "All neighboring shapes", 7.0, -1.5]]
+    assert (gap12x, gap12y, gap23x, gap23y, extra) == (7.0, -1.5, 7.0, -1.5, [])
+
+
+def test_advanced_spacing_table_uses_named_shape_pairs() -> None:
+    records = [
+        {"idx": 1, "name": "first"},
+        {"idx": 2, "name": "second"},
+        {"idx": 3, "name": "third"},
+    ]
+
+    update = _spacing_table_update(
+        records,
+        [["Same spacing", "All neighboring shapes", 4.0, 0.5], ["ignored", "ignored", 8.0, 1.0]],
+        True,
+    )
+    gap12x, gap12y, gap23x, gap23y, extra = _spacing_args_from_table(update["value"], True)
+
+    assert update["headers"] == ADVANCED_NOZZLE_SPACING_HEADERS
+    assert update["value"][0][:2] == ["Shape 1: first", "Shape 2: second"]
+    assert update["value"][1][:2] == ["Shape 2: second", "Shape 3: third"]
+    assert (gap12x, gap12y, gap23x, gap23y, extra) == (4.0, 0.5, 8.0, 1.0, [])
+
+
+def test_delete_shape_reindexes_without_losing_shape_data() -> None:
+    class Event:
+        index = (1, 9)
+
+    records = [
+        {"idx": 1, "name": "first", "stl_path": "first.stl", "target_x": 10.0, "target_y": 11.0, "target_z": 12.0, "pressure": 25, "valve": 4, "port": 1, "color": "#111111"},
+        {"idx": 2, "name": "middle", "stl_path": "middle.stl", "target_x": 20.0, "target_y": 21.0, "target_z": 22.0, "pressure": 30, "valve": 5, "port": 2, "color": "#222222"},
+        {"idx": 3, "name": "last", "stl_path": "last.stl", "target_x": 30.0, "target_y": 31.0, "target_z": 32.0, "pressure": 35, "valve": 6, "port": 3, "color": "#333333"},
+    ]
+
+    outputs = delete_shape_from_settings(records, _shape_settings_rows(records), None, False, 0.0, Event())
+    updated_records = outputs[1]
+    updated_settings = outputs[2]
+
+    assert [record["idx"] for record in updated_records] == [1, 2]
+    assert [record["stl_path"] for record in updated_records] == ["first.stl", "last.stl"]
+    assert [record["target_x"] for record in updated_records] == [10.0, 30.0]
+    assert updated_settings[1][0] == 2
+    assert updated_settings[1][1] == "last"
+    assert updated_settings[1][2:5] == [30.0, 31.0, 32.0]
+
+
+def test_delete_shape_cooldown_blocks_immediate_second_delete() -> None:
+    class Event:
+        index = (1, 9)
+
+    records = [
+        {"idx": 1, "name": "first", "stl_path": "first.stl", "target_x": 10.0, "target_y": 11.0, "target_z": 12.0, "pressure": 25, "valve": 4, "port": 1, "color": "#111111"},
+        {"idx": 2, "name": "middle", "stl_path": "middle.stl", "target_x": 20.0, "target_y": 21.0, "target_z": 22.0, "pressure": 30, "valve": 5, "port": 2, "color": "#222222"},
+        {"idx": 3, "name": "last", "stl_path": "last.stl", "target_x": 30.0, "target_y": 31.0, "target_z": 32.0, "pressure": 35, "valve": 6, "port": 3, "color": "#333333"},
+    ]
+
+    first_outputs = delete_shape_from_settings(records, _shape_settings_rows(records), None, False, 0.0, Event())
+    second_outputs = delete_shape_from_settings(
+        first_outputs[1],
+        first_outputs[2],
+        None,
+        False,
+        first_outputs[-1],
+        Event(),
+    )
+
+    assert [record["name"] for record in second_outputs[1]] == ["first", "last"]
