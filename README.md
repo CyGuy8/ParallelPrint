@@ -50,7 +50,7 @@ Then open the local Gradio URL in your browser, upload STL files or load the bun
 - Exports a ZIP containing the generated TIFF images
 - Combines generated stacks into a reference TIFF stack
 - Converts generated TIFF ZIPs into G-code files with pressure, valve, and port settings per shape from the Shape Settings table
-- Offers two G-code generation options: **Use G1 for all moves** (no rapid travel command) and **Use Reference Stack for motion** (all shapes share one nozzle path; each dispenses only its own geometry)
+- Offers G-code generation options for raster pattern, **Use G1 for all moves** (no rapid travel command), and **Use Reference Stack for motion** (all shapes share one nozzle path; each dispenses only its own geometry)
 - Calculates X/Y nozzle spacing from an editable adjacent-pair spacing table, then visualizes the resulting nozzle layout
 - Previews selected generated G-code inline
 - Visualizes generated or uploaded G-code tool paths, with the source selectable from any active generated shape or an uploaded file
@@ -82,6 +82,7 @@ When you click **Generate Reference TIFF Stack**, the app combines available TIF
 - Pressure increases by `0.1` psi per layer by default.
 - **Use G1 for all moves**: when enabled, every movement line is emitted as `G1` (no `G0` rapid travel); the WAGO valve still marks where material is dispensed. Applies to all shapes.
 - **Use Reference Stack for motion**: when enabled, every shape's snake-path *motion* is taken from the combined Reference TIFF Stack while each shape's *valve/dispensing* comes from its own slices — so parallel print heads share one synchronized nozzle path and each deposits only its own geometry. Requires generating the Reference TIFF Stack on the first tab first; shapes are skipped with a message if it is missing.
+- **Raster Pattern**: `Same-direction raster` keeps the existing back-and-forth raster direction on every layer. `Woodpile raster` alternates the raster axis by layer, switching between X-direction and Y-direction sweeps.
 
 ### Print vs Travel Classification
 

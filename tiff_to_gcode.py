@@ -11,6 +11,17 @@ import numpy as np
 from PIL import Image
 
 
+RASTER_PATTERN_SAME_DIRECTION = "Same-direction raster"
+RASTER_PATTERN_WOODPILE = "Woodpile raster"
+RASTER_PATTERN_CHOICES = (RASTER_PATTERN_SAME_DIRECTION, RASTER_PATTERN_WOODPILE)
+
+
+def _normalize_raster_pattern(pattern: str | None) -> str:
+    if pattern == RASTER_PATTERN_WOODPILE:
+        return RASTER_PATTERN_WOODPILE
+    return RASTER_PATTERN_SAME_DIRECTION
+
+
 def _setpress(pressure: float) -> str:
     pressure_str = str(int(pressure * 10)).zfill(4)
     command_bytes = bytes("08PS  " + pressure_str, "utf-8")
@@ -179,6 +190,175 @@ def _center_on_canvas(
     return out
 
 
+def _append_relative_move(
+    output_list: list[dict],
+    current_x: float,
+    current_y: float,
+    target_x: float,
+    target_y: float,
+    color: int,
+    z_step: float | None = None,
+) -> tuple[float, float]:
+    dx = target_x - current_x
+    dy = target_y - current_y
+    if dx == 0 and dy == 0 and z_step is None:
+        return current_x, current_y
+    move = {"X": dx, "Y": dy, "Color": color}
+    if z_step is not None:
+        move["Z"] = z_step
+    output_list.append(move)
+    return target_x, target_y
+
+
+def _woodpile_layer_segments(
+    path_img: np.ndarray,
+    color_img: np.ndarray,
+    pixel_size: float,
+    raster_axis: str,
+) -> list[tuple[float, float, float, float, int]]:
+    mask = path_img > 0
+    segments: list[tuple[float, float, float, float, int]] = []
+
+    if raster_axis == "Y":
+        first_nonblank = np.where(mask.any(axis=0), mask.argmax(axis=0), -1)
+        last_nonblank = np.where(
+            mask.any(axis=0),
+            mask.shape[0] - 1 - np.flipud(mask).argmax(axis=0),
+            -1,
+        )
+        for col_number, col in enumerate(np.where(first_nonblank != -1)[0]):
+            f_idx, l_idx = int(first_nonblank[col]), int(last_nonblank[col])
+            if f_idx == -1:
+                continue
+            forward = col_number % 2 == 0
+            row_values = list(range(f_idx, l_idx + 1)) if forward else list(range(l_idx, f_idx - 1, -1))
+            run_start = row_values[0]
+            prev_row = row_values[0]
+            prev_color = int(color_img[prev_row, col])
+            x = (int(col) + 0.5) * pixel_size
+            for row in row_values[1:]:
+                this_color = int(color_img[row, col])
+                if this_color == prev_color:
+                    prev_row = row
+                    continue
+                if forward:
+                    start_y = run_start * pixel_size
+                    end_y = (prev_row + 1) * pixel_size
+                else:
+                    start_y = (run_start + 1) * pixel_size
+                    end_y = prev_row * pixel_size
+                segments.append((x, start_y, x, end_y, prev_color))
+                run_start = prev_row = row
+                prev_color = this_color
+            if forward:
+                start_y = run_start * pixel_size
+                end_y = (prev_row + 1) * pixel_size
+            else:
+                start_y = (run_start + 1) * pixel_size
+                end_y = prev_row * pixel_size
+            segments.append((x, start_y, x, end_y, prev_color))
+        return segments
+
+    first_nonblank = np.where(mask.any(axis=1), mask.argmax(axis=1), -1)
+    last_nonblank = np.where(
+        mask.any(axis=1),
+        mask.shape[1] - 1 - np.fliplr(mask).argmax(axis=1),
+        -1,
+    )
+    for row_number, row in enumerate(np.where(first_nonblank != -1)[0]):
+        f_idx, l_idx = int(first_nonblank[row]), int(last_nonblank[row])
+        if f_idx == -1:
+            continue
+        forward = row_number % 2 == 0
+        col_values = list(range(f_idx, l_idx + 1)) if forward else list(range(l_idx, f_idx - 1, -1))
+        run_start = col_values[0]
+        prev_col = col_values[0]
+        prev_color = int(color_img[row, prev_col])
+        y = (int(row) + 0.5) * pixel_size
+        for col in col_values[1:]:
+            this_color = int(color_img[row, col])
+            if this_color == prev_color:
+                prev_col = col
+                continue
+            if forward:
+                start_x = run_start * pixel_size
+                end_x = (prev_col + 1) * pixel_size
+            else:
+                start_x = (run_start + 1) * pixel_size
+                end_x = prev_col * pixel_size
+            segments.append((start_x, y, end_x, y, prev_color))
+            run_start = prev_col = col
+            prev_color = this_color
+        if forward:
+            start_x = run_start * pixel_size
+            end_x = (prev_col + 1) * pixel_size
+        else:
+            start_x = (run_start + 1) * pixel_size
+            end_x = prev_col * pixel_size
+        segments.append((start_x, y, end_x, y, prev_color))
+    return segments
+
+
+def _build_woodpile_gcode_list(
+    path_ref_list: list[np.ndarray],
+    color_ref_list: list[np.ndarray],
+    pixel_size: float,
+    layer_height: float,
+) -> list[dict]:
+    gcode_list: list[dict] = []
+    current_x = 0.0
+    current_y = 0.0
+
+    for layer_number, (path_img, color_img) in enumerate(zip(path_ref_list, color_ref_list)):
+        raster_axis = "X" if layer_number % 2 == 0 else "Y"
+        segments = _woodpile_layer_segments(path_img, color_img, pixel_size, raster_axis)
+        if not segments:
+            if layer_number > 0:
+                gcode_list.append({"X": 0.0, "Y": 0.0, "Z": layer_height, "Color": 0})
+            continue
+
+        first_x, first_y = segments[0][0], segments[0][1]
+        if layer_number > 0:
+            current_x, current_y = _append_relative_move(
+                gcode_list,
+                current_x,
+                current_y,
+                first_x,
+                first_y,
+                0,
+                z_step=layer_height,
+            )
+        else:
+            current_x, current_y = _append_relative_move(
+                gcode_list,
+                current_x,
+                current_y,
+                first_x,
+                first_y,
+                0,
+            )
+
+        for start_x, start_y, end_x, end_y, color in segments:
+            current_x, current_y = _append_relative_move(
+                gcode_list,
+                current_x,
+                current_y,
+                start_x,
+                start_y,
+                0,
+            )
+            current_x, current_y = _append_relative_move(
+                gcode_list,
+                current_x,
+                current_y,
+                end_x,
+                end_y,
+                color,
+            )
+
+    return gcode_list
+
+
 def generate_snake_path_gcode(
     zip_path: str | Path,
     shape_name: str,
@@ -191,10 +371,12 @@ def generate_snake_path_gcode(
     increase_pressure_per_layer: float = 0.1,
     all_g1: bool = False,
     motion_tiffs: list[str] | None = None,
+    raster_pattern: str | None = RASTER_PATTERN_SAME_DIRECTION,
 ) -> Path:
     zip_path = Path(zip_path)
     if not zip_path.exists():
         raise FileNotFoundError(f"ZIP file not found: {zip_path}")
+    raster_pattern = _normalize_raster_pattern(raster_pattern)
 
     work_dir = Path(tempfile.mkdtemp(prefix="tiff_gcode_"))
     extract_dir = work_dir / "tiffs"
@@ -241,87 +423,95 @@ def generate_snake_path_gcode(
     pressure_on_lines = [_toggle_cmd(com_port, start=True)]
     pressure_off_lines = [_toggle_cmd(com_port, start=False)]
 
-    gcode_list: list[dict] = []
-    dist_sign_long = 1
-    current_offsets_x: list[int] = []
-    use_flip_y = False
-    direction = -1
-
-    for layers in range(len(path_ref_list)):
-        current_image_ref = path_ref_list[layers]
-        last_image_ref = path_ref_list[layers - 1] if layers > 0 else None
-        y_ref = current_image_ref.shape[0]
-
-        def find_first_valid_y(row: np.ndarray | None, flip: bool = False) -> int | None:
-            if row is None:
-                return None
-            row_data = np.flip(row) if flip else row
-            for j, pixel in enumerate(row_data):
-                if np.any(pixel) != off_color:
-                    return y_ref - 1 - j if flip else j
-            return None
-
-        last_x = last_y = None
-        if current_offsets_x:
-            use_flip_x = layers % 2 == 1
-            last_x = current_offsets_x[-1] if use_flip_x else current_offsets_x[0]
-            last_row = (
-                last_image_ref[last_x] if last_image_ref is not None else None
-            )
-            last_y = find_first_valid_y(last_row, flip=use_flip_y)
-            current_offsets_x.clear()
-
-        current_offsets_x = [
-            i for i, row in enumerate(current_image_ref) if np.any(row) != off_color
-        ]
-
-        first_x = first_y = None
-        if current_offsets_x:
-            use_flip_x = layers % 2 == 1
-            first_x = current_offsets_x[-1] if use_flip_x else current_offsets_x[0]
-            first_row = current_image_ref[first_x]
-            first_y = find_first_valid_y(first_row, flip=use_flip_y)
-
-        if None in (last_x, last_y, first_x, first_y):
-            shift_x = shift_y = 0
-        else:
-            shift_x = (first_x - last_x) * fil_width
-            shift_y = (first_y - last_y) * fil_width * dist_sign_long
-            if use_flip_y:
-                shift_y = -shift_y
-
-        if len(current_offsets_x) % 2 == 1:
-            use_flip_y = not use_flip_y
-
-        if layers > 0:
-            gcode_list.append(
-                {"X": shift_y, "Y": shift_x, "Z": layer_height, "Color": 0}
-            )
-
-        for row in current_image_ref:
-            if all(p == off_color for p in row):
-                dist_sign_long = -dist_sign_long
-            dist_sign_long = -dist_sign_long
-
-        # Flip path and color together on even layers so they stay aligned.
-        even_layer = (layers + 1) % 2 == 0
-        ref_for_path = (
-            np.flipud(current_image_ref) if even_layer else current_image_ref.copy()
-        )
-        current_image = (
-            np.flipud(color_ref_list[layers]) if even_layer else color_ref_list[layers]
-        )
-
-        if layers == 0:
-            direction = -1
-        direction = _gcode_layer(
-            ref_for_path,
-            current_image,
-            gcode_list,
+    if raster_pattern == RASTER_PATTERN_WOODPILE:
+        gcode_list = _build_woodpile_gcode_list(
+            path_ref_list,
+            color_ref_list,
             fil_width,
-            direction,
-            layers,
+            layer_height,
         )
+    else:
+        gcode_list: list[dict] = []
+        dist_sign_long = 1
+        current_offsets_x: list[int] = []
+        use_flip_y = False
+        direction = -1
+
+        for layers in range(len(path_ref_list)):
+            current_image_ref = path_ref_list[layers]
+            last_image_ref = path_ref_list[layers - 1] if layers > 0 else None
+            y_ref = current_image_ref.shape[0]
+
+            def find_first_valid_y(row: np.ndarray | None, flip: bool = False) -> int | None:
+                if row is None:
+                    return None
+                row_data = np.flip(row) if flip else row
+                for j, pixel in enumerate(row_data):
+                    if np.any(pixel) != off_color:
+                        return y_ref - 1 - j if flip else j
+                return None
+
+            last_x = last_y = None
+            if current_offsets_x:
+                use_flip_x = layers % 2 == 1
+                last_x = current_offsets_x[-1] if use_flip_x else current_offsets_x[0]
+                last_row = (
+                    last_image_ref[last_x] if last_image_ref is not None else None
+                )
+                last_y = find_first_valid_y(last_row, flip=use_flip_y)
+                current_offsets_x.clear()
+
+            current_offsets_x = [
+                i for i, row in enumerate(current_image_ref) if np.any(row) != off_color
+            ]
+
+            first_x = first_y = None
+            if current_offsets_x:
+                use_flip_x = layers % 2 == 1
+                first_x = current_offsets_x[-1] if use_flip_x else current_offsets_x[0]
+                first_row = current_image_ref[first_x]
+                first_y = find_first_valid_y(first_row, flip=use_flip_y)
+
+            if None in (last_x, last_y, first_x, first_y):
+                shift_x = shift_y = 0
+            else:
+                shift_x = (first_x - last_x) * fil_width
+                shift_y = (first_y - last_y) * fil_width * dist_sign_long
+                if use_flip_y:
+                    shift_y = -shift_y
+
+            if len(current_offsets_x) % 2 == 1:
+                use_flip_y = not use_flip_y
+
+            if layers > 0:
+                gcode_list.append(
+                    {"X": shift_y, "Y": shift_x, "Z": layer_height, "Color": 0}
+                )
+
+            for row in current_image_ref:
+                if all(p == off_color for p in row):
+                    dist_sign_long = -dist_sign_long
+                dist_sign_long = -dist_sign_long
+
+            # Flip path and color together on even layers so they stay aligned.
+            even_layer = (layers + 1) % 2 == 0
+            ref_for_path = (
+                np.flipud(current_image_ref) if even_layer else current_image_ref.copy()
+            )
+            current_image = (
+                np.flipud(color_ref_list[layers]) if even_layer else color_ref_list[layers]
+            )
+
+            if layers == 0:
+                direction = -1
+            direction = _gcode_layer(
+                ref_for_path,
+                current_image,
+                gcode_list,
+                fil_width,
+                direction,
+                layers,
+            )
 
     gcode_path = work_dir / f"{shape_name}_SnakePath_gcode.txt"
     pressure_cur = float(pressure)

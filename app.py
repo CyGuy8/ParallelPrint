@@ -36,7 +36,11 @@ from stl_slicer import (
     scale_mesh,
     slice_stl_to_tiffs,
 )
-from tiff_to_gcode import generate_snake_path_gcode
+from tiff_to_gcode import (
+    RASTER_PATTERN_CHOICES,
+    RASTER_PATTERN_SAME_DIRECTION,
+    generate_snake_path_gcode,
+)
 
 
 ViewerState = dict[str, Any]
@@ -2208,6 +2212,7 @@ def generate_dynamic_gcode(
     settings_table: Any,
     all_g1: bool,
     use_reference_motion: bool,
+    raster_pattern: str | None,
     ref_state: ViewerState | None,
     layer_height: float,
     pixel_size: float,
@@ -2235,6 +2240,7 @@ def generate_dynamic_gcode(
                 fil_width=float(pixel_size),
                 all_g1=bool(all_g1),
                 motion_tiffs=motion_tiffs,
+                raster_pattern=raster_pattern,
             )
             record["gcode_path"] = str(gcode_path)
             messages.append(f"Shape {record['idx']}: wrote `{gcode_path.name}`.")
@@ -2568,6 +2574,12 @@ def build_dynamic_demo() -> gr.Blocks:
                 value=True,
             )
             gcode_all_g1 = gr.Checkbox(label="Move at one constant speed (no fast travel moves)", value=True)
+            gcode_raster_pattern = gr.Dropdown(
+                label="Raster Pattern",
+                choices=list(RASTER_PATTERN_CHOICES),
+                value=RASTER_PATTERN_SAME_DIRECTION,
+                allow_custom_value=False,
+            )
             gcode_button = gr.Button("Generate G-Code", variant="primary")
             gcode_downloads = gr.File(label="Download G-Code Files", file_count="multiple", interactive=False, elem_classes=["gcode-download"])
             gcode_status = gr.Markdown("")
@@ -2727,7 +2739,7 @@ def build_dynamic_demo() -> gr.Blocks:
 
         gcode_button.click(
             fn=generate_dynamic_gcode,
-            inputs=[shape_records, shape_settings, gcode_all_g1, gcode_use_ref_motion, ref_state, layer_height, pixel_size],
+            inputs=[shape_records, shape_settings, gcode_all_g1, gcode_use_ref_motion, gcode_raster_pattern, ref_state, layer_height, pixel_size],
             outputs=[shape_records, gcode_downloads, gcode_status, gcode_text_source, gcode_source],
         )
         gcode_text_source.change(fn=load_selected_gcode_text, inputs=[shape_records, gcode_text_source], outputs=[gcode_text])
