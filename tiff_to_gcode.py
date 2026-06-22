@@ -11,14 +11,21 @@ import numpy as np
 from PIL import Image
 
 
-RASTER_PATTERN_SAME_DIRECTION = "Same-direction raster"
+RASTER_PATTERN_SAME_DIRECTION = "X-direction raster"
+RASTER_PATTERN_Y_DIRECTION = "Y-direction raster"
 RASTER_PATTERN_WOODPILE = "Woodpile raster"
-RASTER_PATTERN_CHOICES = (RASTER_PATTERN_SAME_DIRECTION, RASTER_PATTERN_WOODPILE)
+RASTER_PATTERN_CHOICES = (
+    RASTER_PATTERN_SAME_DIRECTION,
+    RASTER_PATTERN_Y_DIRECTION,
+    RASTER_PATTERN_WOODPILE,
+)
 
 
 def _normalize_raster_pattern(pattern: str | None) -> str:
     if pattern == RASTER_PATTERN_WOODPILE:
         return RASTER_PATTERN_WOODPILE
+    if pattern == RASTER_PATTERN_Y_DIRECTION:
+        return RASTER_PATTERN_Y_DIRECTION
     return RASTER_PATTERN_SAME_DIRECTION
 
 
@@ -299,18 +306,27 @@ def _woodpile_layer_segments(
     return segments
 
 
-def _build_woodpile_gcode_list(
+def _raster_axis_for_pattern(pattern: str, layer_number: int) -> str:
+    if pattern == RASTER_PATTERN_Y_DIRECTION:
+        return "Y"
+    if pattern == RASTER_PATTERN_WOODPILE and layer_number % 2 == 1:
+        return "Y"
+    return "X"
+
+
+def _build_footprint_raster_gcode_list(
     path_ref_list: list[np.ndarray],
     color_ref_list: list[np.ndarray],
     pixel_size: float,
     layer_height: float,
+    raster_pattern: str,
 ) -> list[dict]:
     gcode_list: list[dict] = []
     current_x = 0.0
     current_y = 0.0
 
     for layer_number, (path_img, color_img) in enumerate(zip(path_ref_list, color_ref_list)):
-        raster_axis = "X" if layer_number % 2 == 0 else "Y"
+        raster_axis = _raster_axis_for_pattern(raster_pattern, layer_number)
         segments = _woodpile_layer_segments(path_img, color_img, pixel_size, raster_axis)
         if not segments:
             if layer_number > 0:
@@ -423,12 +439,13 @@ def generate_snake_path_gcode(
     pressure_on_lines = [_toggle_cmd(com_port, start=True)]
     pressure_off_lines = [_toggle_cmd(com_port, start=False)]
 
-    if raster_pattern == RASTER_PATTERN_WOODPILE:
-        gcode_list = _build_woodpile_gcode_list(
+    if raster_pattern in (RASTER_PATTERN_Y_DIRECTION, RASTER_PATTERN_WOODPILE):
+        gcode_list = _build_footprint_raster_gcode_list(
             path_ref_list,
             color_ref_list,
             fil_width,
             layer_height,
+            raster_pattern,
         )
     else:
         gcode_list: list[dict] = []

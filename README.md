@@ -82,7 +82,7 @@ When you click **Generate Reference TIFF Stack**, the app combines available TIF
 - Pressure increases by `0.1` psi per layer by default.
 - **Use G1 for all moves**: when enabled, every movement line is emitted as `G1` (no `G0` rapid travel); the WAGO valve still marks where material is dispensed. Applies to all shapes.
 - **Use Reference Stack for motion**: when enabled, every shape's snake-path *motion* is taken from the combined Reference TIFF Stack while each shape's *valve/dispensing* comes from its own slices — so parallel print heads share one synchronized nozzle path and each deposits only its own geometry. Requires generating the Reference TIFF Stack on the first tab first; shapes are skipped with a message if it is missing.
-- **Raster Pattern**: `Same-direction raster` keeps the existing back-and-forth raster direction on every layer. `Woodpile raster` alternates the raster axis by layer, switching between X-direction and Y-direction sweeps.
+- **Raster Pattern**: `X-direction raster` keeps the existing X-direction back-and-forth raster on every layer. `Y-direction raster` rasters every layer in Y. `Woodpile raster` alternates the raster axis by layer, switching between X-direction and Y-direction sweeps.
 
 ### Print vs Travel Classification
 
