@@ -4,6 +4,7 @@ import tempfile
 import math
 import time
 import warnings
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -134,7 +135,7 @@ APP_CSS = """
 }
 
 #shape-settings-table table tbody tr td:last-child,
-#shape-settings-table [role="gridcell"]:nth-child(10n) {
+#shape-settings-table [role="gridcell"]:nth-child(12n) {
     color: #ffffff !important;
     cursor: pointer;
     font-size: 0 !important;
@@ -143,7 +144,7 @@ APP_CSS = """
 }
 
 #shape-settings-table table tbody tr td:last-child::after,
-#shape-settings-table [role="gridcell"]:nth-child(10n)::after {
+#shape-settings-table [role="gridcell"]:nth-child(12n)::after {
     content: "X";
     display: inline-flex;
     align-items: center;
@@ -159,9 +160,9 @@ APP_CSS = """
 }
 
 #shape-settings-table table tbody tr td:last-child input,
-#shape-settings-table [role="gridcell"]:nth-child(10n) input,
+#shape-settings-table [role="gridcell"]:nth-child(12n) input,
 #shape-settings-table table tbody tr td:last-child textarea,
-#shape-settings-table [role="gridcell"]:nth-child(10n) textarea {
+#shape-settings-table [role="gridcell"]:nth-child(12n) textarea {
     display: none !important;
 }
 
@@ -295,7 +296,7 @@ APP_HEAD = """
         });
     }
     function suppressDeleteCellEditor(event) {
-        var cell = event.target && event.target.closest ? event.target.closest('#shape-settings-table td:last-child, #shape-settings-table [role="gridcell"]:nth-child(10n)') : null;
+        var cell = event.target && event.target.closest ? event.target.closest('#shape-settings-table td:last-child, #shape-settings-table [role="gridcell"]:nth-child(12n)') : null;
         if (!cell) return;
         setTimeout(function () {
             if (document.activeElement && cell.contains(document.activeElement)) {
@@ -1377,8 +1378,23 @@ def _resolve_nozzle_layout(
     if not parts:
         return offsets, spacings
 
-    ordered = sorted(parts, key=lambda part: part["idx"])
-    offsets[ordered[0]["idx"]] = (0.0, 0.0)
+    grouped: dict[int, list[dict]] = {}
+    for part in parts:
+        grouped.setdefault(_record_nozzle_number(part, int(part.get("idx", 1) or 1)), []).append(part)
+    ordered_nozzles = sorted(grouped)
+    offsets[ordered_nozzles[0]] = (0.0, 0.0)
+
+    def nozzle_bounds(nozzle: int) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+        mins: list[tuple[float, float, float]] = []
+        maxs: list[tuple[float, float, float]] = []
+        for part in grouped[nozzle]:
+            part_min, part_max = part["parsed"]["bounds"]
+            mins.append(part_min)
+            maxs.append(part_max)
+        return (
+            tuple(min(values) for values in zip(*mins)),
+            tuple(max(values) for values in zip(*maxs)),
+        )
 
     first_spacing = (float(part_gap_12_x or 0.0), float(part_gap_12_y or 0.0))
     raw_pairs: list[tuple[float, float]] = [
@@ -1390,37 +1406,41 @@ def _resolve_nozzle_layout(
             float(extra_pair_gaps[index] or 0.0),
             float(extra_pair_gaps[index + 1] or 0.0) if index + 1 < len(extra_pair_gaps) else 0.0,
         ))
-    max_pair_count = max((int(part.get("idx", 0)) for part in parts), default=1) - 1
+    max_pair_count = max(0, len(ordered_nozzles) - 1)
     while len(raw_pairs) < max_pair_count:
         raw_pairs.append(first_spacing)
     if same_spacing:
         raw_pairs = [first_spacing for _ in raw_pairs]
 
     pair_spacing = {
-        (index + 1, index + 2): raw_pairs[index]
-        for index in range(len(raw_pairs))
+        (ordered_nozzles[index], ordered_nozzles[index + 1]): raw_pairs[index]
+        for index in range(min(len(raw_pairs), max_pair_count))
     }
 
     def spacing_between(prev_idx: int, cur_idx: int) -> tuple[float, float]:
         if (prev_idx, cur_idx) in pair_spacing:
             return pair_spacing[(prev_idx, cur_idx)]
-        if cur_idx <= prev_idx:
+        try:
+            start_pos = ordered_nozzles.index(prev_idx)
+            end_pos = ordered_nozzles.index(cur_idx)
+        except ValueError:
+            return 0.0, 0.0
+        if end_pos <= start_pos:
             return 0.0, 0.0
         total_x = 0.0
         total_y = 0.0
-        for pair_idx in range(prev_idx, cur_idx):
-            step_x, step_y = pair_spacing.get((pair_idx, pair_idx + 1), first_spacing)
+        for pair_pos in range(start_pos, end_pos):
+            pair = (ordered_nozzles[pair_pos], ordered_nozzles[pair_pos + 1])
+            step_x, step_y = pair_spacing.get(pair, first_spacing)
             total_x += step_x
             total_y += step_y
         return total_x, total_y
 
-    for previous, current in zip(ordered, ordered[1:]):
-        prev_idx = previous["idx"]
-        cur_idx = current["idx"]
+    for prev_idx, cur_idx in zip(ordered_nozzles, ordered_nozzles[1:]):
         gap_x, y_step = spacing_between(prev_idx, cur_idx)
         prev_offset_x, prev_offset_y = offsets[prev_idx]
-        (_, _, _), (prev_xmax, _prev_ymax, _) = previous["parsed"]["bounds"]
-        (cur_xmin, _cur_ymin, _), (_, _, _) = current["parsed"]["bounds"]
+        (_, _, _), (prev_xmax, _prev_ymax, _) = nozzle_bounds(prev_idx)
+        (cur_xmin, _cur_ymin, _), (_, _, _) = nozzle_bounds(cur_idx)
         dx = (prev_xmax + prev_offset_x + gap_x) - cur_xmin
         dy = prev_offset_y + y_step
         offsets[cur_idx] = (dx, dy)
@@ -1442,8 +1462,9 @@ def _format_shape_dimensions(parts: list[dict]) -> list[str]:
     lines = ["**Shape dimensions from generated G-code:**"]
     for part in sorted(parts, key=lambda item: item["idx"]):
         (xmin, ymin, zmin), (xmax, ymax, zmax) = part["parsed"]["bounds"]
+        nozzle = _record_nozzle_number(part, int(part.get("idx", 1) or 1))
         lines.append(
-            f"Shape {part['idx']}: X {xmax - xmin:.2f} mm, "
+            f"Shape {part['idx']} (Nozzle {nozzle}): X {xmax - xmin:.2f} mm, "
             f"Y {ymax - ymin:.2f} mm, Z {zmax - zmin:.2f} mm."
         )
     return lines
@@ -1463,7 +1484,7 @@ def _format_nozzle_spacing_status(
             lines.append(f"Nozzle {idx}: X {x:.2f} mm, Y {y:.2f} mm.")
 
     if not spacings:
-        lines.append("Generate G-code for at least two shapes to calculate nozzle spacing.")
+        lines.append("Generate G-code for at least two nozzles to calculate nozzle spacing.")
         return "  \n".join(lines)
 
     lines.append("**Nozzle-to-nozzle distances:**")
@@ -1614,7 +1635,142 @@ def generate_reference_stack(
     return ref_state, slider, label, preview
 
 
-SHAPE_SETTINGS_HEADERS = ["Shape", "STL", "Target X (mm)", "Target Y (mm)", "Target Z (mm)", "Pressure (psi)", "Valve", "Port", "Color", "Delete"]
+def _zip_tiff_paths(tiff_paths: list[Path], zip_path: Path) -> None:
+    with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for tiff_path in tiff_paths:
+            archive.write(tiff_path, arcname=tiff_path.name)
+
+
+def _partition_length(length: int, count: int) -> list[tuple[int, int]]:
+    base = length // count
+    remainder = length % count
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for index in range(count):
+        size = base + (1 if index < remainder else 0)
+        end = start + size
+        spans.append((start, end))
+        start = end
+    return spans
+
+
+def split_tiff_stack_grid(
+    state: ViewerState,
+    base_name: str = "split_shape",
+    columns: float = 2,
+    rows: float = 1,
+    progress: gr.Progress = gr.Progress(),
+) -> list[dict[str, Any]]:
+    tiff_paths = [Path(path) for path in state.get("tiff_paths", [])]
+    if not tiff_paths:
+        raise ValueError("Generate a TIFF stack for the selected shape before splitting it.")
+
+    with Image.open(tiff_paths[0]) as first_image:
+        width, height = first_image.size
+    column_count = max(1, _coerce_int(columns, 2))
+    row_count = max(1, _coerce_int(rows, 1))
+    if column_count > width:
+        raise ValueError(f"Cannot split {width}-pixel-wide TIFF slices into {column_count} columns.")
+    if row_count > height:
+        raise ValueError(f"Cannot split {height}-pixel-tall TIFF slices into {row_count} rows.")
+
+    safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in base_name).strip("_") or "split_shape"
+    output_dir = Path(tempfile.mkdtemp(prefix=f"{safe_name}_split_"))
+    x_spans = _partition_length(width, column_count)
+    y_spans = _partition_length(height, row_count)
+    pieces: list[dict[str, Any]] = []
+    for row_index, (y_start, y_end) in enumerate(y_spans, start=1):
+        for col_index, (x_start, x_end) in enumerate(x_spans, start=1):
+            piece_dir = output_dir / f"r{row_index:02d}_c{col_index:02d}_tiff_slices"
+            piece_dir.mkdir(parents=True, exist_ok=True)
+            pieces.append({
+                "row": row_index,
+                "col": col_index,
+                "x_start": x_start,
+                "x_end": x_end,
+                "y_start": y_start,
+                "y_end": y_end,
+                "tiff_dir": piece_dir,
+                "tiff_paths": [],
+            })
+
+    for index, source_path in enumerate(tiff_paths):
+        progress(index / max(len(tiff_paths), 1), desc=f"Splitting layer {index + 1}/{len(tiff_paths)}")
+        with Image.open(source_path) as image:
+            layer = image.convert("L")
+            if layer.size != (width, height):
+                raise ValueError("All TIFF slices must have the same dimensions to split the stack.")
+
+            for piece in pieces:
+                piece_image = layer.crop((piece["x_start"], piece["y_start"], piece["x_end"], piece["y_end"]))
+                piece_path = piece["tiff_dir"] / f"slice_{index:04d}.tif"
+                piece_image.save(piece_path, compression="tiff_deflate")
+                piece["tiff_paths"].append(piece_path)
+
+    pixel_size = float(state.get("pixel_size", 0.0) or 0.0)
+    z_values = list(state.get("z_values", []))
+    if len(z_values) < len(tiff_paths):
+        z_values.extend([0.0] * (len(tiff_paths) - len(z_values)))
+
+    base_x_min = float(state.get("x_min", 0.0) or 0.0)
+    base_y_min = float(state.get("y_min", 0.0) or 0.0)
+    for piece in pieces:
+        piece_width = piece["x_end"] - piece["x_start"]
+        piece_height = piece["y_end"] - piece["y_start"]
+        zip_path = output_dir / f"{safe_name}_r{piece['row']:02d}_c{piece['col']:02d}_tiff_slices.zip"
+        _zip_tiff_paths(piece["tiff_paths"], zip_path)
+        piece_state: ViewerState = {
+            "tiff_paths": [str(path) for path in piece["tiff_paths"]],
+            "z_values": z_values[: len(piece["tiff_paths"])],
+            "pixel_size": pixel_size,
+            "x_min": base_x_min + (piece["x_start"] * pixel_size),
+            "y_min": base_y_min + ((height - piece["y_end"]) * pixel_size),
+            "image_width": piece_width,
+            "image_height": piece_height,
+            "zip_path": str(zip_path),
+        }
+        piece["state"] = piece_state
+        piece["zip_path"] = zip_path
+    return pieces
+
+
+def split_tiff_stack_left_right(
+    state: ViewerState,
+    base_name: str = "split_shape",
+    progress: gr.Progress = gr.Progress(),
+) -> tuple[ViewerState, ViewerState, Path, Path]:
+    pieces = split_tiff_stack_grid(state, base_name=base_name, columns=2, rows=1, progress=progress)
+    return pieces[0]["state"], pieces[1]["state"], pieces[0]["zip_path"], pieces[1]["zip_path"]
+
+
+SHAPE_SETTINGS_HEADERS = [
+    "Shape",
+    "STL",
+    "Target X (mm)",
+    "Target Y (mm)",
+    "Target Z (mm)",
+    "Pressure (psi)",
+    "Valve",
+    "Nozzle",
+    "Port",
+    "Color",
+    "Contour Tracing",
+    "Delete",
+]
+SHAPE_SETTINGS_DATATYPES = [
+    "number",
+    "str",
+    "number",
+    "number",
+    "number",
+    "number",
+    "number",
+    "number",
+    "number",
+    "str",
+    "bool",
+    "str",
+]
 SIMPLE_NOZZLE_SPACING_HEADERS = [
     "Spacing Mode",
     "Applies To",
@@ -1622,8 +1778,8 @@ SIMPLE_NOZZLE_SPACING_HEADERS = [
     "Y nozzle spacing (mm)",
 ]
 ADVANCED_NOZZLE_SPACING_HEADERS = [
-    "From Shape",
-    "To Shape",
+    "From Nozzle",
+    "To Nozzle",
     "X edge spacing (mm)",
     "Y nozzle spacing (mm)",
 ]
@@ -1638,6 +1794,39 @@ def _normalise_rows(table: Any) -> list[list[Any]]:
     if isinstance(table, dict) and "data" in table:
         return table.get("data") or []
     return list(table or [])
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    if text in {"1", "true", "yes", "y", "on", "checked"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "unchecked"}:
+        return False
+    return default
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        try:
+            return int(float(default))
+        except (TypeError, ValueError):
+            return 0
+
+
+def _record_nozzle_number(record: dict, fallback: int | None = None) -> int:
+    default = fallback if fallback is not None else int(record.get("idx", 1) or 1)
+    nozzle = _coerce_int(record.get("nozzle", default), default)
+    return nozzle if nozzle > 0 else default
 
 
 def _file_path_value(file_value: Any) -> str | None:
@@ -1710,8 +1899,10 @@ def _records_from_files(files: Any, previous_records: list[dict] | None = None) 
             "last_scaled_axis": previous.get("last_scaled_axis", "target_x"),
             "pressure": previous.get("pressure", 25.0),
             "valve": previous.get("valve", 4),
+            "nozzle": previous.get("nozzle", index),
             "port": previous.get("port", 1),
             "color": previous.get("color", _default_color(index)),
+            "contour_tracing": previous.get("contour_tracing", False),
             "tiff_state": previous.get("tiff_state", _empty_state()),
             "zip_path": previous.get("zip_path"),
             "gcode_path": previous.get("gcode_path"),
@@ -1738,8 +1929,10 @@ def _shape_settings_rows(records: list[dict]) -> list[list[Any]]:
             record.get("target_z", DEFAULT_TARGET_EXTENTS[2]),
             record.get("pressure", 25.0),
             record.get("valve", 4),
+            _record_nozzle_number(record, int(record["idx"])),
             record.get("port", 1),
             record.get("color", _default_color(record["idx"])),
+            bool(record.get("contour_tracing", False)),
             "Delete",
         ]
         for record in records
@@ -1773,20 +1966,33 @@ def _apply_shape_settings(records: list[dict], settings_table: Any) -> list[dict
                 ("target_z", 4, DEFAULT_TARGET_EXTENTS[2]),
                 ("pressure", 5, 25.0),
                 ("valve", 6, 4),
-                ("port", 7, 1),
             ):
                 try:
                     copy[key] = float(row[pos])
                 except (IndexError, TypeError, ValueError):
                     copy[key] = copy.get(key, default)
+            has_nozzle_column = len(row) >= len(SHAPE_SETTINGS_HEADERS)
+            nozzle_pos = 7 if has_nozzle_column else None
+            port_pos = 8 if has_nozzle_column else 7
+            color_pos = 9 if has_nozzle_column else 8
+            contour_pos = 10 if has_nozzle_column else 9
+            copy["valve"] = _coerce_int(copy.get("valve", 4), 4)
+            copy["nozzle"] = _coerce_int(
+                row[nozzle_pos] if nozzle_pos is not None else copy.get("nozzle", copy.get("idx", 1)),
+                _record_nozzle_number(copy),
+            )
+            copy["port"] = _coerce_int(
+                row[port_pos] if len(row) > port_pos else copy.get("port", 1),
+                _coerce_int(copy.get("port", 1), 1),
+            )
+            if copy["nozzle"] <= 0:
+                copy["nozzle"] = _record_nozzle_number(copy)
+            if len(row) > color_pos and row[color_pos]:
+                copy["color"] = str(row[color_pos])
             try:
-                copy["valve"] = int(float(copy["valve"]))
-                copy["port"] = int(float(copy["port"]))
-            except (TypeError, ValueError):
-                copy["valve"] = 4
-                copy["port"] = 1
-            if len(row) > 8 and row[8]:
-                copy["color"] = str(row[8])
+                copy["contour_tracing"] = _coerce_bool(row[contour_pos], bool(copy.get("contour_tracing", False)))
+            except IndexError:
+                copy["contour_tracing"] = bool(copy.get("contour_tracing", False))
         updated.append(copy)
     return updated
 
@@ -1823,8 +2029,23 @@ def _last_edited_target_axes(records: list[dict] | None, settings_table: Any) ->
     return edited_axes
 
 
-def _shape_spacing_label(record: dict) -> str:
-    return f"Shape {record.get('idx', '?')}: {record.get('name') or 'Unnamed'}"
+def _nozzle_spacing_label(nozzle: int, records: list[dict]) -> str:
+    shapes = [
+        f"Shape {record.get('idx', '?')}"
+        for record in records
+        if _record_nozzle_number(record, int(record.get("idx", 1) or 1)) == nozzle
+    ]
+    if shapes:
+        return f"Nozzle {nozzle}: {', '.join(shapes)}"
+    return f"Nozzle {nozzle}"
+
+
+def _ordered_nozzle_numbers(records: list[dict]) -> list[int]:
+    nozzles = {
+        _record_nozzle_number(record, int(record.get("idx", position) or position))
+        for position, record in enumerate(records, start=1)
+    }
+    return sorted(nozzles)
 
 
 def _spacing_pairs_from_table(spacing_table: Any) -> list[tuple[float, float]]:
@@ -1849,18 +2070,19 @@ def _spacing_table_update(records: list[dict], existing_table: Any | None = None
     if not use_individual_spacing:
         return gr.update(
             headers=SIMPLE_NOZZLE_SPACING_HEADERS,
-            value=[["Same spacing", "All neighboring shapes", first_pair[0], first_pair[1]]],
+            value=[["Same spacing", "All neighboring nozzles", first_pair[0], first_pair[1]]],
             row_count=(1, "fixed"),
             column_count=(len(SIMPLE_NOZZLE_SPACING_HEADERS), "fixed"),
             label="Nozzle Spacing",
         )
 
     rows: list[list[Any]] = []
-    for index, (first, second) in enumerate(zip(records, records[1:])):
+    ordered_nozzles = _ordered_nozzle_numbers(records)
+    for index, (first, second) in enumerate(zip(ordered_nozzles, ordered_nozzles[1:])):
         gap_x, gap_y = pairs[index] if index < len(pairs) else first_pair
         rows.append([
-            _shape_spacing_label(first),
-            _shape_spacing_label(second),
+            _nozzle_spacing_label(first, records),
+            _nozzle_spacing_label(second, records),
             gap_x,
             gap_y,
         ])
@@ -2085,6 +2307,21 @@ def normalize_shape_dimensions_for_mode(
     return normalized, _shape_settings_rows(normalized)
 
 
+def normalize_shape_settings_and_spacing(
+    records: list[dict] | None,
+    settings_table: Any | None,
+    scale_mode: str | None,
+    existing_spacing: Any | None,
+    use_individual_spacing: bool | None,
+) -> tuple:
+    updated_records, updated_settings = normalize_shape_dimensions_for_mode(records, settings_table, scale_mode)
+    return (
+        updated_records,
+        updated_settings,
+        _spacing_table_update(updated_records, existing_spacing, use_individual_spacing),
+    )
+
+
 def show_selected_model(
     records: list[dict] | None,
     selected: str | None,
@@ -2148,7 +2385,19 @@ def generate_dynamic_stacks(
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
     if not records:
-        return records, [], "Upload at least one STL first.", _dropdown_update(records), _reset_slider(), "No slice stack loaded yet.", None
+        return (
+            records,
+            [],
+            "Upload at least one STL first.",
+            _dropdown_update(records),
+            _reset_slider(),
+            "No slice stack loaded yet.",
+            None,
+            _empty_state(),
+            _reset_slider(),
+            "No reference stack generated yet.",
+            None,
+        )
     total = len(records)
     messages: list[str] = []
     for pos, record in enumerate(records):
@@ -2182,6 +2431,11 @@ def generate_dynamic_stacks(
             messages.append(f"Shape {record['idx']}: wrote `{stack.zip_path.name}`.")
         except Exception as exc:
             messages.append(f"Shape {record['idx']}: failed ({exc}).")
+    ref_state, ref_slider, ref_label, ref_preview = generate_dynamic_reference_stack(records, progress=progress)
+    if (ref_state or {}).get("tiff_paths"):
+        messages.append("Reference TIFF Stack: updated automatically.")
+    else:
+        messages.append("Reference TIFF Stack: skipped (no generated shape slices available).")
     first_state = records[0].get("tiff_state") or _empty_state()
     label, preview = _render_selected_slice(first_state, 0)
     slider = gr.update(
@@ -2199,12 +2453,197 @@ def generate_dynamic_stacks(
         slider,
         label,
         preview,
+        ref_state,
+        ref_slider,
+        ref_label,
+        ref_preview,
     )
 
 
 def generate_dynamic_reference_stack(records: list[dict] | None, progress: gr.Progress = gr.Progress()) -> tuple:
     states = [record.get("tiff_state") or _empty_state() for record in (records or [])]
     return generate_reference_stack(*states, progress=progress)
+
+
+def _split_piece_choice(piece: dict[str, Any]) -> str:
+    return f"R{piece['row']} C{piece['col']}"
+
+
+def _split_piece_dropdown_update(pieces: list[dict[str, Any]], selected: str | None = None) -> dict[str, Any]:
+    choices = [_split_piece_choice(piece) for piece in pieces]
+    value = selected if selected in choices else (choices[0] if choices else None)
+    return gr.update(choices=choices, value=value)
+
+
+def _selected_split_piece(pieces: list[dict[str, Any]] | None, selected: str | None) -> dict[str, Any] | None:
+    if not pieces:
+        return None
+    for piece in pieces:
+        if _split_piece_choice(piece) == selected:
+            return piece
+    return pieces[0]
+
+
+def preview_selected_split_piece(pieces: list[dict[str, Any]] | None, selected: str | None) -> tuple:
+    piece = _selected_split_piece(pieces, selected)
+    if not piece:
+        return _reset_slider(), "No split stack generated yet.", None
+    state = piece.get("state") or _empty_state()
+    label, preview = _render_selected_slice(state, 0)
+    slider = gr.update(
+        minimum=0,
+        maximum=max(0, len(state.get("tiff_paths", [])) - 1),
+        value=0,
+        step=1,
+        interactive=len(state.get("tiff_paths", [])) > 1,
+    )
+    return slider, label, preview
+
+
+def jump_to_selected_split_piece(pieces: list[dict[str, Any]] | None, selected: str | None, index: float) -> tuple:
+    piece = _selected_split_piece(pieces, selected)
+    if not piece:
+        return "No split stack generated yet.", None
+    return _render_selected_slice(piece.get("state") or _empty_state(), int(index))
+
+
+def shift_selected_split_piece(pieces: list[dict[str, Any]] | None, selected: str | None, index: float, delta: int) -> tuple:
+    piece = _selected_split_piece(pieces, selected)
+    if not piece:
+        return gr.update(value=0), "No split stack generated yet.", None
+    state = piece.get("state") or _empty_state()
+    new_index, label, preview = shift_slice(state, index, delta)
+    return gr.update(value=new_index), label, preview
+
+
+def split_selected_shape_for_grid(
+    records: list[dict] | None,
+    selected: str | None,
+    settings_table: Any | None,
+    existing_spacing: Any | None,
+    use_individual_spacing: bool | None,
+    columns: float,
+    rows: float,
+    starting_nozzle: float,
+    starting_valve: float,
+    progress: gr.Progress = gr.Progress(),
+) -> tuple:
+    records = _apply_shape_settings(records or [], settings_table)
+    if not records:
+        empty = _empty_state()
+        return (
+            records,
+            _shape_settings_rows(records),
+            _spacing_table_update(records, existing_spacing, use_individual_spacing),
+            [],
+            [],
+            _gcode_dropdown_update(records),
+            _gcode_dropdown_update(records, include_upload=True),
+            _dropdown_update(records),
+            [],
+            [],
+            _split_piece_dropdown_update([]),
+            _reset_slider(),
+            "No split stack generated yet.",
+            None,
+            "Generate TIFF stacks for a shape before splitting it.",
+        )
+
+    pos = _selected_record_index(records, selected)
+    if pos < 0:
+        pos = 0
+    source = records[pos]
+    state = source.get("tiff_state") or _empty_state()
+    try:
+        pieces = split_tiff_stack_grid(
+            state,
+            base_name=str(source.get("name") or f"shape_{source.get('idx', pos + 1)}"),
+            columns=columns,
+            rows=rows,
+            progress=progress,
+        )
+    except Exception as exc:
+        empty = _empty_state()
+        return (
+            records,
+            _shape_settings_rows(records),
+            _spacing_table_update(records, existing_spacing, use_individual_spacing),
+            [record.get("zip_path") for record in records if record.get("zip_path")],
+            [record.get("gcode_path") for record in records if record.get("gcode_path")],
+            _gcode_dropdown_update(records),
+            _gcode_dropdown_update(records, include_upload=True),
+            _dropdown_update(records, selected),
+            [],
+            [],
+            _split_piece_dropdown_update([]),
+            _reset_slider(),
+            "No split stack generated yet.",
+            None,
+            f"Split failed: {exc}",
+        )
+
+    base_name = str(source.get("name") or f"Shape {source.get('idx', pos + 1)}")
+    first_nozzle = max(1, _coerce_int(starting_nozzle, 1))
+    first_valve = max(1, _coerce_int(starting_valve, _coerce_int(source.get("valve", 4), 4)))
+    split_records: list[dict] = []
+    for index, piece in enumerate(pieces):
+        piece_state = piece["state"]
+        piece_width_mm = float(piece_state.get("image_width", 0) or 0) * float(piece_state.get("pixel_size", 0.0) or 0.0)
+        piece_height_mm = float(piece_state.get("image_height", 0) or 0) * float(piece_state.get("pixel_size", 0.0) or 0.0)
+        piece_record = dict(source)
+        piece_record.update({
+            "name": f"{base_name} - R{piece['row']}C{piece['col']}",
+            "stl_path": None,
+            "target_x": piece_width_mm or source.get("target_x", DEFAULT_TARGET_EXTENTS[0]),
+            "target_y": piece_height_mm or source.get("target_y", DEFAULT_TARGET_EXTENTS[1]),
+            "nozzle": first_nozzle + index,
+            "valve": first_valve + index,
+            "tiff_state": piece_state,
+            "zip_path": str(piece["zip_path"]),
+            "gcode_path": None,
+        })
+        split_records.append(piece_record)
+    next_records = _reindex_shape_records([*records[:pos], *split_records, *records[pos + 1:]])
+    slider, label, preview = preview_selected_split_piece(pieces, None)
+    status = (
+        f"Split Shape {source.get('idx', pos + 1)} into {len(pieces)} print-ready stacks "
+        f"({max(1, _coerce_int(columns, 2))} columns x {max(1, _coerce_int(rows, 1))} rows).  \n"
+        f"Nozzles {first_nozzle}-{first_nozzle + len(pieces) - 1}; valves {first_valve}-{first_valve + len(pieces) - 1}."
+    )
+    return (
+        next_records,
+        _shape_settings_rows(next_records),
+        _spacing_table_update(next_records, existing_spacing, use_individual_spacing),
+        [record.get("zip_path") for record in next_records if record.get("zip_path")],
+        [record.get("gcode_path") for record in next_records if record.get("gcode_path")],
+        _gcode_dropdown_update(next_records),
+        _gcode_dropdown_update(next_records, include_upload=True),
+        _dropdown_update(next_records),
+        [str(piece["zip_path"]) for piece in pieces],
+        pieces,
+        _split_piece_dropdown_update(pieces),
+        slider,
+        label,
+        preview,
+        status,
+    )
+
+
+def _contour_tracing_sources(records: list[dict]) -> list[dict]:
+    sources: list[dict] = []
+    for record in records:
+        if not record.get("contour_tracing"):
+            continue
+        state = record.get("tiff_state") or {}
+        tiff_paths = state.get("tiff_paths") or []
+        source = {
+            "owner_idx": int(record.get("idx", len(sources) + 1)),
+            "tiff_paths": list(tiff_paths),
+            "zip_path": record.get("zip_path"),
+        }
+        if source["tiff_paths"] or source["zip_path"]:
+            sources.append(source)
+    return sources
 
 
 def generate_dynamic_gcode(
@@ -2219,7 +2658,11 @@ def generate_dynamic_gcode(
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
     motion_tiffs = (ref_state or {}).get("tiff_paths") if use_reference_motion else None
+    contour_sources = _contour_tracing_sources(records)
     messages: list[str] = []
+    if contour_sources:
+        enabled = ", ".join(f"Shape {source['owner_idx']}" for source in contour_sources)
+        messages.append(f"Contour tracing enabled for {enabled}.")
     for record in records:
         zip_path = record.get("zip_path")
         if not zip_path:
@@ -2241,6 +2684,8 @@ def generate_dynamic_gcode(
                 all_g1=bool(all_g1),
                 motion_tiffs=motion_tiffs,
                 raster_pattern=raster_pattern,
+                contour_tiff_sets=contour_sources,
+                active_contour_owner=int(record.get("idx", 0)),
             )
             record["gcode_path"] = str(gcode_path)
             messages.append(f"Shape {record['idx']}: wrote `{gcode_path.name}`.")
@@ -2285,8 +2730,9 @@ def _parts_from_records(records: list[dict] | None) -> tuple[list[dict], list[st
         if not parsed.get("point_count"):
             messages.append(f"Shape {idx}: no G0/G1 moves found.")
             continue
-        parts.append({"idx": idx, "color": record.get("color", _default_color(idx)), "parsed": parsed})
-        messages.append(f"Shape {idx}: {parsed['point_count']} moves, {parsed.get('layer_count', 0)} layer(s).")
+        nozzle = _record_nozzle_number(record, idx)
+        parts.append({"idx": idx, "nozzle": nozzle, "color": record.get("color", _default_color(idx)), "parsed": parsed})
+        messages.append(f"Shape {idx} (Nozzle {nozzle}): {parsed['point_count']} moves, {parsed.get('layer_count', 0)} layer(s).")
     return parts, messages
 
 
@@ -2480,6 +2926,7 @@ def build_dynamic_demo() -> gr.Blocks:
         shape_records = gr.State([])
         last_shape_delete_at = gr.State(0.0)
         ref_state = gr.State(_empty_state())
+        split_piece_states = gr.State([])
 
         with gr.Tab("STL to TIFF Slicer"):
             gr.Markdown(
@@ -2512,6 +2959,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 value=[],
                 row_count=(0, "dynamic"),
                 column_count=(len(SHAPE_SETTINGS_HEADERS), "fixed"),
+                datatype=SHAPE_SETTINGS_DATATYPES,
                 interactive=True,
                 label="Shape Settings",
                 elem_id="shape-settings-table",
@@ -2562,15 +3010,44 @@ def build_dynamic_demo() -> gr.Blocks:
                         ref_next_button = gr.Button("Next", scale=1, min_width=90, size="sm")
                     ref_slice_slider = gr.Slider(label="Slice Index", minimum=0, maximum=0, value=0, step=1, interactive=False)
 
+        with gr.Tab("Single Shape Multi-Nozzle"):
+            gr.Markdown(
+                """
+                # Single Shape Multi-Nozzle
+                Split one generated TIFF stack into a row/column grid, then print each piece with a different nozzle.
+                """
+            )
+            with gr.Row():
+                split_source = gr.Dropdown(label="Source Shape", choices=[], value=None, allow_custom_value=False)
+                split_refresh_sources = gr.Button("Refresh Source Shapes", variant="secondary", size="sm")
+            with gr.Row():
+                split_columns = gr.Number(label="Columns (X)", value=2, minimum=1, step=1)
+                split_rows = gr.Number(label="Rows (Y)", value=1, minimum=1, step=1)
+                split_start_nozzle = gr.Number(label="Starting Nozzle", value=1, minimum=1, step=1)
+                split_start_valve = gr.Number(label="Starting Valve", value=4, minimum=1, step=1)
+            split_button = gr.Button("Split Selected Shape into Grid Pieces", variant="primary")
+            split_status = gr.Markdown("Generate a TIFF stack, then split it for multi-nozzle printing.")
+            split_downloads = gr.File(label="Download Split TIFF ZIPs", file_count="multiple", interactive=False)
+            with gr.Row():
+                with gr.Column(scale=1, min_width=260):
+                    split_piece_source = gr.Dropdown(label="Preview Generated Piece", choices=[], value=None, allow_custom_value=False)
+                    with gr.Row():
+                        split_piece_prev = gr.Button("Prev", scale=1, min_width=90, size="sm")
+                        split_piece_next = gr.Button("Next", scale=1, min_width=90, size="sm")
+                    split_piece_slider = gr.Slider(label="Piece Slice Index", minimum=0, maximum=0, value=0, step=1, interactive=False)
+                    split_piece_label = gr.Markdown("No split stack generated yet.")
+                with gr.Column(scale=2, min_width=420):
+                    split_piece_preview = gr.Image(label="Generated Piece Preview", type="pil", image_mode="RGB", height=330)
+
         with gr.Tab("TIFF Slices to GCode"):
             gr.Markdown(
                 """
                 # TIFF Slices to GCode
-                Generate G-code for every shape with a TIFF stack. Pressure, valve, port, and color come from the Shape Settings table.
+                Generate G-code for every shape with a TIFF stack. Pressure, valve, nozzle, port, and color come from the Shape Settings table.
                 """
             )
             gcode_use_ref_motion = gr.Checkbox(
-                label="Use Reference Stack for motion (all shapes share one nozzle path; each dispenses only its own geometry). Generate the Reference TIFF Stack on the first tab first.",
+                label="Use Reference Stack for motion (all shapes share one nozzle path; each dispenses only its own geometry).",
                 value=True,
             )
             gcode_all_g1 = gr.Checkbox(label="Move at one constant speed (no fast travel moves)", value=True)
@@ -2593,7 +3070,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 nozzle_use_individual_spacing = gr.Checkbox(label="Advanced Settings", value=False)
                 nozzle_spacing_table = gr.Dataframe(
                     headers=NOZZLE_SPACING_HEADERS,
-                    value=[["Same spacing", "All neighboring shapes", 5.0, 0.0]],
+                    value=[["Same spacing", "All neighboring nozzles", 5.0, 0.0]],
                     row_count=(1, "fixed"),
                     column_count=(len(NOZZLE_SPACING_HEADERS), "fixed"),
                     interactive=True,
@@ -2684,20 +3161,40 @@ def build_dynamic_demo() -> gr.Blocks:
             parallel_mode = gr.State("tube")
 
         shape_sync_outputs = [shape_records, shape_settings, nozzle_spacing_table, selected_shape, gcode_text_source, gcode_source, tiff_downloads, gcode_downloads]
-        stl_upload.change(fn=sync_uploaded_shapes, inputs=[stl_upload, shape_records, shape_settings, nozzle_spacing_table, nozzle_use_individual_spacing], outputs=shape_sync_outputs)
-        sync_uploads_button.click(fn=sync_uploaded_shapes, inputs=[stl_upload, shape_records, shape_settings, nozzle_spacing_table, nozzle_use_individual_spacing], outputs=shape_sync_outputs)
-        load_samples_button.click(fn=load_sample_shapes, inputs=[stl_upload, shape_records, shape_settings, nozzle_spacing_table, nozzle_use_individual_spacing], outputs=[stl_upload, *shape_sync_outputs])
+        stl_upload.change(fn=sync_uploaded_shapes, inputs=[stl_upload, shape_records, shape_settings, nozzle_spacing_table, nozzle_use_individual_spacing], outputs=shape_sync_outputs).then(
+            fn=lambda records: _dropdown_update(records),
+            inputs=[shape_records],
+            outputs=[split_source],
+            queue=False,
+        )
+        sync_uploads_button.click(fn=sync_uploaded_shapes, inputs=[stl_upload, shape_records, shape_settings, nozzle_spacing_table, nozzle_use_individual_spacing], outputs=shape_sync_outputs).then(
+            fn=lambda records: _dropdown_update(records),
+            inputs=[shape_records],
+            outputs=[split_source],
+            queue=False,
+        )
+        load_samples_button.click(fn=load_sample_shapes, inputs=[stl_upload, shape_records, shape_settings, nozzle_spacing_table, nozzle_use_individual_spacing], outputs=[stl_upload, *shape_sync_outputs]).then(
+            fn=lambda records: _dropdown_update(records),
+            inputs=[shape_records],
+            outputs=[split_source],
+            queue=False,
+        )
         shape_settings.select(
             fn=delete_shape_from_settings,
             inputs=[shape_records, shape_settings, nozzle_spacing_table, nozzle_use_individual_spacing, last_shape_delete_at],
             outputs=[stl_upload, *shape_sync_outputs, last_shape_delete_at],
+        ).then(
+            fn=lambda records: _dropdown_update(records),
+            inputs=[shape_records],
+            outputs=[split_source],
+            queue=False,
         )
 
         preview_inputs = [shape_records, selected_shape, shape_settings, model_opacity, scale_mode]
         shape_settings.change(
-            fn=normalize_shape_dimensions_for_mode,
-            inputs=[shape_records, shape_settings, scale_mode],
-            outputs=[shape_records, shape_settings],
+            fn=normalize_shape_settings_and_spacing,
+            inputs=[shape_records, shape_settings, scale_mode, nozzle_spacing_table, nozzle_use_individual_spacing],
+            outputs=[shape_records, shape_settings, nozzle_spacing_table],
             queue=False,
         )
         selected_shape.change(fn=show_selected_model, inputs=preview_inputs, outputs=[model_viewer, model_details, slice_slider, slice_label, slice_preview])
@@ -2730,12 +3227,66 @@ def build_dynamic_demo() -> gr.Blocks:
         generate_button.click(
             fn=generate_dynamic_stacks,
             inputs=[shape_records, shape_settings, layer_height, pixel_size, scale_mode],
-            outputs=[shape_records, tiff_downloads, slicer_status, selected_shape, slice_slider, slice_label, slice_preview],
+            outputs=[
+                shape_records,
+                tiff_downloads,
+                slicer_status,
+                selected_shape,
+                slice_slider,
+                slice_label,
+                slice_preview,
+                ref_state,
+                ref_slice_slider,
+                ref_slice_label,
+                ref_slice_preview,
+            ],
+        ).then(
+            fn=lambda records: _dropdown_update(records),
+            inputs=[shape_records],
+            outputs=[split_source],
+            queue=False,
         )
         ref_generate_button.click(fn=generate_dynamic_reference_stack, inputs=[shape_records], outputs=[ref_state, ref_slice_slider, ref_slice_label, ref_slice_preview])
         ref_slice_slider.release(fn=jump_to_slice, inputs=[ref_state, ref_slice_slider], outputs=[ref_slice_label, ref_slice_preview], queue=False)
         ref_prev_button.click(fn=lambda sv, idx: shift_slice(sv, idx, -1), inputs=[ref_state, ref_slice_slider], outputs=[ref_slice_slider, ref_slice_label, ref_slice_preview], queue=False)
         ref_next_button.click(fn=lambda sv, idx: shift_slice(sv, idx, 1), inputs=[ref_state, ref_slice_slider], outputs=[ref_slice_slider, ref_slice_label, ref_slice_preview], queue=False)
+
+        split_refresh_sources.click(fn=lambda records: _dropdown_update(records), inputs=[shape_records], outputs=[split_source], queue=False)
+        split_button.click(
+            fn=split_selected_shape_for_grid,
+            inputs=[
+                shape_records,
+                split_source,
+                shape_settings,
+                nozzle_spacing_table,
+                nozzle_use_individual_spacing,
+                split_columns,
+                split_rows,
+                split_start_nozzle,
+                split_start_valve,
+            ],
+            outputs=[
+                shape_records,
+                shape_settings,
+                nozzle_spacing_table,
+                tiff_downloads,
+                gcode_downloads,
+                gcode_text_source,
+                gcode_source,
+                split_source,
+                split_downloads,
+                split_piece_states,
+                split_piece_source,
+                split_piece_slider,
+                split_piece_label,
+                split_piece_preview,
+                split_status,
+            ],
+        )
+        split_piece_source.change(fn=preview_selected_split_piece, inputs=[split_piece_states, split_piece_source], outputs=[split_piece_slider, split_piece_label, split_piece_preview], queue=False)
+        split_piece_slider.release(fn=jump_to_selected_split_piece, inputs=[split_piece_states, split_piece_source, split_piece_slider], outputs=[split_piece_label, split_piece_preview], queue=False)
+        split_piece_prev.click(fn=lambda pieces, selected, idx: shift_selected_split_piece(pieces, selected, idx, -1), inputs=[split_piece_states, split_piece_source, split_piece_slider], outputs=[split_piece_slider, split_piece_label, split_piece_preview], queue=False)
+        split_piece_next.click(fn=lambda pieces, selected, idx: shift_selected_split_piece(pieces, selected, idx, 1), inputs=[split_piece_states, split_piece_source, split_piece_slider], outputs=[split_piece_slider, split_piece_label, split_piece_preview], queue=False)
 
         gcode_button.click(
             fn=generate_dynamic_gcode,

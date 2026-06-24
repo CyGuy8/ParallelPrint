@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import zipfile
+from collections import defaultdict
 from codecs import encode
 from pathlib import Path
 from textwrap import wrap
@@ -19,7 +20,6 @@ RASTER_PATTERN_CHOICES = (
     RASTER_PATTERN_Y_DIRECTION,
     RASTER_PATTERN_WOODPILE,
 )
-
 
 def _normalize_raster_pattern(pattern: str | None) -> str:
     if pattern == RASTER_PATTERN_WOODPILE:
@@ -197,6 +197,115 @@ def _center_on_canvas(
     return out
 
 
+def _simplify_closed_contour(
+    points: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    if len(points) < 4:
+        return points
+    if points[0] != points[-1]:
+        points = [*points, points[0]]
+
+    ring = points[:-1]
+    simplified: list[tuple[int, int]] = []
+    for idx, point in enumerate(ring):
+        prev_point = ring[idx - 1]
+        next_point = ring[(idx + 1) % len(ring)]
+        dx1 = point[0] - prev_point[0]
+        dy1 = point[1] - prev_point[1]
+        dx2 = next_point[0] - point[0]
+        dy2 = next_point[1] - point[1]
+        if dx1 * dy2 == dy1 * dx2:
+            continue
+        simplified.append(point)
+
+    if len(simplified) < 3:
+        simplified = ring
+    simplified.append(simplified[0])
+    return simplified
+
+
+def _contour_area2(points: list[tuple[float, float]]) -> float:
+    return sum(
+        x0 * y1 - x1 * y0
+        for (x0, y0), (x1, y1) in zip(points, points[1:])
+    )
+
+
+def _contour_sort_key(points: list[tuple[float, float]]) -> tuple[float, float, float]:
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    return (-abs(_contour_area2(points)), min(ys), min(xs))
+
+
+def _trace_mask_contours(
+    mask: np.ndarray,
+    pixel_size: float,
+    x_offset_px: float = 0.0,
+    y_offset_px: float = 0.0,
+) -> list[list[tuple[float, float]]]:
+    if not np.any(mask):
+        return []
+
+    mask = mask.astype(bool)
+    segments: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    height, width = mask.shape
+
+    def is_on(row: int, col: int) -> bool:
+        return 0 <= row < height and 0 <= col < width and bool(mask[row, col])
+
+    for row in range(height):
+        for col in range(width):
+            if not mask[row, col]:
+                continue
+            if not is_on(row - 1, col):
+                segments.append(((col, row), (col + 1, row)))
+            if not is_on(row, col + 1):
+                segments.append(((col + 1, row), (col + 1, row + 1)))
+            if not is_on(row + 1, col):
+                segments.append(((col + 1, row + 1), (col, row + 1)))
+            if not is_on(row, col - 1):
+                segments.append(((col, row + 1), (col, row)))
+
+    outgoing: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
+    for start, end in segments:
+        outgoing[start].append(end)
+
+    contours: list[list[tuple[float, float]]] = []
+    remaining = set(segments)
+    while remaining:
+        start, end = min(remaining)
+        remaining.remove((start, end))
+        contour = [start, end]
+        current = end
+
+        while current != start:
+            next_point = next(
+                (
+                    candidate
+                    for candidate in outgoing.get(current, [])
+                    if (current, candidate) in remaining
+                ),
+                None,
+            )
+            if next_point is None:
+                break
+            remaining.remove((current, next_point))
+            current = next_point
+            contour.append(current)
+
+        if len(contour) > 3 and contour[-1] == contour[0]:
+            simplified = _simplify_closed_contour(contour)
+            contours.append(
+                [
+                    ((x + x_offset_px) * pixel_size, (y + y_offset_px) * pixel_size)
+                    for x, y in simplified
+                ]
+            )
+
+    contours.sort(key=_contour_sort_key)
+    return contours
+
+
 def _append_relative_move(
     output_list: list[dict],
     current_x: float,
@@ -215,6 +324,396 @@ def _append_relative_move(
         move["Z"] = z_step
     output_list.append(move)
     return target_x, target_y
+
+
+def _point_distance_sq(
+    ax: float,
+    ay: float,
+    bx: float,
+    by: float,
+) -> float:
+    return (ax - bx) ** 2 + (ay - by) ** 2
+
+
+def _closest_point_on_segment(
+    px: float,
+    py: float,
+    ax: float,
+    ay: float,
+    bx: float,
+    by: float,
+) -> tuple[float, float, float]:
+    dx = bx - ax
+    dy = by - ay
+    length_sq = dx * dx + dy * dy
+    if length_sq == 0:
+        return ax, ay, 0.0
+    t = ((px - ax) * dx + (py - ay) * dy) / length_sq
+    t = max(0.0, min(1.0, t))
+    return ax + t * dx, ay + t * dy, t
+
+
+def _rotate_closed_contour_to_nearest_border(
+    contour: list[tuple[float, float]],
+    current_x: float,
+    current_y: float,
+    approach_dx: float = 0.0,
+    approach_dy: float = 0.0,
+) -> list[tuple[float, float]]:
+    if len(contour) < 3:
+        return contour
+
+    ring = contour[:-1] if contour[0] == contour[-1] else contour
+    if len(ring) < 2:
+        return contour
+
+    best_idx = 0
+    best_t = 0.0
+    best_point = ring[0]
+    best_dist = float("inf")
+    for idx, (ax, ay) in enumerate(ring):
+        bx, by = ring[(idx + 1) % len(ring)]
+        point_x, point_y, t = _closest_point_on_segment(
+            current_x,
+            current_y,
+            ax,
+            ay,
+            bx,
+            by,
+        )
+        distance = _point_distance_sq(current_x, current_y, point_x, point_y)
+        if distance < best_dist:
+            best_dist = distance
+            best_idx = idx
+            best_t = t
+            best_point = (point_x, point_y)
+
+    eps = 1e-9
+    def choose_direction(
+        forward: list[tuple[float, float]],
+        reverse: list[tuple[float, float]],
+    ) -> list[tuple[float, float]]:
+        if (
+            len(forward) < 2
+            or len(reverse) < 2
+            or (approach_dx == 0 and approach_dy == 0)
+        ):
+            return forward
+
+        def score(candidate: list[tuple[float, float]]) -> float:
+            tx = candidate[1][0] - candidate[0][0]
+            ty = candidate[1][1] - candidate[0][1]
+            # Positive when the shape interior, opposite the approach vector,
+            # is to the left of the contour's first move.
+            return (ty * approach_dx) - (tx * approach_dy)
+
+        return reverse if score(reverse) > score(forward) else forward
+
+    if best_t <= eps:
+        forward = ring[best_idx:] + ring[:best_idx] + [ring[best_idx]]
+        reverse_ring = list(reversed(ring))
+        reverse_idx = reverse_ring.index(ring[best_idx])
+        reverse = (
+            reverse_ring[reverse_idx:]
+            + reverse_ring[:reverse_idx]
+            + [reverse_ring[reverse_idx]]
+        )
+        return choose_direction(forward, reverse)
+
+    next_idx = (best_idx + 1) % len(ring)
+    if best_t >= 1.0 - eps:
+        forward = ring[next_idx:] + ring[:next_idx] + [ring[next_idx]]
+        reverse_ring = list(reversed(ring))
+        reverse_idx = reverse_ring.index(ring[next_idx])
+        reverse = (
+            reverse_ring[reverse_idx:]
+            + reverse_ring[:reverse_idx]
+            + [reverse_ring[reverse_idx]]
+        )
+        return choose_direction(forward, reverse)
+
+    forward = [best_point]
+    for step in range(1, len(ring) + 1):
+        forward.append(ring[(best_idx + step) % len(ring)])
+    forward.append(best_point)
+
+    reverse = [best_point]
+    for step in range(0, len(ring)):
+        reverse.append(ring[(best_idx - step) % len(ring)])
+    reverse.append(best_point)
+    return choose_direction(forward, reverse)
+
+
+def _last_print_reference(output_list: list[dict]) -> tuple[float, float, float, float]:
+    x = y = 0.0
+    last_x = last_y = 0.0
+    last_dx = last_dy = 0.0
+    for move in output_list:
+        dx = float(move.get("X", 0.0))
+        dy = float(move.get("Y", 0.0))
+        x += dx
+        y += dy
+        if move.get("Color") == 255 and "Z" not in move:
+            last_x = x
+            last_y = y
+            last_dx = dx
+            last_dy = dy
+    return last_x, last_y, last_dx, last_dy
+
+
+def _rewind_trailing_travel(
+    output_list: list[dict],
+    current_x: float,
+    current_y: float,
+) -> tuple[float, float]:
+    if not output_list:
+        return current_x, current_y
+
+    last_move = output_list[-1]
+    if last_move.get("Color") != 0 or "Z" in last_move:
+        return current_x, current_y
+
+    has_layer_print = any(
+        move.get("Color") == 255 and "Z" not in move
+        for move in reversed(output_list[:-1])
+    )
+    if not has_layer_print:
+        return current_x, current_y
+
+    output_list.pop()
+    return (
+        current_x - float(last_move.get("X", 0.0)),
+        current_y - float(last_move.get("Y", 0.0)),
+    )
+
+
+def _contour_source_paths(source: dict, extract_root: Path, source_pos: int) -> list[Path]:
+    paths = source.get("tiff_paths") or source.get("paths") or []
+    if paths:
+        return sorted((Path(path) for path in paths), key=lambda path: _sort_key(path.name))
+
+    zip_path = source.get("zip_path")
+    if not zip_path:
+        return []
+    extract_dir = extract_root / f"source_{source_pos:03d}"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    return _extract_zip_tiffs(Path(zip_path), extract_dir)
+
+
+def _active_pixel_bounds(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    rows, cols = np.where(mask)
+    if len(rows) == 0:
+        return None
+    return int(rows.min()), int(rows.max()), int(cols.min()), int(cols.max())
+
+
+def _first_raster_row_start(mask: np.ndarray) -> tuple[int, int] | None:
+    rows = np.where(mask.any(axis=1))[0]
+    if len(rows) == 0:
+        return None
+    row = int(rows[0])
+    cols = np.where(mask[row])[0]
+    if len(cols) == 0:
+        return None
+    return row, int(cols[0])
+
+
+def _contour_pixel_offsets(
+    raster_pattern: str,
+    motion_mask: np.ndarray,
+    contour_mask: np.ndarray,
+) -> tuple[float, float]:
+    if raster_pattern == RASTER_PATTERN_SAME_DIRECTION:
+        first_row_start = _first_raster_row_start(motion_mask)
+        if first_row_start is None:
+            first_row_start = _first_raster_row_start(contour_mask)
+        if first_row_start is None:
+            return 0.0, 0.0
+        first_row, first_col = first_row_start
+        # The legacy X-raster infill path anchors every row to the first
+        # rastered row's starting pixel. Wider lower rows can extend left of
+        # that point, so using the layer-wide min column shifts pyramid-like
+        # contours away from the infill.
+        return 1.0 - first_col, -0.5 - first_row
+    return 0.0, 0.0
+
+
+def _build_contour_layers(
+    contour_tiff_sets: list[dict] | None,
+    path_ref_list: list[np.ndarray],
+    pixel_size: float,
+    invert: bool,
+    off_color: int,
+    work_dir: Path,
+    raster_pattern: str,
+    layer_start_directions: list[int] | None = None,
+) -> list[list[dict]]:
+    contour_layers: list[list[dict]] = [[] for _ in path_ref_list]
+    if not contour_tiff_sets:
+        return contour_layers
+
+    extract_root = work_dir / "contour_sources"
+    for source_pos, source in enumerate(contour_tiff_sets):
+        try:
+            owner_idx = int(source.get("owner_idx", source.get("idx", source_pos + 1)))
+        except (TypeError, ValueError):
+            owner_idx = source_pos + 1
+
+        source_paths = _contour_source_paths(source, extract_root, source_pos)
+        for layer_number, path_img in enumerate(path_ref_list):
+            if layer_number >= len(source_paths):
+                continue
+            canvas_h, canvas_w = path_img.shape[:2]
+            contour_img = _load_grayscale(source_paths[layer_number], invert=invert)
+            if contour_img.shape[:2] != (canvas_h, canvas_w):
+                contour_img = _center_on_canvas(
+                    contour_img,
+                    canvas_h,
+                    canvas_w,
+                    fill=off_color,
+                )
+            contour_path_img = path_img
+            if raster_pattern == RASTER_PATTERN_SAME_DIRECTION and layer_number % 2 == 1:
+                contour_path_img = np.flipud(contour_path_img)
+                contour_img = np.flipud(contour_img)
+            if (
+                raster_pattern == RASTER_PATTERN_SAME_DIRECTION
+                and layer_start_directions is not None
+                and layer_number < len(layer_start_directions)
+                and layer_start_directions[layer_number] > 0
+            ):
+                contour_path_img = np.fliplr(contour_path_img)
+                contour_img = np.fliplr(contour_img)
+
+            contour_mask = contour_img > off_color
+            x_offset_px, y_offset_px = _contour_pixel_offsets(
+                raster_pattern,
+                contour_path_img > off_color,
+                contour_mask,
+            )
+            contours = _trace_mask_contours(
+                contour_mask,
+                pixel_size,
+                x_offset_px=x_offset_px,
+                y_offset_px=y_offset_px,
+            )
+            if contours:
+                contour_layers[layer_number].append(
+                    {"owner_idx": owner_idx, "contours": contours}
+                )
+
+    return contour_layers
+
+
+def _same_direction_layer_start_directions(
+    path_ref_list: list[np.ndarray],
+    off_color: int,
+) -> list[int]:
+    directions: list[int] = []
+    direction = -1
+    for path_img in path_ref_list:
+        directions.append(direction)
+        nonblank_rows = int(np.count_nonzero((path_img > off_color).any(axis=1)))
+        if nonblank_rows % 2 == 1:
+            direction *= -1
+    return directions
+
+
+def _append_layer_contours(
+    output_list: list[dict],
+    current_x: float,
+    current_y: float,
+    contour_layers: list[list[dict]],
+    layer_number: int,
+    active_owner_idx: int | None,
+    origin_x: float = 0.0,
+    origin_y: float = 0.0,
+    x_scale: float = 1.0,
+    y_scale: float = 1.0,
+) -> tuple[float, float]:
+    if layer_number >= len(contour_layers):
+        return current_x, current_y
+
+    active_sources = [
+        source
+        for source in contour_layers[layer_number]
+        if source.get("owner_idx") == active_owner_idx
+        and any(len(contour) >= 2 for contour in source.get("contours", []))
+    ]
+    if not active_sources:
+        return current_x, current_y
+
+    current_x, current_y = _rewind_trailing_travel(
+        output_list,
+        current_x,
+        current_y,
+    )
+
+    first_start_x: float | None = None
+    first_start_y: float | None = None
+    use_infill_reference = True
+
+    for source in active_sources:
+        color = 255
+        for contour in source.get("contours", []):
+            if len(contour) < 2:
+                continue
+            contour = [
+                (origin_x + (x_scale * x), origin_y + (y_scale * y))
+                for x, y in contour
+            ]
+            if use_infill_reference:
+                nearest_x, nearest_y, approach_dx, approach_dy = _last_print_reference(
+                    output_list
+                )
+            else:
+                nearest_x, nearest_y = current_x, current_y
+                approach_dx, approach_dy = 0.0, 0.0
+            contour = _rotate_closed_contour_to_nearest_border(
+                contour,
+                nearest_x,
+                nearest_y,
+                approach_dx,
+                approach_dy,
+            )
+            if contour[0] != contour[-1]:
+                contour = [*contour, contour[0]]
+            start_x, start_y = contour[0]
+            if first_start_x is None:
+                first_start_x, first_start_y = start_x, start_y
+            use_infill_reference = False
+            current_x, current_y = _append_relative_move(
+                output_list,
+                current_x,
+                current_y,
+                start_x,
+                start_y,
+                0,
+            )
+            for target_x, target_y in contour[1:]:
+                current_x, current_y = _append_relative_move(
+                    output_list,
+                    current_x,
+                    current_y,
+                    target_x,
+                    target_y,
+                    color,
+                )
+
+    if first_start_x is not None and (
+        abs(current_x - first_start_x) > 1e-9
+        or abs(current_y - (first_start_y or 0.0)) > 1e-9
+    ):
+        current_x, current_y = _append_relative_move(
+            output_list,
+            current_x,
+            current_y,
+            first_start_x,
+            first_start_y,
+            255,
+        )
+
+    return current_x, current_y
 
 
 def _woodpile_layer_segments(
@@ -320,10 +819,13 @@ def _build_footprint_raster_gcode_list(
     pixel_size: float,
     layer_height: float,
     raster_pattern: str,
+    contour_layers: list[list[dict]] | None = None,
+    active_contour_owner: int | None = None,
 ) -> list[dict]:
     gcode_list: list[dict] = []
     current_x = 0.0
     current_y = 0.0
+    contour_layers = contour_layers or []
 
     for layer_number, (path_img, color_img) in enumerate(zip(path_ref_list, color_ref_list)):
         raster_axis = _raster_axis_for_pattern(raster_pattern, layer_number)
@@ -331,6 +833,23 @@ def _build_footprint_raster_gcode_list(
         if not segments:
             if layer_number > 0:
                 gcode_list.append({"X": 0.0, "Y": 0.0, "Z": layer_height, "Color": 0})
+            layer_end_x, layer_end_y = current_x, current_y
+            current_x, current_y = _append_layer_contours(
+                gcode_list,
+                current_x,
+                current_y,
+                contour_layers,
+                layer_number,
+                active_contour_owner,
+            )
+            current_x, current_y = _append_relative_move(
+                gcode_list,
+                current_x,
+                current_y,
+                layer_end_x,
+                layer_end_y,
+                0,
+            )
             continue
 
         first_x, first_y = segments[0][0], segments[0][1]
@@ -372,6 +891,24 @@ def _build_footprint_raster_gcode_list(
                 color,
             )
 
+        layer_end_x, layer_end_y = current_x, current_y
+        current_x, current_y = _append_layer_contours(
+            gcode_list,
+            current_x,
+            current_y,
+            contour_layers,
+            layer_number,
+            active_contour_owner,
+        )
+        current_x, current_y = _append_relative_move(
+            gcode_list,
+            current_x,
+            current_y,
+            layer_end_x,
+            layer_end_y,
+            0,
+        )
+
     return gcode_list
 
 
@@ -388,6 +925,8 @@ def generate_snake_path_gcode(
     all_g1: bool = False,
     motion_tiffs: list[str] | None = None,
     raster_pattern: str | None = RASTER_PATTERN_SAME_DIRECTION,
+    contour_tiff_sets: list[dict] | None = None,
+    active_contour_owner: int | None = None,
 ) -> Path:
     zip_path = Path(zip_path)
     if not zip_path.exists():
@@ -435,6 +974,24 @@ def generate_snake_path_gcode(
         path_ref_list = [im.copy() for im in shape_imgs]
         color_ref_list = [im.copy() for im in shape_imgs]
 
+    layer_start_directions = None
+    if raster_pattern == RASTER_PATTERN_SAME_DIRECTION:
+        layer_start_directions = _same_direction_layer_start_directions(
+            path_ref_list,
+            off_color,
+        )
+
+    contour_layers = _build_contour_layers(
+        contour_tiff_sets,
+        path_ref_list,
+        fil_width,
+        invert,
+        off_color,
+        work_dir,
+        raster_pattern,
+        layer_start_directions,
+    )
+
     setpress_lines = [_setpress_cmd(com_port, pressure, start=True)]
     pressure_on_lines = [_toggle_cmd(com_port, start=True)]
     pressure_off_lines = [_toggle_cmd(com_port, start=False)]
@@ -446,9 +1003,13 @@ def generate_snake_path_gcode(
             fil_width,
             layer_height,
             raster_pattern,
+            contour_layers,
+            active_contour_owner,
         )
     else:
         gcode_list: list[dict] = []
+        current_x = 0.0
+        current_y = 0.0
         dist_sign_long = 1
         current_offsets_x: list[int] = []
         use_flip_y = False
@@ -504,6 +1065,8 @@ def generate_snake_path_gcode(
                 gcode_list.append(
                     {"X": shift_y, "Y": shift_x, "Z": layer_height, "Color": 0}
                 )
+                current_x += shift_y
+                current_y += shift_x
 
             for row in current_image_ref:
                 if all(p == off_color for p in row):
@@ -521,6 +1084,10 @@ def generate_snake_path_gcode(
 
             if layers == 0:
                 direction = -1
+            layer_start = len(gcode_list)
+            layer_origin_x, layer_origin_y = current_x, current_y
+            layer_x_scale = 1.0 if direction < 0 else -1.0
+            layer_y_scale = -1.0 if layers % 2 == 1 else 1.0
             direction = _gcode_layer(
                 ref_for_path,
                 current_image,
@@ -528,6 +1095,31 @@ def generate_snake_path_gcode(
                 fil_width,
                 direction,
                 layers,
+            )
+            for move in gcode_list[layer_start:]:
+                current_x += float(move.get("X", 0.0))
+                current_y += float(move.get("Y", 0.0))
+
+            layer_end_x, layer_end_y = current_x, current_y
+            current_x, current_y = _append_layer_contours(
+                gcode_list,
+                current_x,
+                current_y,
+                contour_layers,
+                layers,
+                active_contour_owner,
+                layer_origin_x,
+                layer_origin_y,
+                layer_x_scale,
+                layer_y_scale,
+            )
+            current_x, current_y = _append_relative_move(
+                gcode_list,
+                current_x,
+                current_y,
+                layer_end_x,
+                layer_end_y,
+                off_color,
             )
 
     gcode_path = work_dir / f"{shape_name}_SnakePath_gcode.txt"

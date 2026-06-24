@@ -381,6 +381,14 @@ def _segments_to_xyz(
     return xs, ys, zs
 
 
+def _part_nozzle(part: dict) -> int:
+    try:
+        nozzle = int(float(part.get("nozzle", part.get("idx", 1))))
+    except (TypeError, ValueError):
+        nozzle = int(part.get("idx", 1) or 1)
+    return nozzle if nozzle > 0 else int(part.get("idx", 1) or 1)
+
+
 def build_toolpath_figure(
     parsed: dict,
     travel_opacity: float = 0.2,
@@ -526,9 +534,9 @@ def build_parallel_figure(
     `tube` True draws filament tubes with a shared-time animation
     timeline; False draws fast thin scatter lines (no animation).
 
-    `parts` is a list of {"idx": int, "color": str, "parsed": dict}. Each part's
-    print and travel traces (and, in tube mode, a nozzle marker) are named by idx
-    so the client-side animation/recolor can address them.
+    `parts` is a list of {"idx": int, "nozzle": int, "color": str, "parsed": dict}.
+    Each part's print and travel traces (and, in tube mode, a nozzle marker) are
+    named by idx so the client-side animation/recolor can address them.
     """
     fig = go.Figure()
     anim_parts: list[dict] = []
@@ -541,6 +549,7 @@ def build_parallel_figure(
     running_x = 0.0
     for part in parts:
         idx = part["idx"]
+        nozzle = _part_nozzle(part)
         color = part["color"]
         parsed = part["parsed"]
         moves = parsed.get("moves") or []
@@ -554,7 +563,8 @@ def build_parallel_figure(
             y_off = 0.0
             running_x += width + gap
         else:
-            x_off, y_off = part_offsets.get(idx, (0.0, 0.0))
+            x_off, y_off = part_offsets.get(nozzle, part_offsets.get(idx, (0.0, 0.0)))
+        nozzle_trace_name = f"Nozzle {nozzle} (Shape {idx})"
 
         if tube:
             print_tube = _build_path_tube(moves, radius=max(filament_width, 0.05) / 2.0, kind="print")
@@ -591,7 +601,7 @@ def build_parallel_figure(
             fig.add_trace(
                 go.Scatter3d(
                     x=[path_x[-1]], y=[path_y[-1]], z=[path["z"][-1]],
-                    mode="markers", name=f"Nozzle {idx}",
+                    mode="markers", name=nozzle_trace_name,
                     marker=dict(size=4, color=color), showlegend=False, hoverinfo="skip",
                 )
             )
@@ -601,7 +611,7 @@ def build_parallel_figure(
             anim_parts.append({
                 "printName": f"Shape {idx}",
                 "travelName": f"Travel {idx}",
-                "nozzleName": f"Nozzle {idx}",
+                "nozzleName": nozzle_trace_name,
                 "print_face_t": print_tube["face_t"],
                 "travel_face_t": travel_tube["face_t"],
                 "path_x": path_x, "path_y": path_y, "path_z": path["z"], "path_t": path["t"],
@@ -668,13 +678,16 @@ def build_nozzle_spacing_figure(
     fig = go.Figure()
     bx0 = by0 = float("inf")
     bx1 = by1 = float("-inf")
+    nozzle_colors: dict[int, str] = {}
 
     for part in parts:
         idx = part["idx"]
+        nozzle = _part_nozzle(part)
         color = part["color"]
+        nozzle_colors.setdefault(nozzle, color)
         parsed = part["parsed"]
         (pxmin, pymin, _), (pxmax, pymax, _) = parsed["bounds"]
-        x_off, y_off = part_offsets.get(idx, (0.0, 0.0))
+        x_off, y_off = part_offsets.get(nozzle, part_offsets.get(idx, (0.0, 0.0)))
         xs = [pxmin + x_off, pxmax + x_off, pxmax + x_off, pxmin + x_off, pxmin + x_off]
         ys = [pymin + y_off, pymin + y_off, pymax + y_off, pymax + y_off, pymin + y_off]
         fig.add_trace(
@@ -682,25 +695,31 @@ def build_nozzle_spacing_figure(
                 x=xs,
                 y=ys,
                 mode="lines",
-                name=f"Shape {idx} bounds",
+                name=f"Shape {idx} bounds (N{nozzle})",
                 line=dict(color=color, width=2),
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=[x_off],
-                y=[y_off],
-                mode="markers+text",
-                name=f"Nozzle {idx}",
-                marker=dict(color=color, size=12),
-                text=[f"N{idx}"],
-                textposition="top center",
             )
         )
         bx0 = min(bx0, min(xs), x_off)
         bx1 = max(bx1, max(xs), x_off)
         by0 = min(by0, min(ys), y_off)
         by1 = max(by1, max(ys), y_off)
+
+    for nozzle, (x_off, y_off) in sorted(part_offsets.items()):
+        fig.add_trace(
+            go.Scatter(
+                x=[x_off],
+                y=[y_off],
+                mode="markers+text",
+                name=f"Nozzle {nozzle}",
+                marker=dict(color=nozzle_colors.get(nozzle, "#444444"), size=12),
+                text=[f"N{nozzle}"],
+                textposition="top center",
+            )
+        )
+        bx0 = min(bx0, x_off)
+        bx1 = max(bx1, x_off)
+        by0 = min(by0, y_off)
+        by1 = max(by1, y_off)
 
     for spacing in spacings:
         start = spacing["from"]
@@ -759,7 +778,7 @@ def build_parallel_gif(
 
     Each part's toolpath is drawn as growing colored lines (print solid, travel
     faint), three parts in parallel on a shared cumulative-length time axis.
-    `parts` is a list of {"idx": int, "color": str, "parsed": dict}.
+    `parts` is a list of {"idx": int, "nozzle": int, "color": str, "parsed": dict}.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -784,7 +803,8 @@ def build_parallel_gif(
             y_off = 0.0
             running_x += (pxmax - pxmin) + gap
         else:
-            x_off, y_off = part_offsets.get(part["idx"], (0.0, 0.0))
+            nozzle = _part_nozzle(part)
+            x_off, y_off = part_offsets.get(nozzle, part_offsets.get(part["idx"], (0.0, 0.0)))
 
         cum = 0.0
         mlist: list[tuple] = []

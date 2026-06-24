@@ -48,8 +48,9 @@ Then open the local Gradio URL in your browser, upload STL files or load the bun
 - Encodes material as black (`0`) and empty space as white (`255`) in each TIFF slice
 - Lets you step through the slice stack in the browser
 - Exports a ZIP containing the generated TIFF images
-- Combines generated stacks into a reference TIFF stack
-- Converts generated TIFF ZIPs into G-code files with pressure, valve, and port settings per shape from the Shape Settings table
+- Automatically combines generated stacks into a reference TIFF stack when TIFF stacks are generated
+- Splits one generated TIFF stack into an editable row/column grid for multi-nozzle printing of one large shape
+- Converts generated TIFF ZIPs into G-code files with pressure, valve, nozzle, and port settings per shape from the Shape Settings table
 - Offers G-code generation options for raster pattern, **Use G1 for all moves** (no rapid travel command), and **Use Reference Stack for motion** (all shapes share one nozzle path; each dispenses only its own geometry)
 - Calculates X/Y nozzle spacing from an editable adjacent-pair spacing table, then visualizes the resulting nozzle layout
 - Previews selected generated G-code inline
@@ -61,13 +62,21 @@ Then open the local Gradio URL in your browser, upload STL files or load the bun
 
 ### Reference TIFF Stack Alignment
 
-When you click **Generate Reference TIFF Stack**, the app combines available TIFF stacks layer-by-layer.
+When you click **Generate TIFF Stacks**, the app automatically combines available TIFF stacks layer-by-layer into the Reference TIFF Stack. The **Generate Reference TIFF Stack** button can still rebuild it manually from the current shape stacks.
 
 - If source TIFFs have different dimensions, each layer is placed on a canvas using the largest width and height.
 - Layers are centered in X and Y before merging.
 - Pixel merge uses a black-wins rule: a pixel is black in the reference if any source has black at that pixel.
 - Alignment is centered image placement, not bottom-left anchoring.
 - If image-size differences are odd, centering may produce a one-pixel shift due to integer rounding.
+
+### Single Shape Multi-Nozzle
+
+The **Single Shape Multi-Nozzle** tab can split one generated shape stack into a grid of print-ready stacks. Choose a source shape that already has TIFF slices, set the number of columns and rows, choose the starting nozzle and valve numbers, then click **Split Selected Shape into Grid Pieces**.
+
+- Each slice is split into columns along X and rows along Y; leftover pixels are assigned to earlier columns/rows so no pixels are dropped.
+- The selected shape is replaced in Shape Settings by one generated record per grid cell, named by row and column.
+- Nozzle and valve numbers are assigned sequentially from the starting values, and the existing **TIFF Slices to GCode** tab can generate separate G-code for each piece.
 
 ### G-code XY Step Size
 
@@ -78,10 +87,10 @@ When you click **Generate Reference TIFF Stack**, the app combines available TIF
 - Generated G-code starts in relative coordinate mode (`G91`).
 - `G0` is travel and `G1` is print/feed.
 - The app generates print/feed moves from material pixels and travel moves between material regions.
-- Generated files include pressure preset commands and WAGO valve commands based on the selected pressure, valve, and port.
+- Generated files include pressure preset commands and WAGO valve commands based on the selected pressure, valve, and port; the nozzle number controls layout/spacing assignment.
 - Pressure increases by `0.1` psi per layer by default.
 - **Use G1 for all moves**: when enabled, every movement line is emitted as `G1` (no `G0` rapid travel); the WAGO valve still marks where material is dispensed. Applies to all shapes.
-- **Use Reference Stack for motion**: when enabled, every shape's snake-path *motion* is taken from the combined Reference TIFF Stack while each shape's *valve/dispensing* comes from its own slices — so parallel print heads share one synchronized nozzle path and each deposits only its own geometry. Requires generating the Reference TIFF Stack on the first tab first; shapes are skipped with a message if it is missing.
+- **Use Reference Stack for motion**: when enabled, every shape's snake-path *motion* is taken from the combined Reference TIFF Stack while each shape's *valve/dispensing* comes from its own slices — so parallel print heads share one synchronized nozzle path and each deposits only its own geometry. The reference stack is generated automatically with TIFF stacks; shapes are skipped with a message if it is missing.
 - **Raster Pattern**: `X-direction raster` keeps the existing X-direction back-and-forth raster on every layer. `Y-direction raster` rasters every layer in Y. `Woodpile raster` alternates the raster axis by layer, switching between X-direction and Y-direction sweeps.
 
 ### Print vs Travel Classification
@@ -102,7 +111,7 @@ The G-code visualization tab renders generated shape G-code or an uploaded `.txt
 
 ### Parallel Printing Visualization
 
-The fourth tab plots the generated shapes' G-code at once using the nozzle spacing configured on the TIFF-to-G-code tab, each in its own color. Like the visualization tab it has a fast **Line Plot** and an animated **Tube Plot**; the animation advances all parts on a shared cumulative-path-length timeline, so a shorter part finishes first.
+The fourth tab plots the generated shapes' G-code at once using the nozzle spacing configured on the TIFF-to-G-code tab, each in its own color. Shape Settings maps each STL to a nozzle number, so multiple shapes can share one nozzle offset while valves remain independent. Like the visualization tab it has a fast **Line Plot** and an animated **Tube Plot**; the animation advances all parts on a shared cumulative-path-length timeline, so a shorter part finishes first.
 
 It can also **export the animation as a GIF**, rendered server-side with Matplotlib (the `Agg` CPU backend — no WebGL, no headless browser, and no `ffmpeg`, so it works locally and on Hugging Face). The GIF is line-style with faint grey travel and white, black-outlined nozzle markers drawn on top; controls cover duration, frames per second, elevation/azimuth viewing angle, and travel opacity (0 hides travel).
 
