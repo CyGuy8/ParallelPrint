@@ -483,6 +483,7 @@ def test_woodpile_raster_switches_print_axis_between_layers(tmp_path) -> None:
         pressure=25,
         valve=7,
         port=3,
+        fil_width=1.0,
         raster_pattern=RASTER_PATTERN_WOODPILE,
     )
 
@@ -509,10 +510,10 @@ def test_woodpile_raster_switches_print_axis_between_layers(tmp_path) -> None:
                 y += float(token[1:])
         x_positions.append(x)
         y_positions.append(y)
-    assert min(x_positions) >= 0.0
-    assert max(x_positions) <= 3.0
-    assert min(y_positions) >= 0.0
-    assert max(y_positions) <= 2.0
+    assert min(x_positions) == -1.0
+    assert max(x_positions) == 4.0
+    assert min(y_positions) == -1.0
+    assert max(y_positions) == 3.0
 
 
 def test_y_direction_raster_prints_each_layer_along_y_axis(tmp_path) -> None:
@@ -533,6 +534,7 @@ def test_y_direction_raster_prints_each_layer_along_y_axis(tmp_path) -> None:
         pressure=25,
         valve=7,
         port=3,
+        fil_width=1.0,
         raster_pattern=RASTER_PATTERN_Y_DIRECTION,
     )
 
@@ -562,8 +564,8 @@ def test_y_direction_raster_prints_each_layer_along_y_axis(tmp_path) -> None:
         y_positions.append(y)
     assert min(x_positions) >= 0.0
     assert max(x_positions) <= 3.0
-    assert min(y_positions) >= 0.0
-    assert max(y_positions) <= 2.0
+    assert min(y_positions) == -1.0
+    assert max(y_positions) == 3.0
 
 
 def test_contour_tracing_skips_inactive_nozzle_outline(tmp_path) -> None:

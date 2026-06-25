@@ -742,6 +742,16 @@ def _woodpile_layer_segments(
             prev_row = row_values[0]
             prev_color = int(color_img[prev_row, col])
             x = (int(col) + 0.5) * pixel_size
+            if forward:
+                sweep_start_y = f_idx * pixel_size
+                segments.append(
+                    (x, sweep_start_y - pixel_size, x, sweep_start_y, 0)
+                )
+            else:
+                sweep_start_y = (l_idx + 1) * pixel_size
+                segments.append(
+                    (x, sweep_start_y + pixel_size, x, sweep_start_y, 0)
+                )
             for row in row_values[1:]:
                 this_color = int(color_img[row, col])
                 if this_color == prev_color:
@@ -763,6 +773,10 @@ def _woodpile_layer_segments(
                 start_y = (run_start + 1) * pixel_size
                 end_y = prev_row * pixel_size
             segments.append((x, start_y, x, end_y, prev_color))
+            if forward:
+                segments.append((x, end_y, x, end_y + pixel_size, 0))
+            else:
+                segments.append((x, end_y, x, end_y - pixel_size, 0))
         return segments
 
     first_nonblank = np.where(mask.any(axis=1), mask.argmax(axis=1), -1)
@@ -781,6 +795,12 @@ def _woodpile_layer_segments(
         prev_col = col_values[0]
         prev_color = int(color_img[row, prev_col])
         y = (int(row) + 0.5) * pixel_size
+        if forward:
+            sweep_start_x = f_idx * pixel_size
+            segments.append((sweep_start_x - pixel_size, y, sweep_start_x, y, 0))
+        else:
+            sweep_start_x = (l_idx + 1) * pixel_size
+            segments.append((sweep_start_x + pixel_size, y, sweep_start_x, y, 0))
         for col in col_values[1:]:
             this_color = int(color_img[row, col])
             if this_color == prev_color:
@@ -802,6 +822,10 @@ def _woodpile_layer_segments(
             start_x = (run_start + 1) * pixel_size
             end_x = prev_col * pixel_size
         segments.append((start_x, y, end_x, y, prev_color))
+        if forward:
+            segments.append((end_x, y, end_x + pixel_size, y, 0))
+        else:
+            segments.append((end_x, y, end_x - pixel_size, y, 0))
     return segments
 
 
