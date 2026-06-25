@@ -10,10 +10,13 @@ from app import (
     _apply_shape_settings,
     delete_shape_from_settings,
     _format_nozzle_spacing_status,
+    _grid_spacing_rows,
+    _records_from_files,
     _shape_settings_rows,
     _spacing_args_from_table,
     _spacing_table_update,
     normalize_shape_dimensions_for_mode,
+    _resolve_nozzle_grid_layout,
     _resolve_nozzle_layout,
 )
 
@@ -245,6 +248,26 @@ def test_shape_settings_round_trip_contour_tracing_column() -> None:
     assert updated[0]["contour_tracing"] is True
 
 
+def test_repeated_sample_path_gets_next_unused_nozzle() -> None:
+    records = _records_from_files(
+        ["sample.stl", "sample.stl"],
+        previous_records=[{"idx": 1, "name": "sample", "stl_path": "sample.stl", "nozzle": 1}],
+    )
+
+    assert [record["nozzle"] for record in records] == [1, 2]
+
+
+def test_sample_reload_appends_next_nozzle_set() -> None:
+    sample_paths = ["sample_a.stl", "sample_b.stl", "sample_c.stl"]
+    first_load = _records_from_files(sample_paths)
+    first_resync = _records_from_files(sample_paths, first_load)
+    second_load = _records_from_files([*sample_paths, *sample_paths], first_load)
+
+    assert [record["nozzle"] for record in first_load] == [1, 2, 3]
+    assert [record["nozzle"] for record in first_resync] == [1, 2, 3]
+    assert [record["nozzle"] for record in second_load] == [1, 2, 3, 4, 5, 6]
+
+
 def test_simple_spacing_table_uses_one_shared_spacing_row() -> None:
     records = [
         {"idx": 1, "name": "first"},
@@ -291,6 +314,46 @@ def test_advanced_spacing_table_collapses_duplicate_nozzles() -> None:
 
     assert update["headers"] == ADVANCED_NOZZLE_SPACING_HEADERS
     assert update["value"] == [["Nozzle 1: Shape 1, Shape 2", "Nozzle 2: Shape 3", 9.0, 2.5]]
+
+
+def test_grid_spacing_rows_follow_row_major_pattern() -> None:
+    records = [
+        {"idx": 1, "name": "first", "nozzle": 1},
+        {"idx": 2, "name": "second", "nozzle": 2},
+        {"idx": 3, "name": "third", "nozzle": 3},
+        {"idx": 4, "name": "fourth", "nozzle": 4},
+    ]
+
+    rows, column_count, row_count = _grid_spacing_rows(records, columns=2, rows=2, column_spacing=10.0, row_spacing=3.0)
+
+    assert column_count == 2
+    assert row_count == 2
+    assert rows == [
+        ["Nozzle 1: Shape 1", "Nozzle 2: Shape 2", 10.0, 0.0],
+        ["Nozzle 2: Shape 2", "Nozzle 3: Shape 3", -10.0, 3.0],
+        ["Nozzle 3: Shape 3", "Nozzle 4: Shape 4", 10.0, 0.0],
+    ]
+
+
+def test_nozzle_grid_layout_places_nozzles_by_rows_and_columns() -> None:
+    parts = [
+        _part(1, ((0.0, 0.0, 0.0), (10.0, 20.0, 1.0))),
+        _part(2, ((0.0, 0.0, 0.0), (10.0, 20.0, 1.0))),
+        _part(3, ((0.0, 0.0, 0.0), (10.0, 20.0, 1.0))),
+        _part(4, ((0.0, 0.0, 0.0), (10.0, 20.0, 1.0))),
+    ]
+
+    offsets, spacings = _resolve_nozzle_grid_layout(parts, columns=2, rows=2, column_spacing=2.0, row_spacing=3.0)
+
+    np.testing.assert_allclose(offsets[1], (0.0, 0.0))
+    np.testing.assert_allclose(offsets[2], (12.0, 0.0))
+    np.testing.assert_allclose(offsets[3], (0.0, 23.0))
+    np.testing.assert_allclose(offsets[4], (12.0, 23.0))
+    assert spacings == [
+        {"from": 1, "to": 2, "dx": 12.0, "dy": 0.0},
+        {"from": 2, "to": 3, "dx": -12.0, "dy": 23.0},
+        {"from": 3, "to": 4, "dx": 12.0, "dy": 0.0},
+    ]
 
 
 def test_delete_shape_reindexes_without_losing_shape_data() -> None:

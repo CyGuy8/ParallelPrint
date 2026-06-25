@@ -38,7 +38,7 @@ from stl_slicer import (
     slice_stl_to_tiffs,
 )
 from tiff_to_gcode import (
-    RASTER_PATTERN_CHOICES,
+RASTER_PATTERN_CHOICES,
     RASTER_PATTERN_SAME_DIRECTION,
     generate_snake_path_gcode,
 )
@@ -54,6 +54,19 @@ SCALE_MODE_TARGET_DIMENSIONS = "Independent X/Y/Z"
 SCALE_MODE_UNIFORM_FACTOR = "Keep Proportions"
 TARGET_DIMENSION_KEYS = ("target_x", "target_y", "target_z")
 FRONT_CAMERA = (90, 80, None)
+NOZZLE_LAYOUT_GRID = "Grid Layout"
+NOZZLE_LAYOUT_PAIR_TABLE = "Custom Spacing"
+NOZZLE_LAYOUT_PRESETS = [
+    "Custom",
+    "One row",
+    "One column",
+    "2 x 1",
+    "1 x 2",
+    "2 x 2",
+    "3 x 3",
+    "2 x 5",
+    "5 x 2",
+]
 APP_CSS = """
 .gradio-container {
     font-size: 90%;
@@ -97,6 +110,18 @@ APP_CSS = """
     color: var(--block-label-text-color) !important;
     cursor: pointer !important;
     opacity: 1 !important;
+}
+
+.settings-accordion summary,
+.settings-accordion button[aria-expanded],
+.settings-accordion .label-wrap span {
+    font-size: 1.05rem !important;
+    font-weight: 700 !important;
+}
+
+.settings-accordion summary {
+    padding-top: 0.55rem !important;
+    padding-bottom: 0.55rem !important;
 }
 
 #load-sample-stls-button,
@@ -1454,6 +1479,118 @@ def _resolve_nozzle_layout(
     return offsets, spacings
 
 
+def _group_parts_by_nozzle(parts: list[dict]) -> dict[int, list[dict]]:
+    grouped: dict[int, list[dict]] = {}
+    for part in parts:
+        grouped.setdefault(_record_nozzle_number(part, int(part.get("idx", 1) or 1)), []).append(part)
+    return grouped
+
+
+def _nozzle_group_bounds(grouped: dict[int, list[dict]], nozzle: int) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    mins: list[tuple[float, float, float]] = []
+    maxs: list[tuple[float, float, float]] = []
+    for part in grouped[nozzle]:
+        part_min, part_max = part["parsed"]["bounds"]
+        mins.append(part_min)
+        maxs.append(part_max)
+    return (
+        tuple(min(values) for values in zip(*mins)),
+        tuple(max(values) for values in zip(*maxs)),
+    )
+
+
+def _resolve_nozzle_grid_layout(
+    parts: list[dict],
+    columns: Any,
+    rows: Any,
+    column_spacing: Any,
+    row_spacing: Any,
+) -> tuple[dict[int, tuple[float, float]], list[dict]]:
+    offsets: dict[int, tuple[float, float]] = {}
+    spacings: list[dict] = []
+    if not parts:
+        return offsets, spacings
+
+    grouped = _group_parts_by_nozzle(parts)
+    ordered_nozzles = sorted(grouped)
+    column_count = max(1, _coerce_int(columns, 1))
+    requested_rows = max(1, _coerce_int(rows, 1))
+    row_count = max(requested_rows, math.ceil(len(ordered_nozzles) / column_count))
+    try:
+        x_gap = float(column_spacing)
+    except (TypeError, ValueError):
+        x_gap = 0.0
+    try:
+        y_gap = float(row_spacing)
+    except (TypeError, ValueError):
+        y_gap = 0.0
+
+    placements = {
+        nozzle: (index % column_count, index // column_count)
+        for index, nozzle in enumerate(ordered_nozzles)
+    }
+    column_widths = [0.0 for _ in range(column_count)]
+    row_heights = [0.0 for _ in range(row_count)]
+    bounds_by_nozzle: dict[int, tuple[tuple[float, float, float], tuple[float, float, float]]] = {}
+    for nozzle, (column, row) in placements.items():
+        bounds = _nozzle_group_bounds(grouped, nozzle)
+        bounds_by_nozzle[nozzle] = bounds
+        (xmin, ymin, _), (xmax, ymax, _) = bounds
+        column_widths[column] = max(column_widths[column], xmax - xmin)
+        row_heights[row] = max(row_heights[row], ymax - ymin)
+
+    column_positions: list[float] = []
+    x_pos = 0.0
+    for width in column_widths:
+        column_positions.append(x_pos)
+        x_pos += width + x_gap
+
+    row_positions: list[float] = []
+    y_pos = 0.0
+    for height in row_heights:
+        row_positions.append(y_pos)
+        y_pos += height + y_gap
+
+    for nozzle, (column, row) in placements.items():
+        (xmin, ymin, _), _ = bounds_by_nozzle[nozzle]
+        offsets[nozzle] = (column_positions[column] - xmin, row_positions[row] - ymin)
+
+    for first, second in zip(ordered_nozzles, ordered_nozzles[1:]):
+        first_x, first_y = offsets[first]
+        second_x, second_y = offsets[second]
+        spacings.append({
+            "from": first,
+            "to": second,
+            "dx": second_x - first_x,
+            "dy": second_y - first_y,
+        })
+    return offsets, spacings
+
+
+def _resolve_layout_from_spacing_controls(
+    parts: list[dict],
+    layout_mode: str | None,
+    columns: Any,
+    rows: Any,
+    column_spacing: Any,
+    row_spacing: Any,
+    use_individual_spacing: bool,
+    spacing_table: Any,
+) -> tuple[dict[int, tuple[float, float]], list[dict]]:
+    if layout_mode != NOZZLE_LAYOUT_PAIR_TABLE:
+        return _resolve_nozzle_grid_layout(parts, columns, rows, column_spacing, row_spacing)
+    gap12x, gap12y, gap23x, gap23y, extra = _spacing_args_from_table(spacing_table, use_individual_spacing)
+    return _resolve_nozzle_layout(
+        parts,
+        _same_spacing_from_individual(use_individual_spacing),
+        gap12x,
+        gap12y,
+        gap23x,
+        gap23y,
+        *extra,
+    )
+
+
 def _same_spacing_from_individual(use_individual_spacing: bool | None) -> bool:
     return not bool(use_individual_spacing)
 
@@ -1654,11 +1791,35 @@ def _partition_length(length: int, count: int) -> list[tuple[int, int]]:
     return spans
 
 
+def _layer_split_spans(length: int, count: int, layer_index: int, overlap_pixels: int) -> list[tuple[int, int]]:
+    base_spans = _partition_length(length, count)
+    if overlap_pixels <= 0 or count <= 1:
+        return base_spans
+
+    boundaries = [base_spans[0][0], *[end for _start, end in base_spans]]
+    adjusted = list(boundaries)
+    for boundary_index in range(1, len(boundaries) - 1):
+        direction = 1 if (layer_index + boundary_index) % 2 == 1 else -1
+        lower = adjusted[boundary_index - 1] + 1
+        upper = boundaries[boundary_index + 1] - 1
+        adjusted[boundary_index] = max(lower, min(upper, boundaries[boundary_index] + direction * overlap_pixels))
+    return [(adjusted[index], adjusted[index + 1]) for index in range(count)]
+
+
+def _overlap_canvas_span(start: int, end: int, length: int, position: int, count: int, overlap_pixels: int) -> tuple[int, int]:
+    if overlap_pixels <= 0:
+        return start, end
+    canvas_start = max(0, start - overlap_pixels) if position > 1 else start
+    canvas_end = min(length, end + overlap_pixels) if position < count else end
+    return canvas_start, canvas_end
+
+
 def split_tiff_stack_grid(
     state: ViewerState,
     base_name: str = "split_shape",
     columns: float = 2,
     rows: float = 1,
+    overlapping_layers: bool | None = False,
     progress: gr.Progress = gr.Progress(),
 ) -> list[dict[str, Any]]:
     tiff_paths = [Path(path) for path in state.get("tiff_paths", [])]
@@ -1678,6 +1839,7 @@ def split_tiff_stack_grid(
     output_dir = Path(tempfile.mkdtemp(prefix=f"{safe_name}_split_"))
     x_spans = _partition_length(width, column_count)
     y_spans = _partition_length(height, row_count)
+    overlap_pixels = 1 if overlapping_layers else 0
     pieces: list[dict[str, Any]] = []
     for row_index, (y_start, y_end) in enumerate(y_spans, start=1):
         for col_index, (x_start, x_end) in enumerate(x_spans, start=1):
@@ -1701,8 +1863,25 @@ def split_tiff_stack_grid(
             if layer.size != (width, height):
                 raise ValueError("All TIFF slices must have the same dimensions to split the stack.")
 
+            layer_x_spans = _layer_split_spans(width, column_count, index, overlap_pixels)
+            layer_y_spans = _layer_split_spans(height, row_count, index, overlap_pixels)
             for piece in pieces:
-                piece_image = layer.crop((piece["x_start"], piece["y_start"], piece["x_end"], piece["y_end"]))
+                canvas_x_start, canvas_x_end = _overlap_canvas_span(
+                    piece["x_start"], piece["x_end"], width, piece["col"], column_count, overlap_pixels
+                )
+                canvas_y_start, canvas_y_end = _overlap_canvas_span(
+                    piece["y_start"], piece["y_end"], height, piece["row"], row_count, overlap_pixels
+                )
+                x_start, x_end = layer_x_spans[piece["col"] - 1]
+                y_start, y_end = layer_y_spans[piece["row"] - 1]
+                if overlapping_layers:
+                    piece_image = Image.new("L", (canvas_x_end - canvas_x_start, canvas_y_end - canvas_y_start), 255)
+                    piece_image.paste(
+                        layer.crop((x_start, y_start, x_end, y_end)),
+                        (x_start - canvas_x_start, y_start - canvas_y_start),
+                    )
+                else:
+                    piece_image = layer.crop((x_start, y_start, x_end, y_end))
                 piece_path = piece["tiff_dir"] / f"slice_{index:04d}.tif"
                 piece_image.save(piece_path, compression="tiff_deflate")
                 piece["tiff_paths"].append(piece_path)
@@ -1715,19 +1894,26 @@ def split_tiff_stack_grid(
     base_x_min = float(state.get("x_min", 0.0) or 0.0)
     base_y_min = float(state.get("y_min", 0.0) or 0.0)
     for piece in pieces:
-        piece_width = piece["x_end"] - piece["x_start"]
-        piece_height = piece["y_end"] - piece["y_start"]
+        canvas_x_start, canvas_x_end = _overlap_canvas_span(
+            piece["x_start"], piece["x_end"], width, piece["col"], column_count, overlap_pixels
+        )
+        canvas_y_start, canvas_y_end = _overlap_canvas_span(
+            piece["y_start"], piece["y_end"], height, piece["row"], row_count, overlap_pixels
+        )
+        piece_width = canvas_x_end - canvas_x_start if overlapping_layers else piece["x_end"] - piece["x_start"]
+        piece_height = canvas_y_end - canvas_y_start if overlapping_layers else piece["y_end"] - piece["y_start"]
         zip_path = output_dir / f"{safe_name}_r{piece['row']:02d}_c{piece['col']:02d}_tiff_slices.zip"
         _zip_tiff_paths(piece["tiff_paths"], zip_path)
         piece_state: ViewerState = {
             "tiff_paths": [str(path) for path in piece["tiff_paths"]],
             "z_values": z_values[: len(piece["tiff_paths"])],
             "pixel_size": pixel_size,
-            "x_min": base_x_min + (piece["x_start"] * pixel_size),
-            "y_min": base_y_min + ((height - piece["y_end"]) * pixel_size),
+            "x_min": base_x_min + ((canvas_x_start if overlapping_layers else piece["x_start"]) * pixel_size),
+            "y_min": base_y_min + ((height - (canvas_y_end if overlapping_layers else piece["y_end"])) * pixel_size),
             "image_width": piece_width,
             "image_height": piece_height,
             "zip_path": str(zip_path),
+            "overlapping_layers": bool(overlapping_layers),
         }
         piece["state"] = piece_state
         piece["zip_path"] = zip_path
@@ -1879,13 +2065,26 @@ def _selected_record_index(records: list[dict], selected: str | None) -> int:
     return 0
 
 
+def _next_unused_nozzle(used_nozzles: set[int]) -> int:
+    nozzle = 1
+    while nozzle in used_nozzles:
+        nozzle += 1
+    return nozzle
+
+
 def _records_from_files(files: Any, previous_records: list[dict] | None = None) -> list[dict]:
-    previous_by_path = {record.get("stl_path"): record for record in (previous_records or [])}
+    previous_by_path: dict[str | None, list[dict]] = {}
+    for record in previous_records or []:
+        previous_by_path.setdefault(record.get("stl_path"), []).append(record)
+    used_nozzles: set[int] = set()
     records: list[dict] = []
     for index, path in enumerate(_uploaded_file_paths(files), start=1):
-        previous = previous_by_path.get(path, {})
+        previous_queue = previous_by_path.get(path) or []
+        previous = previous_queue.pop(0) if previous_queue else {}
         name = previous.get("name") or Path(path).stem or f"Shape {index}"
         default_x, default_y, default_z = _default_target_extents_for_stl(path)
+        nozzle = _record_nozzle_number(previous, index) if previous else _next_unused_nozzle(used_nozzles)
+        used_nozzles.add(nozzle)
         records.append({
             "idx": index,
             "name": name,
@@ -1899,7 +2098,7 @@ def _records_from_files(files: Any, previous_records: list[dict] | None = None) 
             "last_scaled_axis": previous.get("last_scaled_axis", "target_x"),
             "pressure": previous.get("pressure", 25.0),
             "valve": previous.get("valve", 4),
-            "nozzle": previous.get("nozzle", index),
+            "nozzle": nozzle,
             "port": previous.get("port", 1),
             "color": previous.get("color", _default_color(index)),
             "contour_tracing": previous.get("contour_tracing", False),
@@ -2095,6 +2294,93 @@ def _spacing_table_update(records: list[dict], existing_table: Any | None = None
     )
 
 
+def _grid_spacing_rows(
+    records: list[dict],
+    columns: Any,
+    rows: Any,
+    column_spacing: Any,
+    row_spacing: Any,
+) -> tuple[list[list[Any]], int, int]:
+    ordered_nozzles = _ordered_nozzle_numbers(records)
+    column_count = max(1, _coerce_int(columns, 2))
+    row_count = max(1, _coerce_int(rows, 1))
+    try:
+        x_spacing = float(column_spacing)
+    except (TypeError, ValueError):
+        x_spacing = 5.0
+    try:
+        y_spacing = float(row_spacing)
+    except (TypeError, ValueError):
+        y_spacing = 5.0
+
+    spacing_rows: list[list[Any]] = []
+    for index, (first, second) in enumerate(zip(ordered_nozzles, ordered_nozzles[1:])):
+        current_col = index % column_count
+        next_col = (index + 1) % column_count
+        if next_col > current_col:
+            gap_x = x_spacing
+            gap_y = 0.0
+        else:
+            gap_x = -x_spacing * (column_count - 1)
+            gap_y = y_spacing
+        spacing_rows.append([
+            _nozzle_spacing_label(first, records),
+            _nozzle_spacing_label(second, records),
+            gap_x,
+            gap_y,
+        ])
+    return spacing_rows, column_count, row_count
+
+
+def apply_nozzle_grid_spacing(
+    records: list[dict] | None,
+    columns: Any,
+    rows: Any,
+    column_spacing: Any,
+    row_spacing: Any,
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    records = records or []
+    spacing_rows, column_count, row_count = _grid_spacing_rows(records, columns, rows, column_spacing, row_spacing)
+    nozzle_count = len(_ordered_nozzle_numbers(records))
+    capacity = column_count * row_count
+    status = f"Applied {column_count} x {row_count} grid spacing to {max(nozzle_count - 1, 0)} nozzle pair(s)."
+    if nozzle_count > capacity:
+        status += f" {nozzle_count} nozzles exceed {capacity} grid slots, so spacing continues row by row."
+    return (
+        gr.update(value=True),
+        gr.update(
+            headers=ADVANCED_NOZZLE_SPACING_HEADERS,
+            value=spacing_rows,
+            row_count=(len(spacing_rows), "fixed"),
+            column_count=(len(ADVANCED_NOZZLE_SPACING_HEADERS), "fixed"),
+            label="Advanced Nozzle Spacing",
+        ),
+        status,
+    )
+
+
+def update_nozzle_grid_preset(
+    preset: str | None,
+    records: list[dict] | None,
+    columns: Any,
+    rows: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    nozzle_count = max(1, len(_ordered_nozzle_numbers(records or [])))
+    if preset == "One row":
+        return gr.update(value=nozzle_count), gr.update(value=1)
+    if preset == "One column":
+        return gr.update(value=1), gr.update(value=nozzle_count)
+    if preset and " x " in preset:
+        left, right = preset.split(" x ", 1)
+        return gr.update(value=max(1, _coerce_int(left, 1))), gr.update(value=max(1, _coerce_int(right, 1)))
+    return gr.update(value=max(1, _coerce_int(columns, 1))), gr.update(value=max(1, _coerce_int(rows, 1)))
+
+
+def update_nozzle_spacing_mode(layout_mode: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    custom_selected = layout_mode == NOZZLE_LAYOUT_PAIR_TABLE
+    return gr.update(visible=not custom_selected), gr.update(visible=custom_selected)
+
+
 def _dropdown_update(records: list[dict], selected: str | None = None) -> dict[str, Any]:
     choices = [_shape_choice(record) for record in records]
     value = selected if selected in choices else (choices[0] if choices else None)
@@ -2120,6 +2406,13 @@ def _merge_file_paths(*file_groups: Any) -> list[str]:
             seen.add(key)
             merged.append(path)
     return merged
+
+
+def _append_file_paths(*file_groups: Any) -> list[str]:
+    paths: list[str] = []
+    for group in file_groups:
+        paths.extend(_uploaded_file_paths(group))
+    return paths
 
 
 def sync_uploaded_shapes(
@@ -2154,7 +2447,7 @@ def load_sample_shapes(
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
     paths = [str(SAMPLE_STL_DIR / filename) for filename in SAMPLE_STL_FILENAMES if (SAMPLE_STL_DIR / filename).exists()]
-    merged_paths = _merge_file_paths(files, paths)
+    merged_paths = _append_file_paths(files, paths)
     return (
         gr.update(value=merged_paths),
         *sync_uploaded_shapes(merged_paths, records, None, existing_spacing, use_individual_spacing),
@@ -2524,6 +2817,7 @@ def split_selected_shape_for_grid(
     use_individual_spacing: bool | None,
     columns: float,
     rows: float,
+    overlapping_layers: bool,
     starting_nozzle: float,
     starting_valve: float,
     progress: gr.Progress = gr.Progress(),
@@ -2560,6 +2854,7 @@ def split_selected_shape_for_grid(
             base_name=str(source.get("name") or f"shape_{source.get('idx', pos + 1)}"),
             columns=columns,
             rows=rows,
+            overlapping_layers=overlapping_layers,
             progress=progress,
         )
     except Exception as exc:
@@ -2610,6 +2905,8 @@ def split_selected_shape_for_grid(
         f"({max(1, _coerce_int(columns, 2))} columns x {max(1, _coerce_int(rows, 1))} rows).  \n"
         f"Nozzles {first_nozzle}-{first_nozzle + len(pieces) - 1}; valves {first_valve}-{first_valve + len(pieces) - 1}."
     )
+    if overlapping_layers:
+        status += "  \nOverlapping Layers is enabled: split boundaries alternate by 1 pixel per layer with small blank margins for alignment."
     return (
         next_records,
         _shape_settings_rows(next_records),
@@ -2748,19 +3045,28 @@ def _spacing_args_from_table(spacing_table: Any, use_individual_spacing: bool | 
     return pairs[0][0], pairs[0][1], pairs[1][0], pairs[1][1], extra
 
 
-def render_dynamic_nozzle_spacing(records: list[dict] | None, use_individual_spacing: bool, spacing_table: Any) -> tuple[Any, str]:
+def render_dynamic_nozzle_spacing(
+    records: list[dict] | None,
+    layout_mode: str | None,
+    columns: Any,
+    rows: Any,
+    column_spacing: Any,
+    row_spacing: Any,
+    use_individual_spacing: bool,
+    spacing_table: Any,
+) -> tuple[Any, str]:
     parts, _messages = _parts_from_records(records)
     if not parts:
         return None, "No shape G-code available. Generate G-code first."
-    gap12x, gap12y, gap23x, gap23y, extra = _spacing_args_from_table(spacing_table, use_individual_spacing)
-    offsets, spacings = _resolve_nozzle_layout(
+    offsets, spacings = _resolve_layout_from_spacing_controls(
         parts,
-        _same_spacing_from_individual(use_individual_spacing),
-        gap12x,
-        gap12y,
-        gap23x,
-        gap23y,
-        *extra,
+        layout_mode,
+        columns,
+        rows,
+        column_spacing,
+        row_spacing,
+        use_individual_spacing,
+        spacing_table,
     )
     return build_nozzle_spacing_figure(parts, offsets, spacings), _format_nozzle_spacing_status(parts, offsets, spacings)
 
@@ -2831,6 +3137,11 @@ def render_dynamic_parallel(
     travel_opacity: float,
     filament_width: float,
     travel_width: float,
+    layout_mode: str | None,
+    columns: Any,
+    rows: Any,
+    column_spacing: Any,
+    row_spacing: Any,
     use_individual_spacing: bool,
     spacing_table: Any,
     tube: bool = True,
@@ -2839,15 +3150,15 @@ def render_dynamic_parallel(
     parts, messages = _parts_from_records(records)
     if not parts:
         return None, "No shape G-code available. Generate G-code on the TIFF Slices to GCode tab first."
-    gap12x, gap12y, gap23x, gap23y, extra = _spacing_args_from_table(spacing_table, use_individual_spacing)
-    offsets, spacings = _resolve_nozzle_layout(
+    offsets, spacings = _resolve_layout_from_spacing_controls(
         parts,
-        _same_spacing_from_individual(use_individual_spacing),
-        gap12x,
-        gap12y,
-        gap23x,
-        gap23y,
-        *extra,
+        layout_mode,
+        columns,
+        rows,
+        column_spacing,
+        row_spacing,
+        use_individual_spacing,
+        spacing_table,
     )
     figure = build_parallel_figure(
         parts,
@@ -2881,6 +3192,11 @@ def export_dynamic_parallel_gif(
     records: list[dict] | None,
     settings_table: Any,
     travel_opacity: float,
+    layout_mode: str | None,
+    columns: Any,
+    rows: Any,
+    column_spacing: Any,
+    row_spacing: Any,
     use_individual_spacing: bool,
     spacing_table: Any,
     duration: float,
@@ -2893,15 +3209,15 @@ def export_dynamic_parallel_gif(
     parts, _messages = _parts_from_records(records)
     if not parts:
         return None
-    gap12x, gap12y, gap23x, gap23y, extra = _spacing_args_from_table(spacing_table, use_individual_spacing)
-    offsets, _spacings = _resolve_nozzle_layout(
+    offsets, _spacings = _resolve_layout_from_spacing_controls(
         parts,
-        _same_spacing_from_individual(use_individual_spacing),
-        gap12x,
-        gap12y,
-        gap23x,
-        gap23y,
-        *extra,
+        layout_mode,
+        columns,
+        rows,
+        column_spacing,
+        row_spacing,
+        use_individual_spacing,
+        spacing_table,
     )
 
     def report(frame: int, total: int) -> None:
@@ -2969,75 +3285,71 @@ def build_dynamic_demo() -> gr.Blocks:
                 pixel_size = gr.Number(label="Pixel Size/Fill Width (mm)", value=0.8, minimum=0.0001, step=0.01)
                 generate_button = gr.Button("Generate TIFF Stacks", variant="primary")
 
-            with gr.Row():
-                selected_shape = gr.Dropdown(label="Preview Shape", choices=[], value=None, allow_custom_value=False)
-                refresh_preview_button = gr.Button("Regenerate Preview", variant="secondary", size="sm")
+            with gr.Accordion("Multi-Nozzle Split", open=False, elem_classes=["settings-accordion"]):
+                with gr.Row():
+                    split_source = gr.Dropdown(label="Source Shape", choices=[], value=None, allow_custom_value=False)
+                    split_refresh_sources = gr.Button("Refresh Source Shapes", variant="secondary", size="sm")
+                with gr.Row():
+                    split_columns = gr.Number(label="Columns (X)", value=2, minimum=1, step=1)
+                    split_rows = gr.Number(label="Rows (Y)", value=1, minimum=1, step=1)
+                    split_start_nozzle = gr.Number(label="Starting Nozzle", value=1, minimum=1, step=1)
+                    split_start_valve = gr.Number(label="Starting Valve", value=4, minimum=1, step=1)
+                split_overlapping_layers = gr.Checkbox(label="Overlapping Layers", value=False)
+                split_button = gr.Button("Split Selected Shape into Grid Pieces", variant="primary")
+                split_status = gr.Markdown("Generate a TIFF stack, then split it for multi-nozzle printing.")
+                split_downloads = gr.File(label="Download Split TIFF ZIPs", file_count="multiple", interactive=False)
+                with gr.Row():
+                    with gr.Column(scale=1, min_width=260):
+                        split_piece_source = gr.Dropdown(label="Preview Generated Piece", choices=[], value=None, allow_custom_value=False)
+                        with gr.Row():
+                            split_piece_prev = gr.Button("Prev", scale=1, min_width=90, size="sm")
+                            split_piece_next = gr.Button("Next", scale=1, min_width=90, size="sm")
+                        split_piece_slider = gr.Slider(label="Piece Slice Index", minimum=0, maximum=0, value=0, step=1, interactive=False)
+                        split_piece_label = gr.Markdown("No split stack generated yet.")
+                    with gr.Column(scale=2, min_width=420):
+                        split_piece_preview = gr.Image(label="Generated Piece Preview", type="pil", image_mode="RGB", height=330)
 
-            with gr.Row():
-                with gr.Column(scale=2, min_width=420):
-                    model_viewer = gr.Model3D(
-                        label="Selected 3D Viewer",
-                        display_mode="solid",
-                        clear_color=(0.94, 0.95, 0.97, 1.0),
-                        camera_position=FRONT_CAMERA,
-                        height=360,
-                    )
-                with gr.Column(scale=1, min_width=300):
-                    model_details = gr.Markdown("No model loaded.")
+            with gr.Accordion("Selected Shape Preview", open=False, elem_classes=["settings-accordion"]):
+                with gr.Row():
+                    selected_shape = gr.Dropdown(label="Preview Shape", choices=[], value=None, allow_custom_value=False)
+                    refresh_preview_button = gr.Button("Regenerate Preview", variant="secondary", size="sm")
 
-            with gr.Row():
-                with gr.Column(scale=2, min_width=420):
-                    slice_preview = gr.Image(label="Selected Slice Preview", type="pil", image_mode="RGB", height=320)
-                with gr.Column(scale=1, min_width=300):
-                    slice_label = gr.Markdown("No slice stack loaded yet.")
-                    with gr.Row():
-                        prev_button = gr.Button("Prev", scale=1, min_width=90, size="sm")
-                        next_button = gr.Button("Next", scale=1, min_width=90, size="sm")
-                    slice_slider = gr.Slider(label="Slice Index", minimum=0, maximum=0, value=0, step=1, interactive=False)
-                    tiff_downloads = gr.File(label="Download TIFF ZIPs", file_count="multiple", interactive=False)
-                    slicer_status = gr.Markdown("")
+                with gr.Row():
+                    with gr.Column(scale=2, min_width=420):
+                        model_viewer = gr.Model3D(
+                            label="Selected 3D Viewer",
+                            display_mode="solid",
+                            clear_color=(0.94, 0.95, 0.97, 1.0),
+                            camera_position=FRONT_CAMERA,
+                            height=360,
+                        )
+                    with gr.Column(scale=1, min_width=300):
+                        model_details = gr.Markdown("No model loaded.")
 
-            gr.Markdown("---")
-            gr.Markdown("### Reference TIFF Stack")
-            with gr.Row():
-                with gr.Column(scale=1, min_width=200):
-                    ref_generate_button = gr.Button("Generate Reference TIFF Stack", variant="primary")
-                with gr.Column(scale=3, min_width=250):
-                    ref_slice_label = gr.Markdown("No reference stack generated yet.")
-                    ref_slice_preview = gr.Image(label="Reference Slice Preview", type="pil", image_mode="RGB", height=270)
-                    with gr.Row():
-                        ref_prev_button = gr.Button("Prev", scale=1, min_width=90, size="sm")
-                        ref_next_button = gr.Button("Next", scale=1, min_width=90, size="sm")
-                    ref_slice_slider = gr.Slider(label="Slice Index", minimum=0, maximum=0, value=0, step=1, interactive=False)
+                with gr.Row():
+                    with gr.Column(scale=2, min_width=420):
+                        slice_preview = gr.Image(label="Selected Slice Preview", type="pil", image_mode="RGB", height=320)
+                    with gr.Column(scale=1, min_width=300):
+                        slice_label = gr.Markdown("No slice stack loaded yet.")
+                        with gr.Row():
+                            prev_button = gr.Button("Prev", scale=1, min_width=90, size="sm")
+                            next_button = gr.Button("Next", scale=1, min_width=90, size="sm")
+                        slice_slider = gr.Slider(label="Slice Index", minimum=0, maximum=0, value=0, step=1, interactive=False)
 
-        with gr.Tab("Single Shape Multi-Nozzle"):
-            gr.Markdown(
-                """
-                # Single Shape Multi-Nozzle
-                Split one generated TIFF stack into a row/column grid, then print each piece with a different nozzle.
-                """
-            )
-            with gr.Row():
-                split_source = gr.Dropdown(label="Source Shape", choices=[], value=None, allow_custom_value=False)
-                split_refresh_sources = gr.Button("Refresh Source Shapes", variant="secondary", size="sm")
-            with gr.Row():
-                split_columns = gr.Number(label="Columns (X)", value=2, minimum=1, step=1)
-                split_rows = gr.Number(label="Rows (Y)", value=1, minimum=1, step=1)
-                split_start_nozzle = gr.Number(label="Starting Nozzle", value=1, minimum=1, step=1)
-                split_start_valve = gr.Number(label="Starting Valve", value=4, minimum=1, step=1)
-            split_button = gr.Button("Split Selected Shape into Grid Pieces", variant="primary")
-            split_status = gr.Markdown("Generate a TIFF stack, then split it for multi-nozzle printing.")
-            split_downloads = gr.File(label="Download Split TIFF ZIPs", file_count="multiple", interactive=False)
-            with gr.Row():
-                with gr.Column(scale=1, min_width=260):
-                    split_piece_source = gr.Dropdown(label="Preview Generated Piece", choices=[], value=None, allow_custom_value=False)
-                    with gr.Row():
-                        split_piece_prev = gr.Button("Prev", scale=1, min_width=90, size="sm")
-                        split_piece_next = gr.Button("Next", scale=1, min_width=90, size="sm")
-                    split_piece_slider = gr.Slider(label="Piece Slice Index", minimum=0, maximum=0, value=0, step=1, interactive=False)
-                    split_piece_label = gr.Markdown("No split stack generated yet.")
-                with gr.Column(scale=2, min_width=420):
-                    split_piece_preview = gr.Image(label="Generated Piece Preview", type="pil", image_mode="RGB", height=330)
+            tiff_downloads = gr.File(label="Download TIFF ZIPs", file_count="multiple", interactive=False)
+            slicer_status = gr.Markdown("")
+
+            with gr.Accordion("Reference TIFF Stack Preview", open=False, elem_classes=["settings-accordion"]):
+                with gr.Row():
+                    with gr.Column(scale=1, min_width=200):
+                        ref_generate_button = gr.Button("Generate Reference TIFF Stack", variant="primary")
+                    with gr.Column(scale=3, min_width=250):
+                        ref_slice_label = gr.Markdown("No reference stack generated yet.")
+                        ref_slice_preview = gr.Image(label="Reference Slice Preview", type="pil", image_mode="RGB", height=270)
+                        with gr.Row():
+                            ref_prev_button = gr.Button("Prev", scale=1, min_width=90, size="sm")
+                            ref_next_button = gr.Button("Next", scale=1, min_width=90, size="sm")
+                        ref_slice_slider = gr.Slider(label="Slice Index", minimum=0, maximum=0, value=0, step=1, interactive=False)
 
         with gr.Tab("TIFF Slices to GCode"):
             gr.Markdown(
@@ -3065,18 +3377,35 @@ def build_dynamic_demo() -> gr.Blocks:
                 refresh_gcode_text_button = gr.Button("Refresh G-Code Preview", variant="secondary", size="sm")
             gcode_text = gr.Code(label="Selected G-Code", language=None, lines=18, max_lines=18, interactive=False, elem_classes=["gcode-view"])
 
-            with gr.Group():
-                gr.Markdown("### Nozzle Spacing")
-                nozzle_use_individual_spacing = gr.Checkbox(label="Advanced Settings", value=False)
-                nozzle_spacing_table = gr.Dataframe(
-                    headers=NOZZLE_SPACING_HEADERS,
-                    value=[["Same spacing", "All neighboring nozzles", 5.0, 0.0]],
-                    row_count=(1, "fixed"),
-                    column_count=(len(NOZZLE_SPACING_HEADERS), "fixed"),
-                    interactive=True,
-                    label="Nozzle Spacing",
-                    elem_id="nozzle-spacing-table",
+            with gr.Accordion("Nozzle Spacing", open=False, elem_classes=["settings-accordion"]):
+                nozzle_layout_mode = gr.Radio(
+                    label="Spacing Mode",
+                    choices=[NOZZLE_LAYOUT_GRID, NOZZLE_LAYOUT_PAIR_TABLE],
+                    value=NOZZLE_LAYOUT_GRID,
                 )
+                with gr.Group(visible=True) as nozzle_grid_group:
+                    with gr.Row():
+                        nozzle_grid_preset = gr.Dropdown(
+                            label="Common Layout",
+                            choices=NOZZLE_LAYOUT_PRESETS,
+                            value="Custom",
+                            allow_custom_value=False,
+                        )
+                        nozzle_grid_columns = gr.Number(label="Grid Columns", value=2, minimum=1, step=1)
+                        nozzle_grid_rows = gr.Number(label="Grid Rows", value=2, minimum=1, step=1)
+                        nozzle_grid_column_spacing = gr.Number(label="Column Gap (X, mm)", value=0.0, step=0.1)
+                        nozzle_grid_row_spacing = gr.Number(label="Row Gap (Y, mm)", value=0.0, step=0.1)
+                with gr.Group(visible=False) as nozzle_custom_group:
+                    nozzle_use_individual_spacing = gr.Checkbox(label="Use Different Values for Each Nozzle Connection", value=False)
+                    nozzle_spacing_table = gr.Dataframe(
+                        headers=NOZZLE_SPACING_HEADERS,
+                        value=[["Same spacing", "All neighboring nozzles", 5.0, 0.0]],
+                        row_count=(1, "fixed"),
+                        column_count=(len(NOZZLE_SPACING_HEADERS), "fixed"),
+                        interactive=True,
+                        label="Custom Spacing",
+                        elem_id="nozzle-spacing-table",
+                    )
                 nozzle_preview_button = gr.Button("Visualize Nozzle Spacing", variant="secondary", elem_id="visualize-nozzle-spacing-button")
                 with gr.Row():
                     with gr.Column(scale=3, min_width=420):
@@ -3262,6 +3591,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 nozzle_use_individual_spacing,
                 split_columns,
                 split_rows,
+                split_overlapping_layers,
                 split_start_nozzle,
                 split_start_valve,
             ],
@@ -3282,6 +3612,10 @@ def build_dynamic_demo() -> gr.Blocks:
                 split_piece_preview,
                 split_status,
             ],
+        ).then(
+            fn=generate_dynamic_reference_stack,
+            inputs=[shape_records],
+            outputs=[ref_state, ref_slice_slider, ref_slice_label, ref_slice_preview],
         )
         split_piece_source.change(fn=preview_selected_split_piece, inputs=[split_piece_states, split_piece_source], outputs=[split_piece_slider, split_piece_label, split_piece_preview], queue=False)
         split_piece_slider.release(fn=jump_to_selected_split_piece, inputs=[split_piece_states, split_piece_source, split_piece_slider], outputs=[split_piece_label, split_piece_preview], queue=False)
@@ -3295,8 +3629,33 @@ def build_dynamic_demo() -> gr.Blocks:
         )
         gcode_text_source.change(fn=load_selected_gcode_text, inputs=[shape_records, gcode_text_source], outputs=[gcode_text])
         refresh_gcode_text_button.click(fn=load_selected_gcode_text, inputs=[shape_records, gcode_text_source], outputs=[gcode_text])
+        nozzle_layout_mode.change(
+            fn=update_nozzle_spacing_mode,
+            inputs=[nozzle_layout_mode],
+            outputs=[nozzle_grid_group, nozzle_custom_group],
+            queue=False,
+        )
+        nozzle_grid_preset.change(
+            fn=update_nozzle_grid_preset,
+            inputs=[nozzle_grid_preset, shape_records, nozzle_grid_columns, nozzle_grid_rows],
+            outputs=[nozzle_grid_columns, nozzle_grid_rows],
+            queue=False,
+        )
         nozzle_use_individual_spacing.change(fn=update_nozzle_spacing_table_mode, inputs=[shape_records, nozzle_spacing_table, nozzle_use_individual_spacing], outputs=[nozzle_spacing_table], queue=False)
-        nozzle_preview_button.click(fn=render_dynamic_nozzle_spacing, inputs=[shape_records, nozzle_use_individual_spacing, nozzle_spacing_table], outputs=[nozzle_spacing_plot, nozzle_spacing_status])
+        nozzle_preview_button.click(
+            fn=render_dynamic_nozzle_spacing,
+            inputs=[
+                shape_records,
+                nozzle_layout_mode,
+                nozzle_grid_columns,
+                nozzle_grid_rows,
+                nozzle_grid_column_spacing,
+                nozzle_grid_row_spacing,
+                nozzle_use_individual_spacing,
+                nozzle_spacing_table,
+            ],
+            outputs=[nozzle_spacing_plot, nozzle_spacing_status],
+        )
 
         gcode_source.change(
             fn=None,
@@ -3334,7 +3693,20 @@ def build_dynamic_demo() -> gr.Blocks:
 
         layer_height.change(fn=sync_width_sliders, inputs=[layer_height], outputs=[print_width_slider, travel_width_slider], queue=False)
 
-        parallel_render_inputs = [shape_records, shape_settings, pp_travel_opacity, pp_filament_width, pp_travel_width, nozzle_use_individual_spacing, nozzle_spacing_table]
+        parallel_render_inputs = [
+            shape_records,
+            shape_settings,
+            pp_travel_opacity,
+            pp_filament_width,
+            pp_travel_width,
+            nozzle_layout_mode,
+            nozzle_grid_columns,
+            nozzle_grid_rows,
+            nozzle_grid_column_spacing,
+            nozzle_grid_row_spacing,
+            nozzle_use_individual_spacing,
+            nozzle_spacing_table,
+        ]
         parallel_outputs = [parallel_plot, parallel_status, parallel_mode, parallel_anim_controls, pp_width_row, pp_export_group]
         parallel_line_button.click(fn=render_dynamic_parallel_lines, inputs=parallel_render_inputs, outputs=parallel_outputs)
         parallel_render_button.click(fn=render_dynamic_parallel_tubes, inputs=parallel_render_inputs, outputs=parallel_outputs)
@@ -3342,7 +3714,22 @@ def build_dynamic_demo() -> gr.Blocks:
         pp_travel_width.release(fn=rerender_dynamic_parallel_current_mode, inputs=[parallel_mode] + parallel_render_inputs, outputs=[parallel_plot, parallel_status])
         pp_export_button.click(
             fn=export_dynamic_parallel_gif,
-            inputs=[shape_records, shape_settings, pp_gif_travel_opacity, nozzle_use_individual_spacing, nozzle_spacing_table, pp_gif_duration, pp_gif_fps, pp_elev, pp_azim],
+            inputs=[
+                shape_records,
+                shape_settings,
+                pp_gif_travel_opacity,
+                nozzle_layout_mode,
+                nozzle_grid_columns,
+                nozzle_grid_rows,
+                nozzle_grid_column_spacing,
+                nozzle_grid_row_spacing,
+                nozzle_use_individual_spacing,
+                nozzle_spacing_table,
+                pp_gif_duration,
+                pp_gif_fps,
+                pp_elev,
+                pp_azim,
+            ],
             outputs=[pp_gif_file],
         )
 

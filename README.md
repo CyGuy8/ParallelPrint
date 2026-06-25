@@ -43,6 +43,7 @@ Then open the local Gradio URL in your browser, upload STL files or load the bun
 - Shows an interactive selected-shape 3D viewer for rotating each model
 - Shows model extents, face count, vertex count, and watertight status
 - Scales loaded STLs from editable target X/Y/Z dimensions in the Shape Settings table; new rows default to the STL's original dimensions, **Reset Dimensions** restores them, and **Keep Proportions** updates the other target sides from the edited side
+- Keeps optional shape, TIFF, reference-stack, and nozzle-spacing previews in closed accordions to reduce clutter
 - Lets you choose layer height and XY pixel size
 - Produces one `.tif` image per slice
 - Encodes material as black (`0`) and empty space as white (`255`) in each TIFF slice
@@ -70,9 +71,9 @@ When you click **Generate TIFF Stacks**, the app automatically combines availabl
 - Alignment is centered image placement, not bottom-left anchoring.
 - If image-size differences are odd, centering may produce a one-pixel shift due to integer rounding.
 
-### Single Shape Multi-Nozzle
+### Multi-Nozzle Split
 
-The **Single Shape Multi-Nozzle** tab can split one generated shape stack into a grid of print-ready stacks. Choose a source shape that already has TIFF slices, set the number of columns and rows, choose the starting nozzle and valve numbers, then click **Split Selected Shape into Grid Pieces**.
+The **Multi-Nozzle Split** accordion on the **STL to TIFF Slicer** tab can split one generated shape stack into a grid of print-ready stacks. Choose a source shape that already has TIFF slices, set the number of columns and rows, choose the starting nozzle and valve numbers, then click **Split Selected Shape into Grid Pieces**.
 
 - Each slice is split into columns along X and rows along Y; leftover pixels are assigned to earlier columns/rows so no pixels are dropped.
 - The selected shape is replaced in Shape Settings by one generated record per grid cell, named by row and column.

@@ -138,3 +138,42 @@ def test_split_tiff_stack_grid_preserves_pixels_and_offsets(tmp_path) -> None:
     for piece, expected_pixels in zip(pieces, expected):
         with Image.open(piece["state"]["tiff_paths"][0]) as image:
             np.testing.assert_array_equal(np.asarray(image), expected_pixels)
+
+
+def test_split_tiff_stack_grid_overlapping_layers_keep_small_alignment_margin(tmp_path) -> None:
+    layer0 = np.zeros((2, 6), dtype=np.uint8)
+    layer1 = np.zeros((2, 6), dtype=np.uint8)
+    layer0_path = tmp_path / "slice_0000.tif"
+    layer1_path = tmp_path / "slice_0001.tif"
+    Image.fromarray(layer0, mode="L").save(layer0_path)
+    Image.fromarray(layer1, mode="L").save(layer1_path)
+    state = {
+        "tiff_paths": [str(layer0_path), str(layer1_path)],
+        "z_values": [0.0, 1.0],
+        "pixel_size": 0.5,
+        "x_min": 10.0,
+        "y_min": -2.0,
+        "image_width": 6,
+        "image_height": 2,
+    }
+
+    left, right = split_tiff_stack_grid(state, "overlap-part", columns=2, rows=1, overlapping_layers=True)
+
+    assert left["state"]["image_width"] == 4
+    assert right["state"]["image_width"] == 4
+    assert left["state"]["x_min"] == 10.0
+    assert right["state"]["x_min"] == 11.0
+    with Image.open(left["state"]["tiff_paths"][0]) as left_layer0:
+        expected = np.zeros((2, 4), dtype=np.uint8)
+        np.testing.assert_array_equal(np.asarray(left_layer0), expected)
+    with Image.open(right["state"]["tiff_paths"][0]) as right_layer0:
+        expected = np.full((2, 4), 255, dtype=np.uint8)
+        expected[:, 2:] = 0
+        np.testing.assert_array_equal(np.asarray(right_layer0), expected)
+    with Image.open(left["state"]["tiff_paths"][1]) as left_layer1:
+        expected = np.full((2, 4), 255, dtype=np.uint8)
+        expected[:, :2] = 0
+        np.testing.assert_array_equal(np.asarray(left_layer1), expected)
+    with Image.open(right["state"]["tiff_paths"][1]) as right_layer1:
+        expected = np.zeros((2, 4), dtype=np.uint8)
+        np.testing.assert_array_equal(np.asarray(right_layer1), expected)
