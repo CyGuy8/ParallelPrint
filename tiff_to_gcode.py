@@ -66,12 +66,16 @@ def _togglepress() -> str:
 
 
 def _setpress_cmd(port: str, pressure: float, start: bool) -> str:
-    insert = "{preset}" if start else ""
+    if start:
+        return f"\n\r{port}.write(eval(setpress({pressure:g})))"
+    insert = ""
     return f"\n\r{insert}{port}.write({_setpress(pressure)})"
 
 
 def _toggle_cmd(port: str, start: bool) -> str:
-    insert = "{preset}" if start else ""
+    if start:
+        return f"\n\r{port}.write(eval(togglepress()))"
+    insert = ""
     return f"\n\r{insert}{port}.write({_togglepress()})"
 
 
@@ -1050,6 +1054,7 @@ def generate_snake_path_gcode(
     fil_width: float = 0.8,
     invert: bool = True,
     increase_pressure_per_layer: float = 0.1,
+    pressure_ramp_enabled: bool = True,
     all_g1: bool = False,
     motion_tiffs: list[str] | None = None,
     raster_pattern: str | None = RASTER_PATTERN_SAME_DIRECTION,
@@ -1301,8 +1306,11 @@ def generate_snake_path_gcode(
                     f"{move_type} X{move['X']} Y{move['Y']} Z{move['Z']} "
                     f"; Color {move['Color']}"
                 )
-                pressure_cur += increase_pressure_per_layer
-                pressure_next = _setpress_cmd(com_port, pressure_cur, start=False)
+                if pressure_ramp_enabled:
+                    pressure_cur += increase_pressure_per_layer
+                    pressure_next = _setpress_cmd(com_port, pressure_cur, start=False)
+                else:
+                    pressure_next = None
             else:
                 line = (
                     f"{move_type} X{move['X']} Y{move['Y']} ; Color {move['Color']}"

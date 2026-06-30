@@ -2928,6 +2928,22 @@ def shift_selected_slice(records: list[dict] | None, selected: str | None, index
     return gr.update(value=next_index), label, preview
 
 
+def _tiff_preview_update(records: list[dict], selected: str | None = None) -> tuple[dict[str, Any], dict[str, Any], str, Image.Image | None]:
+    dropdown = _dropdown_update(records, selected)
+    selected_value = dropdown.get("value") if isinstance(dropdown, dict) else selected
+    pos = _selected_record_index(records, selected_value)
+    state = (records[pos].get("tiff_state") if pos >= 0 else None) or _empty_state()
+    label, preview = _render_selected_slice(state, 0)
+    slider = gr.update(
+        minimum=0,
+        maximum=max(0, len(state.get("tiff_paths", [])) - 1),
+        value=0,
+        step=1,
+        interactive=len(state.get("tiff_paths", [])) > 1,
+    )
+    return dropdown, slider, label, preview
+
+
 def generate_dynamic_stacks(
     records: list[dict] | None,
     settings_table: Any,
@@ -2989,20 +3005,12 @@ def generate_dynamic_stacks(
         messages.append("Reference TIFF Stack: updated automatically.")
     else:
         messages.append("Reference TIFF Stack: skipped (no generated shape slices available).")
-    first_state = records[0].get("tiff_state") or _empty_state()
-    label, preview = _render_selected_slice(first_state, 0)
-    slider = gr.update(
-        minimum=0,
-        maximum=max(0, len(first_state.get("tiff_paths", [])) - 1),
-        value=0,
-        step=1,
-        interactive=len(first_state.get("tiff_paths", [])) > 1,
-    )
+    selected_update, slider, label, preview = _tiff_preview_update(records)
     return (
         records,
         [record.get("zip_path") for record in records if record.get("zip_path")],
         "\n".join(messages),
-        _dropdown_update(records),
+        selected_update,
         slider,
         label,
         preview,
@@ -3089,6 +3097,10 @@ def split_selected_shape_for_grid(
             records,
             _shape_settings_rows(records),
             _spacing_table_update(records, existing_spacing, use_individual_spacing),
+            _dropdown_update(records),
+            _reset_slider(),
+            "No slice stack loaded yet.",
+            None,
             [],
             [],
             _gcode_dropdown_update(records),
@@ -3123,6 +3135,10 @@ def split_selected_shape_for_grid(
             records,
             _shape_settings_rows(records),
             _spacing_table_update(records, existing_spacing, use_individual_spacing),
+            _dropdown_update(records, selected),
+            _reset_slider(),
+            "No slice stack loaded yet.",
+            None,
             [record.get("zip_path") for record in records if record.get("zip_path")],
             [record.get("gcode_path") for record in records if record.get("gcode_path")],
             _gcode_dropdown_update(records),
@@ -3168,6 +3184,8 @@ def split_selected_shape_for_grid(
         })
         split_records.append(piece_record)
     next_records = _reindex_shape_records([*records[:pos], *split_records, *records[pos + 1:]])
+    split_selected = _shape_choice(next_records[pos]) if pos < len(next_records) else None
+    selected_update, main_slider, main_label, main_preview = _tiff_preview_update(next_records, split_selected)
     slider, label, preview = preview_selected_split_piece(pieces, None)
     status = (
         f"Split Shape {source.get('idx', pos + 1)} into {len(pieces)} print-ready stacks "
@@ -3180,6 +3198,10 @@ def split_selected_shape_for_grid(
         next_records,
         _shape_settings_rows(next_records),
         _spacing_table_update(next_records, existing_spacing, use_individual_spacing),
+        selected_update,
+        main_slider,
+        main_label,
+        main_preview,
         [record.get("zip_path") for record in next_records if record.get("zip_path")],
         [record.get("gcode_path") for record in next_records if record.get("gcode_path")],
         _gcode_dropdown_update(next_records),
@@ -3219,6 +3241,7 @@ def generate_dynamic_gcode(
     all_g1: bool,
     use_reference_motion: bool,
     raster_pattern: str | None,
+    pressure_ramp_enabled: bool,
     lead_in_enabled: bool,
     lead_in_length: float,
     lead_in_clearance: float,
@@ -3252,6 +3275,7 @@ def generate_dynamic_gcode(
                 port=int(record.get("port", 1)),
                 layer_height=float(layer_height),
                 fil_width=float(pixel_size),
+                pressure_ramp_enabled=bool(pressure_ramp_enabled),
                 all_g1=bool(all_g1),
                 motion_tiffs=motion_tiffs,
                 raster_pattern=raster_pattern,
@@ -3653,6 +3677,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 value=True,
             )
             gcode_all_g1 = gr.Checkbox(label="Move at one constant speed (no fast travel moves)", value=True)
+            gcode_pressure_ramp_enabled = gr.Checkbox(label="Increase Pressure Each Layer", value=True)
             gcode_raster_pattern = gr.Dropdown(
                 label="Raster Pattern",
                 choices=list(RASTER_PATTERN_CHOICES),
@@ -3942,6 +3967,10 @@ def build_dynamic_demo() -> gr.Blocks:
                 shape_records,
                 shape_settings,
                 nozzle_spacing_table,
+                selected_shape,
+                slice_slider,
+                slice_label,
+                slice_preview,
                 tiff_downloads,
                 gcode_downloads,
                 gcode_text_source,
@@ -3978,6 +4007,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 gcode_all_g1,
                 gcode_use_ref_motion,
                 gcode_raster_pattern,
+                gcode_pressure_ramp_enabled,
                 gcode_lead_in_enabled,
                 gcode_lead_in_length,
                 gcode_lead_in_clearance,
@@ -3987,6 +4017,10 @@ def build_dynamic_demo() -> gr.Blocks:
                 pixel_size,
             ],
             outputs=[shape_records, gcode_downloads, gcode_status, gcode_text_source, gcode_source],
+        ).then(
+            fn=load_selected_gcode_text,
+            inputs=[shape_records, gcode_text_source],
+            outputs=[gcode_text],
         )
         gcode_text_source.change(fn=load_selected_gcode_text, inputs=[shape_records, gcode_text_source], outputs=[gcode_text])
         refresh_gcode_text_button.click(fn=load_selected_gcode_text, inputs=[shape_records, gcode_text_source], outputs=[gcode_text])

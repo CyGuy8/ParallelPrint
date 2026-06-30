@@ -69,6 +69,10 @@ def _moves_with_colors(gcode_text: str) -> list[dict]:
     return moves
 
 
+def _pressure_set_count(gcode_text: str) -> int:
+    return gcode_text.count("\\x30\\x38\\x50\\x53") + gcode_text.count("setpress(")
+
+
 def test_trace_mask_contours_uses_tiff_pixel_border_edges() -> None:
     contours = _trace_mask_contours(
         np.array(
@@ -535,8 +539,8 @@ def test_gcode_header_writes_presets_before_initial_aux_commands(tmp_path) -> No
 
     assert lines[0] == "G91"
     assert lines[1] == "{aux_command}WAGO_ValveCommands(7, 0)"
-    assert lines[2].startswith("{preset}serialPort3.write(")
-    assert lines[3].startswith("{preset}serialPort3.write(")
+    assert lines[2] == "serialPort3.write(eval(setpress(25)))"
+    assert lines[3] == "serialPort3.write(eval(togglepress()))"
     assert lines[4].startswith("{aux_command}WAGO_ValveCommands(")
     assert lines[5].startswith("{aux_command}WAGO_ValveCommands(")
 
@@ -583,6 +587,41 @@ def test_gcode_lead_in_runs_once_before_first_layer(tmp_path) -> None:
     first_z_index = next(index for index, move in enumerate(moves) if move["end"][2] > 0.0)
     assert first_z_index > 7
     assert not any(move["start"][0] < -3.0 or move["end"][0] < -3.0 for move in moves[first_z_index:])
+
+
+def test_gcode_pressure_ramp_can_be_disabled(tmp_path) -> None:
+    tiff_paths = []
+    for index in range(2):
+        tiff_path = tmp_path / f"slice_{index:04d}.tif"
+        Image.new("L", (1, 1), 0).save(tiff_path)
+        tiff_paths.append(tiff_path)
+
+    zip_path = tmp_path / "slices.zip"
+    with zipfile.ZipFile(zip_path, mode="w") as archive:
+        for tiff_path in tiff_paths:
+            archive.write(tiff_path, arcname=tiff_path.name)
+
+    ramped_path = generate_snake_path_gcode(
+        zip_path,
+        shape_name="pressure_ramped",
+        pressure=25,
+        valve=7,
+        port=3,
+        layer_height=1.0,
+        pressure_ramp_enabled=True,
+    )
+    fixed_path = generate_snake_path_gcode(
+        zip_path,
+        shape_name="pressure_fixed",
+        pressure=25,
+        valve=7,
+        port=3,
+        layer_height=1.0,
+        pressure_ramp_enabled=False,
+    )
+
+    assert _pressure_set_count(ramped_path.read_text()) > 1
+    assert _pressure_set_count(fixed_path.read_text()) == 1
 
 
 def test_gcode_uses_g1_for_print_and_g0_for_travel(tmp_path) -> None:
