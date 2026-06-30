@@ -20,6 +20,12 @@ RASTER_PATTERN_CHOICES = (
     RASTER_PATTERN_Y_DIRECTION,
     RASTER_PATTERN_WOODPILE,
 )
+CONTOUR_MODE_EXACT = "Exact pixel border"
+CONTOUR_MODE_ROW_ENVELOPE = "Shape-optimized row envelope"
+CONTOUR_MODE_CHOICES = (
+    CONTOUR_MODE_EXACT,
+    CONTOUR_MODE_ROW_ENVELOPE,
+)
 
 def _normalize_raster_pattern(pattern: str | None) -> str:
     if pattern == RASTER_PATTERN_WOODPILE:
@@ -27,6 +33,12 @@ def _normalize_raster_pattern(pattern: str | None) -> str:
     if pattern == RASTER_PATTERN_Y_DIRECTION:
         return RASTER_PATTERN_Y_DIRECTION
     return RASTER_PATTERN_SAME_DIRECTION
+
+
+def _normalize_contour_mode(mode: str | None) -> str:
+    if mode == CONTOUR_MODE_ROW_ENVELOPE:
+        return CONTOUR_MODE_ROW_ENVELOPE
+    return CONTOUR_MODE_EXACT
 
 
 def _setpress(pressure: float) -> str:
@@ -158,6 +170,47 @@ def _gcode_layer(
 def _sort_key(filename: str) -> int:
     digits = "".join(filter(str.isdigit, filename))
     return int(digits) if digits else 2**31
+
+
+def _lead_in_moves(
+    enabled: bool,
+    length: float,
+    clearance: float,
+    line_count: int,
+    line_spacing: float,
+    print_color: int,
+    off_color: int,
+) -> list[dict]:
+    if not enabled:
+        return []
+    lead_length = max(0.0, float(length))
+    if lead_length <= 0.0:
+        return []
+    lead_clearance = max(0.0, float(clearance))
+    pass_count = max(1, int(line_count))
+    spacing = max(0.0, float(line_spacing))
+
+    moves: list[dict] = []
+    current_x = 0.0
+    current_y = 0.0
+
+    def append_move(dx: float, dy: float, color: int) -> None:
+        nonlocal current_x, current_y
+        if dx == 0.0 and dy == 0.0:
+            return
+        moves.append({"X": dx, "Y": dy, "Color": color})
+        current_x += dx
+        current_y += dy
+
+    append_move(-(lead_clearance + lead_length), 0.0, off_color)
+    direction = 1.0
+    for pass_index in range(pass_count):
+        append_move(direction * lead_length, 0.0, print_color)
+        direction *= -1.0
+        if pass_index < pass_count - 1:
+            append_move(0.0, spacing, off_color)
+    append_move(-current_x, -current_y, off_color)
+    return moves
 
 
 def _extract_zip_tiffs(zip_path: Path, dest: Path) -> list[Path]:
@@ -304,6 +357,51 @@ def _trace_mask_contours(
 
     contours.sort(key=_contour_sort_key)
     return contours
+
+
+def _trace_row_envelope_contours(
+    mask: np.ndarray,
+    pixel_size: float,
+    x_offset_px: float = 0.0,
+    y_offset_px: float = 0.0,
+) -> list[list[tuple[float, float]]]:
+    """Trace one outside contour using each active row's left/right extent."""
+    if not np.any(mask):
+        return []
+
+    mask = mask.astype(bool)
+    first = np.where(mask.any(axis=1), mask.argmax(axis=1), -1)
+    last = np.where(
+        mask.any(axis=1),
+        mask.shape[1] - 1 - np.fliplr(mask).argmax(axis=1),
+        -1,
+    )
+    rows = np.where(first != -1)[0]
+    if len(rows) == 0:
+        return []
+
+    points: list[tuple[float, float]] = []
+
+    for row in rows:
+        points.append((float(first[row] - 1), float(row)))
+
+    bottom = int(rows[-1])
+    for col in range(int(first[bottom]) - 1, int(last[bottom]) + 1):
+        points.append((float(col), float(bottom) + 0.5))
+
+    for row in rows[::-1]:
+        points.append((float(last[row]), float(row)))
+
+    top = int(rows[0])
+    for col in range(int(last[top]), int(first[top]) - 2, -1):
+        points.append((float(col), float(top) - 0.5))
+
+    return [
+        [
+            ((x + x_offset_px) * pixel_size, (y + y_offset_px) * pixel_size)
+            for x, y in points
+        ]
+    ]
 
 
 def _append_relative_move(
@@ -522,6 +620,7 @@ def _contour_pixel_offsets(
     raster_pattern: str,
     motion_mask: np.ndarray,
     contour_mask: np.ndarray,
+    contour_mode: str = CONTOUR_MODE_EXACT,
 ) -> tuple[float, float]:
     if raster_pattern == RASTER_PATTERN_SAME_DIRECTION:
         first_row_start = _first_raster_row_start(motion_mask)
@@ -534,8 +633,14 @@ def _contour_pixel_offsets(
         # rastered row's starting pixel. Wider lower rows can extend left of
         # that point, so using the layer-wide min column shifts pyramid-like
         # contours away from the infill.
-        return 1.0 - first_col, -0.5 - first_row
-    return 0.0, 0.0
+        x_offset, y_offset = 1.0 - first_col, -0.5 - first_row
+    else:
+        x_offset, y_offset = 0.0, 0.0
+
+    if contour_mode == CONTOUR_MODE_ROW_ENVELOPE:
+        x_offset += 1.0
+        y_offset += 0.5
+    return x_offset, y_offset
 
 
 def _build_contour_layers(
@@ -559,6 +664,9 @@ def _build_contour_layers(
         except (TypeError, ValueError):
             owner_idx = source_pos + 1
 
+        contour_mode = _normalize_contour_mode(
+            source.get("contour_mode") or source.get("mode")
+        )
         source_paths = _contour_source_paths(source, extract_root, source_pos)
         for layer_number, path_img in enumerate(path_ref_list):
             if layer_number >= len(source_paths):
@@ -590,16 +698,29 @@ def _build_contour_layers(
                 raster_pattern,
                 contour_path_img > off_color,
                 contour_mask,
+                contour_mode,
             )
-            contours = _trace_mask_contours(
-                contour_mask,
-                pixel_size,
-                x_offset_px=x_offset_px,
-                y_offset_px=y_offset_px,
-            )
+            if contour_mode == CONTOUR_MODE_ROW_ENVELOPE:
+                contours = _trace_row_envelope_contours(
+                    contour_mask,
+                    pixel_size,
+                    x_offset_px=x_offset_px,
+                    y_offset_px=y_offset_px,
+                )
+            else:
+                contours = _trace_mask_contours(
+                    contour_mask,
+                    pixel_size,
+                    x_offset_px=x_offset_px,
+                    y_offset_px=y_offset_px,
+                )
             if contours:
                 contour_layers[layer_number].append(
-                    {"owner_idx": owner_idx, "contours": contours}
+                    {
+                        "owner_idx": owner_idx,
+                        "contour_mode": contour_mode,
+                        "contours": contours,
+                    }
                 )
 
     return contour_layers
@@ -649,8 +770,6 @@ def _append_layer_contours(
         current_y,
     )
 
-    first_start_x: float | None = None
-    first_start_y: float | None = None
     use_infill_reference = True
 
     for source in active_sources:
@@ -679,8 +798,6 @@ def _append_layer_contours(
             if contour[0] != contour[-1]:
                 contour = [*contour, contour[0]]
             start_x, start_y = contour[0]
-            if first_start_x is None:
-                first_start_x, first_start_y = start_x, start_y
             use_infill_reference = False
             current_x, current_y = _append_relative_move(
                 output_list,
@@ -699,19 +816,6 @@ def _append_layer_contours(
                     target_y,
                     color,
                 )
-
-    if first_start_x is not None and (
-        abs(current_x - first_start_x) > 1e-9
-        or abs(current_y - (first_start_y or 0.0)) > 1e-9
-    ):
-        current_x, current_y = _append_relative_move(
-            output_list,
-            current_x,
-            current_y,
-            first_start_x,
-            first_start_y,
-            255,
-        )
 
     return current_x, current_y
 
@@ -951,6 +1055,10 @@ def generate_snake_path_gcode(
     raster_pattern: str | None = RASTER_PATTERN_SAME_DIRECTION,
     contour_tiff_sets: list[dict] | None = None,
     active_contour_owner: int | None = None,
+    lead_in_enabled: bool = False,
+    lead_in_length: float = 5.0,
+    lead_in_clearance: float = 5.0,
+    lead_in_lines: int = 3,
 ) -> Path:
     zip_path = Path(zip_path)
     if not zip_path.exists():
@@ -1146,11 +1254,24 @@ def generate_snake_path_gcode(
                 off_color,
             )
 
+    lead_in = _lead_in_moves(
+        lead_in_enabled,
+        lead_in_length,
+        lead_in_clearance,
+        lead_in_lines,
+        fil_width,
+        255,
+        off_color,
+    )
+    if lead_in:
+        gcode_list = [*lead_in, *gcode_list]
+
     gcode_path = work_dir / f"{shape_name}_SnakePath_gcode.txt"
     pressure_cur = float(pressure)
 
     with open(gcode_path, "w") as f:
         f.write("G91\n")
+        f.write(_valve_cmd(valve, 0))
         for line in setpress_lines:
             f.write(f"{line}\n")
         for line in pressure_on_lines:

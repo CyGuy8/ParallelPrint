@@ -6,11 +6,14 @@ import numpy as np
 from PIL import Image
 
 from tiff_to_gcode import (
+    CONTOUR_MODE_ROW_ENVELOPE,
     RASTER_PATTERN_SAME_DIRECTION,
     RASTER_PATTERN_WOODPILE,
     RASTER_PATTERN_Y_DIRECTION,
     _build_contour_layers,
+    _append_layer_contours,
     _trace_mask_contours,
+    _trace_row_envelope_contours,
     generate_snake_path_gcode,
 )
 
@@ -79,6 +82,76 @@ def test_trace_mask_contours_uses_tiff_pixel_border_edges() -> None:
     )
 
     assert contours == [[(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (0.0, 0.0)]]
+
+
+def test_trace_row_envelope_contours_follows_left_right_row_extents() -> None:
+    contours = _trace_row_envelope_contours(
+        np.array(
+            [
+                [False, True, False],
+                [True, True, True],
+            ],
+            dtype=bool,
+        ),
+        pixel_size=1.0,
+    )
+
+    assert contours == [
+        [
+            (0.0, 0.0),
+            (-1.0, 1.0),
+            (-1.0, 1.5),
+            (0.0, 1.5),
+            (1.0, 1.5),
+            (2.0, 1.5),
+            (2.0, 1.0),
+            (1.0, 0.0),
+            (1.0, -0.5),
+            (0.0, -0.5),
+        ]
+    ]
+
+
+def test_build_contour_layers_can_use_shape_optimized_row_envelope(tmp_path) -> None:
+    contour_img = np.array(
+        [
+            [0, 255, 0],
+            [255, 255, 255],
+        ],
+        dtype=np.uint8,
+    )
+    contour_tiff = tmp_path / "contour_slice_0000.tif"
+    Image.fromarray(contour_img).save(contour_tiff)
+
+    contour_layers = _build_contour_layers(
+        [
+            {
+                "owner_idx": 1,
+                "contour_mode": CONTOUR_MODE_ROW_ENVELOPE,
+                "tiff_paths": [str(contour_tiff)],
+            }
+        ],
+        [contour_img],
+        pixel_size=1.0,
+        invert=False,
+        off_color=0,
+        work_dir=tmp_path,
+        raster_pattern=RASTER_PATTERN_SAME_DIRECTION,
+    )
+
+    assert contour_layers[0][0]["contour_mode"] == CONTOUR_MODE_ROW_ENVELOPE
+    assert contour_layers[0][0]["contours"][0] == [
+        (1.0, 0.0),
+        (0.0, 1.0),
+        (0.0, 1.5),
+        (1.0, 1.5),
+        (2.0, 1.5),
+        (3.0, 1.5),
+        (3.0, 1.0),
+        (2.0, 0.0),
+        (2.0, -0.5),
+        (1.0, -0.5),
+    ]
 
 
 def test_contour_tracing_aligns_default_raster_border_pixel_frame(tmp_path) -> None:
@@ -352,16 +425,45 @@ def test_contour_tracing_closes_loop_and_restores_raster_endpoint(tmp_path) -> N
         ]
         contour_start = layer_prints[2]["end"]
         assert layer_prints[3]["start"] == contour_start
-        assert layer_prints[-1]["end"] == contour_start
+        last_contour_start = layer_prints[-1]["end"]
 
         last_print_index = max(
             idx for idx, move in enumerate(layer_moves) if move["color"] == 255
         )
         assert layer_moves[last_print_index + 1] == {
-            "start": contour_start,
+            "start": last_contour_start,
             "end": (0.0, 0.0, layer_z),
             "color": 0,
         }
+
+
+def test_contour_tracing_keeps_hollow_rings_separate() -> None:
+    output = [{"X": 0.0, "Y": 0.0, "Color": 255}]
+    contour_layers = [
+        [
+            {
+                "owner_idx": 1,
+                "contours": [
+                    [(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0), (0.0, 0.0)],
+                    [(1.0, 1.0), (2.0, 1.0), (2.0, 2.0), (1.0, 2.0), (1.0, 1.0)],
+                ],
+            }
+        ]
+    ]
+
+    current_x, current_y = _append_layer_contours(
+        output,
+        0.0,
+        0.0,
+        contour_layers,
+        layer_number=0,
+        active_owner_idx=1,
+    )
+
+    contour_print_moves = [move for move in output[1:] if move["Color"] == 255]
+
+    assert len(contour_print_moves) == 8
+    assert (current_x, current_y) == (1.0, 1.0)
 
 
 def test_contour_tracing_follows_default_raster_layer_flip(tmp_path) -> None:
@@ -432,10 +534,55 @@ def test_gcode_header_writes_presets_before_initial_aux_commands(tmp_path) -> No
     ]
 
     assert lines[0] == "G91"
-    assert lines[1].startswith("{preset}serialPort3.write(")
+    assert lines[1] == "{aux_command}WAGO_ValveCommands(7, 0)"
     assert lines[2].startswith("{preset}serialPort3.write(")
-    assert lines[3].startswith("{aux_command}WAGO_ValveCommands(")
+    assert lines[3].startswith("{preset}serialPort3.write(")
     assert lines[4].startswith("{aux_command}WAGO_ValveCommands(")
+    assert lines[5].startswith("{aux_command}WAGO_ValveCommands(")
+
+
+def test_gcode_lead_in_runs_once_before_first_layer(tmp_path) -> None:
+    tiff_paths = []
+    for index in range(2):
+        tiff_path = tmp_path / f"slice_{index:04d}.tif"
+        Image.new("L", (1, 1), 0).save(tiff_path)
+        tiff_paths.append(tiff_path)
+
+    zip_path = tmp_path / "slices.zip"
+    with zipfile.ZipFile(zip_path, mode="w") as archive:
+        for tiff_path in tiff_paths:
+            archive.write(tiff_path, arcname=tiff_path.name)
+
+    gcode_path = generate_snake_path_gcode(
+        zip_path,
+        shape_name="lead_in",
+        pressure=25,
+        valve=7,
+        port=3,
+        fil_width=0.5,
+        layer_height=1.0,
+        lead_in_enabled=True,
+        lead_in_length=3.0,
+        lead_in_clearance=4.0,
+        lead_in_lines=3,
+    )
+
+    moves = _moves_with_colors(gcode_path.read_text())
+
+    assert moves[:7] == [
+        {"start": (0.0, 0.0, 0.0), "end": (-7.0, 0.0, 0.0), "color": 0},
+        {"start": (-7.0, 0.0, 0.0), "end": (-4.0, 0.0, 0.0), "color": 255},
+        {"start": (-4.0, 0.0, 0.0), "end": (-4.0, 0.5, 0.0), "color": 0},
+        {"start": (-4.0, 0.5, 0.0), "end": (-7.0, 0.5, 0.0), "color": 255},
+        {"start": (-7.0, 0.5, 0.0), "end": (-7.0, 1.0, 0.0), "color": 0},
+        {"start": (-7.0, 1.0, 0.0), "end": (-4.0, 1.0, 0.0), "color": 255},
+        {"start": (-4.0, 1.0, 0.0), "end": (0.0, 0.0, 0.0), "color": 0},
+    ]
+    assert all(move["end"][2] == 0.0 for move in moves[:7])
+
+    first_z_index = next(index for index, move in enumerate(moves) if move["end"][2] > 0.0)
+    assert first_z_index > 7
+    assert not any(move["start"][0] < -3.0 or move["end"][0] < -3.0 for move in moves[first_z_index:])
 
 
 def test_gcode_uses_g1_for_print_and_g0_for_travel(tmp_path) -> None:

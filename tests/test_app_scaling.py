@@ -94,7 +94,7 @@ def test_split_tiff_stack_left_right_preserves_pixels_and_metadata(tmp_path) -> 
     assert left_zip.exists()
     assert right_zip.exists()
     assert left_state["image_width"] == 3
-    assert right_state["image_width"] == 2
+    assert right_state["image_width"] == 3
     assert left_state["x_min"] == 10.0
     assert right_state["x_min"] == 11.5
     assert left_state["z_values"] == [1.25]
@@ -103,7 +103,9 @@ def test_split_tiff_stack_left_right_preserves_pixels_and_metadata(tmp_path) -> 
     with Image.open(left_state["tiff_paths"][0]) as left_image:
         np.testing.assert_array_equal(np.asarray(left_image), pixels[:, :3])
     with Image.open(right_state["tiff_paths"][0]) as right_image:
-        np.testing.assert_array_equal(np.asarray(right_image), pixels[:, 3:])
+        expected = np.full((2, 3), 255, dtype=np.uint8)
+        expected[:, :2] = pixels[:, 3:]
+        np.testing.assert_array_equal(np.asarray(right_image), expected)
 
 
 def test_split_tiff_stack_grid_preserves_pixels_and_offsets(tmp_path) -> None:
@@ -123,17 +125,55 @@ def test_split_tiff_stack_grid_preserves_pixels_and_offsets(tmp_path) -> None:
     pieces = split_tiff_stack_grid(state, "grid-part", columns=2, rows=2)
 
     assert [(piece["row"], piece["col"]) for piece in pieces] == [(1, 1), (1, 2), (2, 1), (2, 2)]
-    assert [piece["state"]["image_width"] for piece in pieces] == [3, 2, 3, 2]
+    assert [piece["state"]["image_width"] for piece in pieces] == [3, 3, 3, 3]
     assert [piece["state"]["image_height"] for piece in pieces] == [2, 2, 2, 2]
     assert [piece["state"]["x_min"] for piece in pieces] == [4.0, 4.75, 4.0, 4.75]
     assert [piece["state"]["y_min"] for piece in pieces] == [10.5, 10.5, 10.0, 10.0]
     assert all(piece["zip_path"].exists() for piece in pieces)
 
+    right_top = np.full((2, 3), 255, dtype=np.uint8)
+    right_top[:, :2] = pixels[:2, 3:]
+    right_bottom = np.full((2, 3), 255, dtype=np.uint8)
+    right_bottom[:, :2] = pixels[2:, 3:]
     expected = [
         pixels[:2, :3],
-        pixels[:2, 3:],
+        right_top,
         pixels[2:, :3],
-        pixels[2:, 3:],
+        right_bottom,
+    ]
+    for piece, expected_pixels in zip(pieces, expected):
+        with Image.open(piece["state"]["tiff_paths"][0]) as image:
+            np.testing.assert_array_equal(np.asarray(image), expected_pixels)
+
+
+def test_split_tiff_stack_grid_pads_more_than_three_columns_to_equal_widths(tmp_path) -> None:
+    pixels = np.arange(20, dtype=np.uint8).reshape((2, 10))
+    tiff_path = tmp_path / "slice_0000.tif"
+    Image.fromarray(pixels, mode="L").save(tiff_path)
+    state = {
+        "tiff_paths": [str(tiff_path)],
+        "z_values": [0.0],
+        "pixel_size": 1.0,
+        "x_min": 100.0,
+        "y_min": 0.0,
+        "image_width": 10,
+        "image_height": 2,
+    }
+
+    pieces = split_tiff_stack_grid(state, "four-way", columns=4, rows=1)
+
+    assert [piece["state"]["image_width"] for piece in pieces] == [3, 3, 3, 3]
+    assert [piece["state"]["x_min"] for piece in pieces] == [99.0, 102.0, 105.0, 108.0]
+
+    first_expected = np.full((2, 3), 255, dtype=np.uint8)
+    first_expected[:, 1:] = pixels[:, :2]
+    last_expected = np.full((2, 3), 255, dtype=np.uint8)
+    last_expected[:, :2] = pixels[:, 8:]
+    expected = [
+        first_expected,
+        pixels[:, 2:5],
+        pixels[:, 5:8],
+        last_expected,
     ]
     for piece, expected_pixels in zip(pieces, expected):
         with Image.open(piece["state"]["tiff_paths"][0]) as image:
@@ -159,21 +199,23 @@ def test_split_tiff_stack_grid_overlapping_layers_keep_small_alignment_margin(tm
 
     left, right = split_tiff_stack_grid(state, "overlap-part", columns=2, rows=1, overlapping_layers=True)
 
-    assert left["state"]["image_width"] == 4
-    assert right["state"]["image_width"] == 4
-    assert left["state"]["x_min"] == 10.0
+    assert left["state"]["image_width"] == 5
+    assert right["state"]["image_width"] == 5
+    assert left["state"]["x_min"] == 9.5
     assert right["state"]["x_min"] == 11.0
     with Image.open(left["state"]["tiff_paths"][0]) as left_layer0:
-        expected = np.zeros((2, 4), dtype=np.uint8)
+        expected = np.full((2, 5), 255, dtype=np.uint8)
+        expected[:, 1:] = 0
         np.testing.assert_array_equal(np.asarray(left_layer0), expected)
     with Image.open(right["state"]["tiff_paths"][0]) as right_layer0:
-        expected = np.full((2, 4), 255, dtype=np.uint8)
-        expected[:, 2:] = 0
+        expected = np.full((2, 5), 255, dtype=np.uint8)
+        expected[:, 2:4] = 0
         np.testing.assert_array_equal(np.asarray(right_layer0), expected)
     with Image.open(left["state"]["tiff_paths"][1]) as left_layer1:
-        expected = np.full((2, 4), 255, dtype=np.uint8)
-        expected[:, :2] = 0
+        expected = np.full((2, 5), 255, dtype=np.uint8)
+        expected[:, 1:3] = 0
         np.testing.assert_array_equal(np.asarray(left_layer1), expected)
     with Image.open(right["state"]["tiff_paths"][1]) as right_layer1:
-        expected = np.zeros((2, 4), dtype=np.uint8)
+        expected = np.full((2, 5), 255, dtype=np.uint8)
+        expected[:, :4] = 0
         np.testing.assert_array_equal(np.asarray(right_layer1), expected)

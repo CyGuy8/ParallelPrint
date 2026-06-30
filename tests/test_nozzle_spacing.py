@@ -7,7 +7,10 @@ from app import (
     SCALE_MODE_UNIFORM_FACTOR,
     SHAPE_SETTINGS_HEADERS,
     SIMPLE_NOZZLE_SPACING_HEADERS,
+    _auto_align_split_offsets,
+    _auto_align_grid_spacing_rows,
     _apply_shape_settings,
+    _contour_tracing_sources,
     delete_shape_from_settings,
     _format_nozzle_spacing_status,
     _grid_spacing_rows,
@@ -18,6 +21,11 @@ from app import (
     normalize_shape_dimensions_for_mode,
     _resolve_nozzle_grid_layout,
     _resolve_nozzle_layout,
+)
+from tiff_to_gcode import (
+    CONTOUR_MODE_ROW_ENVELOPE,
+    RASTER_PATTERN_SAME_DIRECTION,
+    RASTER_PATTERN_Y_DIRECTION,
 )
 
 
@@ -248,6 +256,27 @@ def test_shape_settings_round_trip_contour_tracing_column() -> None:
     assert updated[0]["contour_tracing"] is True
 
 
+def test_contour_tracing_sources_request_shape_optimized_mode() -> None:
+    sources = _contour_tracing_sources(
+        [
+            {
+                "idx": 2,
+                "contour_tracing": True,
+                "tiff_state": {"tiff_paths": ["slice_0000.tif"]},
+            }
+        ]
+    )
+
+    assert sources == [
+        {
+            "owner_idx": 2,
+            "contour_mode": CONTOUR_MODE_ROW_ENVELOPE,
+            "tiff_paths": ["slice_0000.tif"],
+            "zip_path": None,
+        }
+    ]
+
+
 def test_repeated_sample_path_gets_next_unused_nozzle() -> None:
     records = _records_from_files(
         ["sample.stl", "sample.stl"],
@@ -316,6 +345,78 @@ def test_advanced_spacing_table_collapses_duplicate_nozzles() -> None:
     assert update["value"] == [["Nozzle 1: Shape 1, Shape 2", "Nozzle 2: Shape 3", 9.0, 2.5]]
 
 
+def test_auto_align_split_offsets_follow_raster_axis() -> None:
+    assert _auto_align_split_offsets(RASTER_PATTERN_SAME_DIRECTION) == (-3.2, -0.8)
+    assert _auto_align_split_offsets(RASTER_PATTERN_Y_DIRECTION) == (-0.8, -3.2)
+
+
+def test_auto_align_grid_spacing_only_targets_split_siblings() -> None:
+    records = [
+        {"idx": 1, "name": "first", "nozzle": 1, "split_group_id": "split-a", "split_index": 0},
+        {"idx": 2, "name": "second", "nozzle": 2, "split_group_id": "split-a", "split_index": 1},
+        {"idx": 3, "name": "third", "nozzle": 3},
+        {"idx": 4, "name": "fourth", "nozzle": 4, "split_group_id": "split-a", "split_index": 2},
+    ]
+
+    rows, column_count, row_count, aligned_count = _auto_align_grid_spacing_rows(
+        records,
+        columns=2,
+        rows=2,
+        column_spacing=10.0,
+        row_spacing=3.0,
+        raster_pattern=RASTER_PATTERN_SAME_DIRECTION,
+    )
+
+    assert column_count == 2
+    assert row_count == 2
+    assert aligned_count == 1
+    assert rows == [
+        ["Nozzle 1: Shape 1", "Nozzle 2: Shape 2", -3.2, 0.0],
+        ["Nozzle 2: Shape 2", "Nozzle 3: Shape 3", 0.0, 3.0],
+        ["Nozzle 3: Shape 3", "Nozzle 4: Shape 4", 10.0, 0.0],
+    ]
+
+
+def test_auto_align_grid_spacing_handles_split_row_transition() -> None:
+    records = [
+        {"idx": 1, "name": "first", "nozzle": 1, "split_group_id": "split-a", "split_index": 0},
+        {"idx": 2, "name": "second", "nozzle": 2, "split_group_id": "split-a", "split_index": 1},
+        {"idx": 3, "name": "third", "nozzle": 3, "split_group_id": "split-a", "split_index": 2},
+    ]
+
+    rows, _column_count, _row_count, aligned_count = _auto_align_grid_spacing_rows(
+        records,
+        columns=2,
+        rows=2,
+        column_spacing=10.0,
+        row_spacing=3.0,
+        raster_pattern=RASTER_PATTERN_SAME_DIRECTION,
+    )
+
+    assert aligned_count == 2
+    assert rows[0] == ["Nozzle 1: Shape 1", "Nozzle 2: Shape 2", -3.2, 0.0]
+    assert rows[1] == ["Nozzle 2: Shape 2", "Nozzle 3: Shape 3", 0.0, -0.8]
+
+
+def test_auto_align_grid_spacing_skips_unsplit_records() -> None:
+    records = [
+        {"idx": 1, "name": "first", "nozzle": 1},
+        {"idx": 2, "name": "second", "nozzle": 2},
+    ]
+
+    rows, _column_count, _row_count, aligned_count = _auto_align_grid_spacing_rows(
+        records,
+        columns=2,
+        rows=1,
+        column_spacing=10.0,
+        row_spacing=3.0,
+        raster_pattern=RASTER_PATTERN_SAME_DIRECTION,
+    )
+
+    assert aligned_count == 0
+    assert rows == [["Nozzle 1: Shape 1", "Nozzle 2: Shape 2", 10.0, 0.0]]
+
+
 def test_grid_spacing_rows_follow_row_major_pattern() -> None:
     records = [
         {"idx": 1, "name": "first", "nozzle": 1},
@@ -330,7 +431,34 @@ def test_grid_spacing_rows_follow_row_major_pattern() -> None:
     assert row_count == 2
     assert rows == [
         ["Nozzle 1: Shape 1", "Nozzle 2: Shape 2", 10.0, 0.0],
-        ["Nozzle 2: Shape 2", "Nozzle 3: Shape 3", -10.0, 3.0],
+        ["Nozzle 2: Shape 2", "Nozzle 3: Shape 3", 0.0, 3.0],
+        ["Nozzle 3: Shape 3", "Nozzle 4: Shape 4", 10.0, 0.0],
+    ]
+
+
+def test_grid_spacing_rows_preserve_existing_advanced_values() -> None:
+    records = [
+        {"idx": 1, "name": "first", "nozzle": 1},
+        {"idx": 2, "name": "second", "nozzle": 2},
+        {"idx": 3, "name": "third", "nozzle": 3},
+        {"idx": 4, "name": "fourth", "nozzle": 4},
+    ]
+
+    rows, _column_count, _row_count = _grid_spacing_rows(
+        records,
+        columns=2,
+        rows=2,
+        column_spacing=10.0,
+        row_spacing=3.0,
+        existing_table=[
+            ["Nozzle 1", "Nozzle 2", 1.5, 0.25],
+            ["Nozzle 2", "Nozzle 3", 2.0, 4.5],
+        ],
+    )
+
+    assert rows == [
+        ["Nozzle 1: Shape 1", "Nozzle 2: Shape 2", 1.5, 0.25],
+        ["Nozzle 2: Shape 2", "Nozzle 3: Shape 3", 2.0, 4.5],
         ["Nozzle 3: Shape 3", "Nozzle 4: Shape 4", 10.0, 0.0],
     ]
 
@@ -353,6 +481,39 @@ def test_nozzle_grid_layout_places_nozzles_by_rows_and_columns() -> None:
         {"from": 1, "to": 2, "dx": 12.0, "dy": 0.0},
         {"from": 2, "to": 3, "dx": -12.0, "dy": 23.0},
         {"from": 3, "to": 4, "dx": 12.0, "dy": 0.0},
+    ]
+
+
+def test_advanced_nozzle_grid_layout_uses_per_connection_gaps() -> None:
+    parts = [
+        _part(1, ((0.0, 0.0, 0.0), (10.0, 20.0, 1.0))),
+        _part(2, ((0.0, 0.0, 0.0), (10.0, 20.0, 1.0))),
+        _part(3, ((0.0, 0.0, 0.0), (10.0, 20.0, 1.0))),
+        _part(4, ((0.0, 0.0, 0.0), (10.0, 20.0, 1.0))),
+    ]
+
+    offsets, spacings = _resolve_nozzle_grid_layout(
+        parts,
+        columns=2,
+        rows=2,
+        column_spacing=2.0,
+        row_spacing=3.0,
+        use_individual_spacing=True,
+        spacing_table=[
+            ["Nozzle 1", "Nozzle 2", 2.0, 0.0],
+            ["Nozzle 2", "Nozzle 3", 4.0, 3.0],
+            ["Nozzle 3", "Nozzle 4", 6.0, 0.0],
+        ],
+    )
+
+    np.testing.assert_allclose(offsets[1], (0.0, 0.0))
+    np.testing.assert_allclose(offsets[2], (12.0, 0.0))
+    np.testing.assert_allclose(offsets[3], (4.0, 23.0))
+    np.testing.assert_allclose(offsets[4], (20.0, 23.0))
+    assert spacings == [
+        {"from": 1, "to": 2, "dx": 12.0, "dy": 0.0},
+        {"from": 2, "to": 3, "dx": -8.0, "dy": 23.0},
+        {"from": 3, "to": 4, "dx": 16.0, "dy": 0.0},
     ]
 
 

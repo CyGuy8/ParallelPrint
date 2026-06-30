@@ -52,6 +52,7 @@ Then open the local Gradio URL in your browser, upload STL files or load the bun
 - Automatically combines generated stacks into a reference TIFF stack when TIFF stacks are generated
 - Splits one generated TIFF stack into an editable row/column grid for multi-nozzle printing of one large shape
 - Converts generated TIFF ZIPs into G-code files with pressure, valve, nozzle, and port settings per shape from the Shape Settings table
+- Appends a shape-optimized outer contour after each enabled shape layer by tracing that layer's active row envelope
 - Offers G-code generation options for raster pattern, **Use G1 for all moves** (no rapid travel command), and **Use Reference Stack for motion** (all shapes share one nozzle path; each dispenses only its own geometry)
 - Calculates X/Y nozzle spacing from an editable adjacent-pair spacing table, then visualizes the resulting nozzle layout
 - Previews selected generated G-code inline
@@ -75,7 +76,7 @@ When you click **Generate TIFF Stacks**, the app automatically combines availabl
 
 The **Multi-Nozzle Split** accordion on the **STL to TIFF Slicer** tab can split one generated shape stack into a grid of print-ready stacks. Choose a source shape that already has TIFF slices, set the number of columns and rows, choose the starting nozzle and valve numbers, then click **Split Selected Shape into Grid Pieces**.
 
-- Each slice is split into columns along X and rows along Y; leftover pixels are assigned to earlier columns/rows so no pixels are dropped.
+- Each slice is padded with white pixels as needed, then split into equal-width columns and equal-height rows so every generated piece in the grid has a matching TIFF canvas.
 - The selected shape is replaced in Shape Settings by one generated record per grid cell, named by row and column.
 - Nozzle and valve numbers are assigned sequentially from the starting values, and the existing **TIFF Slices to GCode** tab can generate separate G-code for each piece.
 
@@ -93,6 +94,8 @@ The **Multi-Nozzle Split** accordion on the **STL to TIFF Slicer** tab can split
 - **Use G1 for all moves**: when enabled, every movement line is emitted as `G1` (no `G0` rapid travel); the WAGO valve still marks where material is dispensed. Applies to all shapes.
 - **Use Reference Stack for motion**: when enabled, every shape's snake-path *motion* is taken from the combined Reference TIFF Stack while each shape's *valve/dispensing* comes from its own slices — so parallel print heads share one synchronized nozzle path and each deposits only its own geometry. The reference stack is generated automatically with TIFF stacks; shapes are skipped with a message if it is missing.
 - **Raster Pattern**: `X-direction raster` keeps the existing X-direction back-and-forth raster on every layer. `Y-direction raster` rasters every layer in Y. `Woodpile raster` alternates the raster axis by layer, switching between X-direction and Y-direction sweeps.
+- **Auto Align Split Parts**: in Nozzle Spacing, fills Grid Layout gaps for split-piece alignment. X-direction raster uses X `-3.2` mm and Y `-0.8` mm; Y-direction raster switches those values.
+- **Contour Tracing**: enabled per row in Shape Settings. The app uses the shape-optimized row-envelope tracer, travels from the layer raster end to the nearest contour point, prints the contour, then returns to the raster endpoint before the next layer.
 
 ### Print vs Travel Classification
 

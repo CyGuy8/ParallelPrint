@@ -38,8 +38,10 @@ from stl_slicer import (
     slice_stl_to_tiffs,
 )
 from tiff_to_gcode import (
-RASTER_PATTERN_CHOICES,
+    CONTOUR_MODE_ROW_ENVELOPE,
+    RASTER_PATTERN_CHOICES,
     RASTER_PATTERN_SAME_DIRECTION,
+    RASTER_PATTERN_Y_DIRECTION,
     generate_snake_path_gcode,
 )
 
@@ -67,6 +69,8 @@ NOZZLE_LAYOUT_PRESETS = [
     "2 x 5",
     "5 x 2",
 ]
+AUTO_ALIGN_X_RASTER_OFFSETS = (-3.2, -0.8)
+AUTO_ALIGN_Y_RASTER_OFFSETS = (-0.8, -3.2)
 APP_CSS = """
 .gradio-container {
     font-size: 90%;
@@ -149,10 +153,15 @@ APP_CSS = """
 }
 
 #nozzle-spacing-table table tbody tr td:nth-child(-n+2),
+#nozzle-grid-spacing-table table tbody tr td:nth-child(-n+2),
 #nozzle-spacing-table table thead th,
+#nozzle-grid-spacing-table table thead th,
 #nozzle-spacing-table [role="columnheader"],
+#nozzle-grid-spacing-table [role="columnheader"],
 #nozzle-spacing-table [role="gridcell"]:nth-child(4n + 1),
-#nozzle-spacing-table [role="gridcell"]:nth-child(4n + 2) {
+#nozzle-spacing-table [role="gridcell"]:nth-child(4n + 2),
+#nozzle-grid-spacing-table [role="gridcell"]:nth-child(4n + 1),
+#nozzle-grid-spacing-table [role="gridcell"]:nth-child(4n + 2) {
     background: rgba(243, 244, 246, 0.82) !important;
     color: var(--body-text-color-subdued) !important;
     pointer-events: none;
@@ -1499,12 +1508,22 @@ def _nozzle_group_bounds(grouped: dict[int, list[dict]], nozzle: int) -> tuple[t
     )
 
 
+def _grid_default_gap_for_pair(pair_index: int, column_count: int, x_gap: float, y_gap: float) -> tuple[float, float]:
+    current_col = pair_index % column_count
+    next_col = (pair_index + 1) % column_count
+    if next_col > current_col:
+        return x_gap, 0.0
+    return 0.0, y_gap
+
+
 def _resolve_nozzle_grid_layout(
     parts: list[dict],
     columns: Any,
     rows: Any,
     column_spacing: Any,
     row_spacing: Any,
+    use_individual_spacing: bool | None = False,
+    spacing_table: Any | None = None,
 ) -> tuple[dict[int, tuple[float, float]], list[dict]]:
     offsets: dict[int, tuple[float, float]] = {}
     spacings: list[dict] = []
@@ -1516,14 +1535,8 @@ def _resolve_nozzle_grid_layout(
     column_count = max(1, _coerce_int(columns, 1))
     requested_rows = max(1, _coerce_int(rows, 1))
     row_count = max(requested_rows, math.ceil(len(ordered_nozzles) / column_count))
-    try:
-        x_gap = float(column_spacing)
-    except (TypeError, ValueError):
-        x_gap = 0.0
-    try:
-        y_gap = float(row_spacing)
-    except (TypeError, ValueError):
-        y_gap = 0.0
+    x_gap = _coerce_float(column_spacing, 0.0)
+    y_gap = _coerce_float(row_spacing, 0.0)
 
     placements = {
         nozzle: (index % column_count, index // column_count)
@@ -1538,6 +1551,53 @@ def _resolve_nozzle_grid_layout(
         (xmin, ymin, _), (xmax, ymax, _) = bounds
         column_widths[column] = max(column_widths[column], xmax - xmin)
         row_heights[row] = max(row_heights[row], ymax - ymin)
+
+    if use_individual_spacing:
+        gap_pairs = _spacing_pairs_from_table(spacing_table)
+
+        def pair_gap(pair_index: int) -> tuple[float, float]:
+            if pair_index < len(gap_pairs):
+                return gap_pairs[pair_index]
+            return _grid_default_gap_for_pair(pair_index, column_count, x_gap, y_gap)
+
+        row_start_x = 0.0
+        row_min_y = 0.0
+        for row in range(row_count):
+            row_start_index = row * column_count
+            row_nozzles = ordered_nozzles[row_start_index:row_start_index + column_count]
+            if not row_nozzles:
+                break
+            for col, nozzle in enumerate(row_nozzles):
+                (xmin, ymin, _), _ = bounds_by_nozzle[nozzle]
+                if col == 0:
+                    target_x = row_start_x
+                    target_y = row_min_y
+                else:
+                    prev = row_nozzles[col - 1]
+                    gap_x, gap_y = pair_gap(row_start_index + col - 1)
+                    prev_offset_x, _prev_offset_y = offsets[prev]
+                    (_, _, _), (prev_xmax, _prev_ymax, _) = bounds_by_nozzle[prev]
+                    target_x = prev_offset_x + prev_xmax + gap_x
+                    target_y = row_min_y + gap_y
+                offsets[nozzle] = (target_x - xmin, target_y - ymin)
+
+            row_bottom = max(offsets[nozzle][1] + bounds_by_nozzle[nozzle][1][1] for nozzle in row_nozzles)
+            next_row_start_index = row_start_index + len(row_nozzles)
+            if next_row_start_index < len(ordered_nozzles):
+                row_shift_x, row_gap = pair_gap(next_row_start_index - 1)
+                row_start_x += row_shift_x
+                row_min_y = row_bottom + row_gap
+
+        for first, second in zip(ordered_nozzles, ordered_nozzles[1:]):
+            first_x, first_y = offsets[first]
+            second_x, second_y = offsets[second]
+            spacings.append({
+                "from": first,
+                "to": second,
+                "dx": second_x - first_x,
+                "dy": second_y - first_y,
+            })
+        return offsets, spacings
 
     column_positions: list[float] = []
     x_pos = 0.0
@@ -1574,11 +1634,21 @@ def _resolve_layout_from_spacing_controls(
     rows: Any,
     column_spacing: Any,
     row_spacing: Any,
+    use_grid_individual_spacing: bool | None,
+    grid_spacing_table: Any,
     use_individual_spacing: bool,
     spacing_table: Any,
 ) -> tuple[dict[int, tuple[float, float]], list[dict]]:
     if layout_mode != NOZZLE_LAYOUT_PAIR_TABLE:
-        return _resolve_nozzle_grid_layout(parts, columns, rows, column_spacing, row_spacing)
+        return _resolve_nozzle_grid_layout(
+            parts,
+            columns,
+            rows,
+            column_spacing,
+            row_spacing,
+            use_grid_individual_spacing,
+            grid_spacing_table,
+        )
     gap12x, gap12y, gap23x, gap23y, extra = _spacing_args_from_table(spacing_table, use_individual_spacing)
     return _resolve_nozzle_layout(
         parts,
@@ -1791,6 +1861,25 @@ def _partition_length(length: int, count: int) -> list[tuple[int, int]]:
     return spans
 
 
+def _padded_grid_axis(length: int, count: int) -> dict[str, Any]:
+    cell_size = max(1, math.ceil(length / count))
+    padded_length = cell_size * count
+    total_pad = padded_length - length
+    leading_pad = total_pad // 2
+    trailing_pad = total_pad - leading_pad
+    spans = [
+        (index * cell_size, (index + 1) * cell_size)
+        for index in range(count)
+    ]
+    return {
+        "cell_size": cell_size,
+        "padded_length": padded_length,
+        "leading_pad": leading_pad,
+        "trailing_pad": trailing_pad,
+        "spans": spans,
+    }
+
+
 def _layer_split_spans(length: int, count: int, layer_index: int, overlap_pixels: int) -> list[tuple[int, int]]:
     base_spans = _partition_length(length, count)
     if overlap_pixels <= 0 or count <= 1:
@@ -1804,14 +1893,6 @@ def _layer_split_spans(length: int, count: int, layer_index: int, overlap_pixels
         upper = boundaries[boundary_index + 1] - 1
         adjusted[boundary_index] = max(lower, min(upper, boundaries[boundary_index] + direction * overlap_pixels))
     return [(adjusted[index], adjusted[index + 1]) for index in range(count)]
-
-
-def _overlap_canvas_span(start: int, end: int, length: int, position: int, count: int, overlap_pixels: int) -> tuple[int, int]:
-    if overlap_pixels <= 0:
-        return start, end
-    canvas_start = max(0, start - overlap_pixels) if position > 1 else start
-    canvas_end = min(length, end + overlap_pixels) if position < count else end
-    return canvas_start, canvas_end
 
 
 def split_tiff_stack_grid(
@@ -1837,9 +1918,24 @@ def split_tiff_stack_grid(
 
     safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in base_name).strip("_") or "split_shape"
     output_dir = Path(tempfile.mkdtemp(prefix=f"{safe_name}_split_"))
-    x_spans = _partition_length(width, column_count)
-    y_spans = _partition_length(height, row_count)
+    x_axis = _padded_grid_axis(width, column_count)
+    y_axis = _padded_grid_axis(height, row_count)
+    x_spans = x_axis["spans"]
+    y_spans = y_axis["spans"]
     overlap_pixels = 1 if overlapping_layers else 0
+    overlap_x = overlap_pixels if column_count > 1 else 0
+    overlap_y = overlap_pixels if row_count > 1 else 0
+    padded_width = int(x_axis["padded_length"])
+    padded_height = int(y_axis["padded_length"])
+    working_width = padded_width + (2 * overlap_x)
+    working_height = padded_height + (2 * overlap_y)
+    source_x = int(x_axis["leading_pad"]) + overlap_x
+    source_y = int(y_axis["leading_pad"]) + overlap_y
+    working_x_min = base_x_min = float(state.get("x_min", 0.0) or 0.0)
+    working_y_min = base_y_min = float(state.get("y_min", 0.0) or 0.0)
+    pixel_size = float(state.get("pixel_size", 0.0) or 0.0)
+    working_x_min = base_x_min - (source_x * pixel_size)
+    working_y_min = base_y_min - ((int(y_axis["trailing_pad"]) + overlap_y) * pixel_size)
     pieces: list[dict[str, Any]] = []
     for row_index, (y_start, y_end) in enumerate(y_spans, start=1):
         for col_index, (x_start, x_end) in enumerate(x_spans, start=1):
@@ -1863,53 +1959,82 @@ def split_tiff_stack_grid(
             if layer.size != (width, height):
                 raise ValueError("All TIFF slices must have the same dimensions to split the stack.")
 
-            layer_x_spans = _layer_split_spans(width, column_count, index, overlap_pixels)
-            layer_y_spans = _layer_split_spans(height, row_count, index, overlap_pixels)
+            padded_layer = Image.new("L", (working_width, working_height), 255)
+            padded_layer.paste(layer, (source_x, source_y))
+            layer_x_spans = [
+                (x_start + overlap_x, x_end + overlap_x)
+                for x_start, x_end in _layer_split_spans(
+                    padded_width,
+                    column_count,
+                    index,
+                    overlap_x,
+                )
+            ]
+            layer_y_spans = [
+                (y_start + overlap_y, y_end + overlap_y)
+                for y_start, y_end in _layer_split_spans(
+                    padded_height,
+                    row_count,
+                    index,
+                    overlap_y,
+                )
+            ]
             for piece in pieces:
-                canvas_x_start, canvas_x_end = _overlap_canvas_span(
-                    piece["x_start"], piece["x_end"], width, piece["col"], column_count, overlap_pixels
-                )
-                canvas_y_start, canvas_y_end = _overlap_canvas_span(
-                    piece["y_start"], piece["y_end"], height, piece["row"], row_count, overlap_pixels
-                )
+                canvas_x_start = piece["x_start"]
+                canvas_x_end = piece["x_end"]
+                canvas_y_start = piece["y_start"]
+                canvas_y_end = piece["y_end"]
+                if overlapping_layers:
+                    canvas_x_start -= overlap_x
+                    canvas_x_end += overlap_x
+                    canvas_y_start -= overlap_y
+                    canvas_y_end += overlap_y
+                canvas_x_start += overlap_x
+                canvas_x_end += overlap_x
+                canvas_y_start += overlap_y
+                canvas_y_end += overlap_y
                 x_start, x_end = layer_x_spans[piece["col"] - 1]
                 y_start, y_end = layer_y_spans[piece["row"] - 1]
                 if overlapping_layers:
                     piece_image = Image.new("L", (canvas_x_end - canvas_x_start, canvas_y_end - canvas_y_start), 255)
                     piece_image.paste(
-                        layer.crop((x_start, y_start, x_end, y_end)),
+                        padded_layer.crop((x_start, y_start, x_end, y_end)),
                         (x_start - canvas_x_start, y_start - canvas_y_start),
                     )
                 else:
-                    piece_image = layer.crop((x_start, y_start, x_end, y_end))
+                    piece_image = padded_layer.crop((x_start, y_start, x_end, y_end))
                 piece_path = piece["tiff_dir"] / f"slice_{index:04d}.tif"
                 piece_image.save(piece_path, compression="tiff_deflate")
                 piece["tiff_paths"].append(piece_path)
 
-    pixel_size = float(state.get("pixel_size", 0.0) or 0.0)
     z_values = list(state.get("z_values", []))
     if len(z_values) < len(tiff_paths):
         z_values.extend([0.0] * (len(tiff_paths) - len(z_values)))
 
-    base_x_min = float(state.get("x_min", 0.0) or 0.0)
-    base_y_min = float(state.get("y_min", 0.0) or 0.0)
     for piece in pieces:
-        canvas_x_start, canvas_x_end = _overlap_canvas_span(
-            piece["x_start"], piece["x_end"], width, piece["col"], column_count, overlap_pixels
-        )
-        canvas_y_start, canvas_y_end = _overlap_canvas_span(
-            piece["y_start"], piece["y_end"], height, piece["row"], row_count, overlap_pixels
-        )
-        piece_width = canvas_x_end - canvas_x_start if overlapping_layers else piece["x_end"] - piece["x_start"]
-        piece_height = canvas_y_end - canvas_y_start if overlapping_layers else piece["y_end"] - piece["y_start"]
+        canvas_x_start = piece["x_start"]
+        canvas_x_end = piece["x_end"]
+        canvas_y_start = piece["y_start"]
+        canvas_y_end = piece["y_end"]
+        if overlapping_layers:
+            canvas_x_start -= overlap_x
+            canvas_x_end += overlap_x
+            canvas_y_start -= overlap_y
+            canvas_y_end += overlap_y
+        canvas_x_start += overlap_x
+        canvas_x_end += overlap_x
+        canvas_y_start += overlap_y
+        canvas_y_end += overlap_y
+        piece_width = canvas_x_end - canvas_x_start
+        piece_height = canvas_y_end - canvas_y_start
         zip_path = output_dir / f"{safe_name}_r{piece['row']:02d}_c{piece['col']:02d}_tiff_slices.zip"
         _zip_tiff_paths(piece["tiff_paths"], zip_path)
         piece_state: ViewerState = {
             "tiff_paths": [str(path) for path in piece["tiff_paths"]],
             "z_values": z_values[: len(piece["tiff_paths"])],
             "pixel_size": pixel_size,
-            "x_min": base_x_min + ((canvas_x_start if overlapping_layers else piece["x_start"]) * pixel_size),
-            "y_min": base_y_min + ((height - (canvas_y_end if overlapping_layers else piece["y_end"])) * pixel_size),
+            "x_min": working_x_min + (canvas_x_start * pixel_size),
+            "y_min": working_y_min + ((working_height - canvas_y_end) * pixel_size),
             "image_width": piece_width,
             "image_height": piece_height,
             "zip_path": str(zip_path),
@@ -2007,6 +2132,13 @@ def _coerce_int(value: Any, default: int) -> int:
             return int(float(default))
         except (TypeError, ValueError):
             return 0
+
+
+def _coerce_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def _record_nozzle_number(record: dict, fallback: int | None = None) -> int:
@@ -2300,29 +2432,20 @@ def _grid_spacing_rows(
     rows: Any,
     column_spacing: Any,
     row_spacing: Any,
+    existing_table: Any | None = None,
 ) -> tuple[list[list[Any]], int, int]:
     ordered_nozzles = _ordered_nozzle_numbers(records)
     column_count = max(1, _coerce_int(columns, 2))
-    row_count = max(1, _coerce_int(rows, 1))
-    try:
-        x_spacing = float(column_spacing)
-    except (TypeError, ValueError):
-        x_spacing = 5.0
-    try:
-        y_spacing = float(row_spacing)
-    except (TypeError, ValueError):
-        y_spacing = 5.0
+    requested_rows = max(1, _coerce_int(rows, 1))
+    row_count = max(requested_rows, math.ceil(len(ordered_nozzles) / column_count) if ordered_nozzles else requested_rows)
+    x_spacing = _coerce_float(column_spacing, 5.0)
+    y_spacing = _coerce_float(row_spacing, 5.0)
+    existing_pairs = _spacing_pairs_from_table(existing_table)
 
     spacing_rows: list[list[Any]] = []
     for index, (first, second) in enumerate(zip(ordered_nozzles, ordered_nozzles[1:])):
-        current_col = index % column_count
-        next_col = (index + 1) % column_count
-        if next_col > current_col:
-            gap_x = x_spacing
-            gap_y = 0.0
-        else:
-            gap_x = -x_spacing * (column_count - 1)
-            gap_y = y_spacing
+        default_gap_x, default_gap_y = _grid_default_gap_for_pair(index, column_count, x_spacing, y_spacing)
+        gap_x, gap_y = existing_pairs[index] if index < len(existing_pairs) else (default_gap_x, default_gap_y)
         spacing_rows.append([
             _nozzle_spacing_label(first, records),
             _nozzle_spacing_label(second, records),
@@ -2330,6 +2453,85 @@ def _grid_spacing_rows(
             gap_y,
         ])
     return spacing_rows, column_count, row_count
+
+
+def _grid_spacing_table_update(
+    records: list[dict] | None,
+    columns: Any,
+    rows: Any,
+    column_spacing: Any,
+    row_spacing: Any,
+    existing_table: Any | None = None,
+    use_individual_grid_spacing: bool | None = False,
+) -> dict[str, Any]:
+    spacing_rows, _column_count, _row_count = _grid_spacing_rows(
+        records or [],
+        columns,
+        rows,
+        column_spacing,
+        row_spacing,
+        existing_table if use_individual_grid_spacing else None,
+    )
+    return gr.update(
+        headers=ADVANCED_NOZZLE_SPACING_HEADERS,
+        value=spacing_rows,
+        row_count=(len(spacing_rows), "fixed"),
+        column_count=(len(ADVANCED_NOZZLE_SPACING_HEADERS), "fixed"),
+        label="Advanced Grid Spacing",
+        visible=bool(use_individual_grid_spacing),
+    )
+
+
+def _records_by_nozzle(records: list[dict]) -> dict[int, list[dict]]:
+    grouped: dict[int, list[dict]] = {}
+    for index, record in enumerate(records, start=1):
+        grouped.setdefault(_record_nozzle_number(record, int(record.get("idx", index) or index)), []).append(record)
+    return grouped
+
+
+def _split_pair_was_created_together(records_by_nozzle: dict[int, list[dict]], first: int, second: int) -> bool:
+    for first_record in records_by_nozzle.get(first, []):
+        first_group = first_record.get("split_group_id")
+        if not first_group:
+            continue
+        first_index = _coerce_int(first_record.get("split_index"), -1)
+        if first_index < 0:
+            continue
+        for second_record in records_by_nozzle.get(second, []):
+            if second_record.get("split_group_id") != first_group:
+                continue
+            if _coerce_int(second_record.get("split_index"), -1) == first_index + 1:
+                return True
+    return False
+
+
+def _auto_align_grid_spacing_rows(
+    records: list[dict],
+    columns: Any,
+    rows: Any,
+    column_spacing: Any,
+    row_spacing: Any,
+    raster_pattern: str | None,
+) -> tuple[list[list[Any]], int, int, int]:
+    spacing_rows, column_count, row_count = _grid_spacing_rows(
+        records,
+        columns,
+        rows,
+        column_spacing,
+        row_spacing,
+    )
+    auto_x_gap, auto_y_gap = _auto_align_split_offsets(raster_pattern)
+    records_by_nozzle = _records_by_nozzle(records)
+    ordered_nozzles = _ordered_nozzle_numbers(records)
+    aligned_count = 0
+    for index, (first, second) in enumerate(zip(ordered_nozzles, ordered_nozzles[1:])):
+        if not _split_pair_was_created_together(records_by_nozzle, first, second):
+            continue
+        gap_x, gap_y = _grid_default_gap_for_pair(index, column_count, auto_x_gap, auto_y_gap)
+        spacing_rows[index][2] = gap_x
+        spacing_rows[index][3] = gap_y
+        aligned_count += 1
+    return spacing_rows, column_count, row_count, aligned_count
 
 
 def apply_nozzle_grid_spacing(
@@ -2356,6 +2558,64 @@ def apply_nozzle_grid_spacing(
             label="Advanced Nozzle Spacing",
         ),
         status,
+    )
+
+
+def _auto_align_split_offsets(raster_pattern: str | None) -> tuple[float, float]:
+    if raster_pattern == RASTER_PATTERN_Y_DIRECTION:
+        return AUTO_ALIGN_Y_RASTER_OFFSETS
+    return AUTO_ALIGN_X_RASTER_OFFSETS
+
+
+def auto_align_split_parts_for_raster(
+    records: list[dict] | None,
+    columns: Any,
+    rows: Any,
+    column_spacing: Any,
+    row_spacing: Any,
+    raster_pattern: str | None,
+) -> tuple:
+    x_gap, y_gap = _auto_align_split_offsets(raster_pattern)
+    raster_label = raster_pattern or RASTER_PATTERN_SAME_DIRECTION
+    spacing_rows, column_count, row_count, aligned_count = _auto_align_grid_spacing_rows(
+        records or [],
+        columns,
+        rows,
+        column_spacing,
+        row_spacing,
+        raster_pattern,
+    )
+    if aligned_count <= 0:
+        return (
+            gr.update(value=NOZZLE_LAYOUT_GRID),
+            gr.update(visible=True),
+            gr.update(visible=False),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            "No split-sibling nozzle connections found. Auto align was not applied.",
+        )
+
+    return (
+        gr.update(value=NOZZLE_LAYOUT_GRID),
+        gr.update(visible=True),
+        gr.update(visible=False),
+        gr.update(),
+        gr.update(),
+        gr.update(value=True),
+        gr.update(
+            headers=ADVANCED_NOZZLE_SPACING_HEADERS,
+            value=spacing_rows,
+            row_count=(len(spacing_rows), "fixed"),
+            column_count=(len(ADVANCED_NOZZLE_SPACING_HEADERS), "fixed"),
+            label="Advanced Grid Spacing",
+            visible=True,
+        ),
+        (
+            f"Auto aligned {aligned_count} split nozzle connection(s) for {raster_label} "
+            f"in a {column_count} x {row_count} grid: Column Gap X {x_gap:.2f} mm, Row Gap Y {y_gap:.2f} mm."
+        ),
     )
 
 
@@ -2880,6 +3140,9 @@ def split_selected_shape_for_grid(
     base_name = str(source.get("name") or f"Shape {source.get('idx', pos + 1)}")
     first_nozzle = max(1, _coerce_int(starting_nozzle, 1))
     first_valve = max(1, _coerce_int(starting_valve, _coerce_int(source.get("valve", 4), 4)))
+    split_column_count = max(1, _coerce_int(columns, 2))
+    split_row_count = max(1, _coerce_int(rows, 1))
+    split_group_id = f"split-{int(time.time() * 1_000_000)}-{source.get('idx', pos + 1)}"
     split_records: list[dict] = []
     for index, piece in enumerate(pieces):
         piece_state = piece["state"]
@@ -2893,6 +3156,12 @@ def split_selected_shape_for_grid(
             "target_y": piece_height_mm or source.get("target_y", DEFAULT_TARGET_EXTENTS[1]),
             "nozzle": first_nozzle + index,
             "valve": first_valve + index,
+            "split_group_id": split_group_id,
+            "split_index": index,
+            "split_row": int(piece["row"]),
+            "split_col": int(piece["col"]),
+            "split_rows": split_row_count,
+            "split_columns": split_column_count,
             "tiff_state": piece_state,
             "zip_path": str(piece["zip_path"]),
             "gcode_path": None,
@@ -2935,6 +3204,7 @@ def _contour_tracing_sources(records: list[dict]) -> list[dict]:
         tiff_paths = state.get("tiff_paths") or []
         source = {
             "owner_idx": int(record.get("idx", len(sources) + 1)),
+            "contour_mode": CONTOUR_MODE_ROW_ENVELOPE,
             "tiff_paths": list(tiff_paths),
             "zip_path": record.get("zip_path"),
         }
@@ -2949,6 +3219,10 @@ def generate_dynamic_gcode(
     all_g1: bool,
     use_reference_motion: bool,
     raster_pattern: str | None,
+    lead_in_enabled: bool,
+    lead_in_length: float,
+    lead_in_clearance: float,
+    lead_in_lines: float,
     ref_state: ViewerState | None,
     layer_height: float,
     pixel_size: float,
@@ -2959,7 +3233,7 @@ def generate_dynamic_gcode(
     messages: list[str] = []
     if contour_sources:
         enabled = ", ".join(f"Shape {source['owner_idx']}" for source in contour_sources)
-        messages.append(f"Contour tracing enabled for {enabled}.")
+        messages.append(f"Shape-optimized contour tracing enabled for {enabled}.")
     for record in records:
         zip_path = record.get("zip_path")
         if not zip_path:
@@ -2983,6 +3257,10 @@ def generate_dynamic_gcode(
                 raster_pattern=raster_pattern,
                 contour_tiff_sets=contour_sources,
                 active_contour_owner=int(record.get("idx", 0)),
+                lead_in_enabled=bool(lead_in_enabled),
+                lead_in_length=float(lead_in_length),
+                lead_in_clearance=float(lead_in_clearance),
+                lead_in_lines=max(1, _coerce_int(lead_in_lines, 3)),
             )
             record["gcode_path"] = str(gcode_path)
             messages.append(f"Shape {record['idx']}: wrote `{gcode_path.name}`.")
@@ -3052,6 +3330,8 @@ def render_dynamic_nozzle_spacing(
     rows: Any,
     column_spacing: Any,
     row_spacing: Any,
+    use_grid_individual_spacing: bool,
+    grid_spacing_table: Any,
     use_individual_spacing: bool,
     spacing_table: Any,
 ) -> tuple[Any, str]:
@@ -3065,6 +3345,8 @@ def render_dynamic_nozzle_spacing(
         rows,
         column_spacing,
         row_spacing,
+        use_grid_individual_spacing,
+        grid_spacing_table,
         use_individual_spacing,
         spacing_table,
     )
@@ -3142,6 +3424,8 @@ def render_dynamic_parallel(
     rows: Any,
     column_spacing: Any,
     row_spacing: Any,
+    use_grid_individual_spacing: bool,
+    grid_spacing_table: Any,
     use_individual_spacing: bool,
     spacing_table: Any,
     tube: bool = True,
@@ -3157,6 +3441,8 @@ def render_dynamic_parallel(
         rows,
         column_spacing,
         row_spacing,
+        use_grid_individual_spacing,
+        grid_spacing_table,
         use_individual_spacing,
         spacing_table,
     )
@@ -3197,6 +3483,8 @@ def export_dynamic_parallel_gif(
     rows: Any,
     column_spacing: Any,
     row_spacing: Any,
+    use_grid_individual_spacing: bool,
+    grid_spacing_table: Any,
     use_individual_spacing: bool,
     spacing_table: Any,
     duration: float,
@@ -3216,6 +3504,8 @@ def export_dynamic_parallel_gif(
         rows,
         column_spacing,
         row_spacing,
+        use_grid_individual_spacing,
+        grid_spacing_table,
         use_individual_spacing,
         spacing_table,
     )
@@ -3369,6 +3659,11 @@ def build_dynamic_demo() -> gr.Blocks:
                 value=RASTER_PATTERN_SAME_DIRECTION,
                 allow_custom_value=False,
             )
+            gcode_lead_in_enabled = gr.Checkbox(label="Lead In", value=False)
+            with gr.Row():
+                gcode_lead_in_length = gr.Number(label="Lead In Length (mm)", value=5.0, minimum=0.1, step=0.1)
+                gcode_lead_in_clearance = gr.Number(label="Lead In Clearance (mm)", value=5.0, minimum=0.0, step=0.1)
+                gcode_lead_in_lines = gr.Number(label="Lead In Raster Lines", value=3, minimum=1, step=1)
             gcode_button = gr.Button("Generate G-Code", variant="primary")
             gcode_downloads = gr.File(label="Download G-Code Files", file_count="multiple", interactive=False, elem_classes=["gcode-download"])
             gcode_status = gr.Markdown("")
@@ -3395,6 +3690,19 @@ def build_dynamic_demo() -> gr.Blocks:
                         nozzle_grid_rows = gr.Number(label="Grid Rows", value=2, minimum=1, step=1)
                         nozzle_grid_column_spacing = gr.Number(label="Column Gap (X, mm)", value=0.0, step=0.1)
                         nozzle_grid_row_spacing = gr.Number(label="Row Gap (Y, mm)", value=0.0, step=0.1)
+                    with gr.Row():
+                        auto_align_split_parts_button = gr.Button("Auto Align Split Parts", variant="secondary", size="sm")
+                        nozzle_grid_use_individual_spacing = gr.Checkbox(label="Use Different Grid Connection Gaps", value=False)
+                    nozzle_grid_spacing_table = gr.Dataframe(
+                        headers=ADVANCED_NOZZLE_SPACING_HEADERS,
+                        value=[],
+                        row_count=(0, "fixed"),
+                        column_count=(len(ADVANCED_NOZZLE_SPACING_HEADERS), "fixed"),
+                        interactive=True,
+                        label="Advanced Grid Spacing",
+                        visible=False,
+                        elem_id="nozzle-grid-spacing-table",
+                    )
                 with gr.Group(visible=False) as nozzle_custom_group:
                     nozzle_use_individual_spacing = gr.Checkbox(label="Use Different Values for Each Nozzle Connection", value=False)
                     nozzle_spacing_table = gr.Dataframe(
@@ -3489,11 +3797,26 @@ def build_dynamic_demo() -> gr.Blocks:
 
             parallel_mode = gr.State("tube")
 
+        grid_spacing_refresh_inputs = [
+            shape_records,
+            nozzle_grid_columns,
+            nozzle_grid_rows,
+            nozzle_grid_column_spacing,
+            nozzle_grid_row_spacing,
+            nozzle_grid_spacing_table,
+            nozzle_grid_use_individual_spacing,
+        ]
+
         shape_sync_outputs = [shape_records, shape_settings, nozzle_spacing_table, selected_shape, gcode_text_source, gcode_source, tiff_downloads, gcode_downloads]
         stl_upload.change(fn=sync_uploaded_shapes, inputs=[stl_upload, shape_records, shape_settings, nozzle_spacing_table, nozzle_use_individual_spacing], outputs=shape_sync_outputs).then(
             fn=lambda records: _dropdown_update(records),
             inputs=[shape_records],
             outputs=[split_source],
+            queue=False,
+        ).then(
+            fn=_grid_spacing_table_update,
+            inputs=grid_spacing_refresh_inputs,
+            outputs=[nozzle_grid_spacing_table],
             queue=False,
         )
         sync_uploads_button.click(fn=sync_uploaded_shapes, inputs=[stl_upload, shape_records, shape_settings, nozzle_spacing_table, nozzle_use_individual_spacing], outputs=shape_sync_outputs).then(
@@ -3501,11 +3824,21 @@ def build_dynamic_demo() -> gr.Blocks:
             inputs=[shape_records],
             outputs=[split_source],
             queue=False,
+        ).then(
+            fn=_grid_spacing_table_update,
+            inputs=grid_spacing_refresh_inputs,
+            outputs=[nozzle_grid_spacing_table],
+            queue=False,
         )
         load_samples_button.click(fn=load_sample_shapes, inputs=[stl_upload, shape_records, shape_settings, nozzle_spacing_table, nozzle_use_individual_spacing], outputs=[stl_upload, *shape_sync_outputs]).then(
             fn=lambda records: _dropdown_update(records),
             inputs=[shape_records],
             outputs=[split_source],
+            queue=False,
+        ).then(
+            fn=_grid_spacing_table_update,
+            inputs=grid_spacing_refresh_inputs,
+            outputs=[nozzle_grid_spacing_table],
             queue=False,
         )
         shape_settings.select(
@@ -3517,6 +3850,11 @@ def build_dynamic_demo() -> gr.Blocks:
             inputs=[shape_records],
             outputs=[split_source],
             queue=False,
+        ).then(
+            fn=_grid_spacing_table_update,
+            inputs=grid_spacing_refresh_inputs,
+            outputs=[nozzle_grid_spacing_table],
+            queue=False,
         )
 
         preview_inputs = [shape_records, selected_shape, shape_settings, model_opacity, scale_mode]
@@ -3524,6 +3862,11 @@ def build_dynamic_demo() -> gr.Blocks:
             fn=normalize_shape_settings_and_spacing,
             inputs=[shape_records, shape_settings, scale_mode, nozzle_spacing_table, nozzle_use_individual_spacing],
             outputs=[shape_records, shape_settings, nozzle_spacing_table],
+            queue=False,
+        ).then(
+            fn=_grid_spacing_table_update,
+            inputs=grid_spacing_refresh_inputs,
+            outputs=[nozzle_grid_spacing_table],
             queue=False,
         )
         selected_shape.change(fn=show_selected_model, inputs=preview_inputs, outputs=[model_viewer, model_details, slice_slider, slice_label, slice_preview])
@@ -3616,6 +3959,11 @@ def build_dynamic_demo() -> gr.Blocks:
             fn=generate_dynamic_reference_stack,
             inputs=[shape_records],
             outputs=[ref_state, ref_slice_slider, ref_slice_label, ref_slice_preview],
+        ).then(
+            fn=_grid_spacing_table_update,
+            inputs=grid_spacing_refresh_inputs,
+            outputs=[nozzle_grid_spacing_table],
+            queue=False,
         )
         split_piece_source.change(fn=preview_selected_split_piece, inputs=[split_piece_states, split_piece_source], outputs=[split_piece_slider, split_piece_label, split_piece_preview], queue=False)
         split_piece_slider.release(fn=jump_to_selected_split_piece, inputs=[split_piece_states, split_piece_source, split_piece_slider], outputs=[split_piece_label, split_piece_preview], queue=False)
@@ -3624,7 +3972,20 @@ def build_dynamic_demo() -> gr.Blocks:
 
         gcode_button.click(
             fn=generate_dynamic_gcode,
-            inputs=[shape_records, shape_settings, gcode_all_g1, gcode_use_ref_motion, gcode_raster_pattern, ref_state, layer_height, pixel_size],
+            inputs=[
+                shape_records,
+                shape_settings,
+                gcode_all_g1,
+                gcode_use_ref_motion,
+                gcode_raster_pattern,
+                gcode_lead_in_enabled,
+                gcode_lead_in_length,
+                gcode_lead_in_clearance,
+                gcode_lead_in_lines,
+                ref_state,
+                layer_height,
+                pixel_size,
+            ],
             outputs=[shape_records, gcode_downloads, gcode_status, gcode_text_source, gcode_source],
         )
         gcode_text_source.change(fn=load_selected_gcode_text, inputs=[shape_records, gcode_text_source], outputs=[gcode_text])
@@ -3635,12 +3996,52 @@ def build_dynamic_demo() -> gr.Blocks:
             outputs=[nozzle_grid_group, nozzle_custom_group],
             queue=False,
         )
+        auto_align_split_parts_button.click(
+            fn=auto_align_split_parts_for_raster,
+            inputs=[
+                shape_records,
+                nozzle_grid_columns,
+                nozzle_grid_rows,
+                nozzle_grid_column_spacing,
+                nozzle_grid_row_spacing,
+                gcode_raster_pattern,
+            ],
+            outputs=[
+                nozzle_layout_mode,
+                nozzle_grid_group,
+                nozzle_custom_group,
+                nozzle_grid_column_spacing,
+                nozzle_grid_row_spacing,
+                nozzle_grid_use_individual_spacing,
+                nozzle_grid_spacing_table,
+                nozzle_spacing_status,
+            ],
+            queue=False,
+        )
         nozzle_grid_preset.change(
             fn=update_nozzle_grid_preset,
             inputs=[nozzle_grid_preset, shape_records, nozzle_grid_columns, nozzle_grid_rows],
             outputs=[nozzle_grid_columns, nozzle_grid_rows],
             queue=False,
+        ).then(
+            fn=_grid_spacing_table_update,
+            inputs=grid_spacing_refresh_inputs,
+            outputs=[nozzle_grid_spacing_table],
+            queue=False,
         )
+        for grid_spacing_control in (
+            nozzle_grid_columns,
+            nozzle_grid_rows,
+            nozzle_grid_column_spacing,
+            nozzle_grid_row_spacing,
+            nozzle_grid_use_individual_spacing,
+        ):
+            grid_spacing_control.change(
+                fn=_grid_spacing_table_update,
+                inputs=grid_spacing_refresh_inputs,
+                outputs=[nozzle_grid_spacing_table],
+                queue=False,
+            )
         nozzle_use_individual_spacing.change(fn=update_nozzle_spacing_table_mode, inputs=[shape_records, nozzle_spacing_table, nozzle_use_individual_spacing], outputs=[nozzle_spacing_table], queue=False)
         nozzle_preview_button.click(
             fn=render_dynamic_nozzle_spacing,
@@ -3651,6 +4052,8 @@ def build_dynamic_demo() -> gr.Blocks:
                 nozzle_grid_rows,
                 nozzle_grid_column_spacing,
                 nozzle_grid_row_spacing,
+                nozzle_grid_use_individual_spacing,
+                nozzle_grid_spacing_table,
                 nozzle_use_individual_spacing,
                 nozzle_spacing_table,
             ],
@@ -3704,6 +4107,8 @@ def build_dynamic_demo() -> gr.Blocks:
             nozzle_grid_rows,
             nozzle_grid_column_spacing,
             nozzle_grid_row_spacing,
+            nozzle_grid_use_individual_spacing,
+            nozzle_grid_spacing_table,
             nozzle_use_individual_spacing,
             nozzle_spacing_table,
         ]
@@ -3723,6 +4128,8 @@ def build_dynamic_demo() -> gr.Blocks:
                 nozzle_grid_rows,
                 nozzle_grid_column_spacing,
                 nozzle_grid_row_spacing,
+                nozzle_grid_use_individual_spacing,
+                nozzle_grid_spacing_table,
                 nozzle_use_individual_spacing,
                 nozzle_spacing_table,
                 pp_gif_duration,
