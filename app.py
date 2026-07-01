@@ -2641,6 +2641,10 @@ def update_nozzle_spacing_mode(layout_mode: str | None) -> tuple[dict[str, Any],
     return gr.update(visible=not custom_selected), gr.update(visible=custom_selected)
 
 
+def update_lead_in_options_visibility(enabled: bool | None) -> dict[str, Any]:
+    return gr.update(visible=bool(enabled))
+
+
 def _dropdown_update(records: list[dict], selected: str | None = None) -> dict[str, Any]:
     choices = [_shape_choice(record) for record in records]
     value = selected if selected in choices else (choices[0] if choices else None)
@@ -3685,10 +3689,11 @@ def build_dynamic_demo() -> gr.Blocks:
                 allow_custom_value=False,
             )
             gcode_lead_in_enabled = gr.Checkbox(label="Lead In", value=False)
-            with gr.Row():
-                gcode_lead_in_length = gr.Number(label="Lead In Length (mm)", value=5.0, minimum=0.1, step=0.1)
-                gcode_lead_in_clearance = gr.Number(label="Lead In Clearance (mm)", value=5.0, minimum=0.0, step=0.1)
-                gcode_lead_in_lines = gr.Number(label="Lead In Raster Lines", value=3, minimum=1, step=1)
+            with gr.Group(visible=False) as gcode_lead_in_options_group:
+                with gr.Row():
+                    gcode_lead_in_length = gr.Number(label="Lead In Length (mm)", value=5.0, minimum=0.1, step=0.1)
+                    gcode_lead_in_clearance = gr.Number(label="Lead In Clearance (mm)", value=5.0, minimum=0.0, step=0.1)
+                    gcode_lead_in_lines = gr.Number(label="Lead In Raster Lines", value=3, minimum=1, step=1)
             gcode_button = gr.Button("Generate G-Code", variant="primary")
             gcode_downloads = gr.File(label="Download G-Code Files", file_count="multiple", interactive=False, elem_classes=["gcode-download"])
             gcode_status = gr.Markdown("")
@@ -4021,6 +4026,12 @@ def build_dynamic_demo() -> gr.Blocks:
             fn=load_selected_gcode_text,
             inputs=[shape_records, gcode_text_source],
             outputs=[gcode_text],
+        )
+        gcode_lead_in_enabled.change(
+            fn=update_lead_in_options_visibility,
+            inputs=[gcode_lead_in_enabled],
+            outputs=[gcode_lead_in_options_group],
+            queue=False,
         )
         gcode_text_source.change(fn=load_selected_gcode_text, inputs=[shape_records, gcode_text_source], outputs=[gcode_text])
         refresh_gcode_text_button.click(fn=load_selected_gcode_text, inputs=[shape_records, gcode_text_source], outputs=[gcode_text])

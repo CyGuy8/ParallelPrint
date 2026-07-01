@@ -673,15 +673,17 @@ def test_woodpile_raster_switches_print_axis_between_layers(tmp_path) -> None:
         raster_pattern=RASTER_PATTERN_WOODPILE,
     )
 
+    gcode_text = gcode_path.read_text()
     move_lines = [
         line.strip()
-        for line in gcode_path.read_text().splitlines()
+        for line in gcode_text.splitlines()
         if line.startswith(("G0", "G1"))
     ]
     z_move_index = next(i for i, line in enumerate(move_lines) if " Z" in line)
     first_layer_prints = [line for line in move_lines[:z_move_index] if line.startswith("G1") and "; Color 255" in line]
     second_layer_prints = [line for line in move_lines[z_move_index + 1 :] if line.startswith("G1") and "; Color 255" in line]
 
+    assert move_lines[0] == "G0 X1.0 Y0.0 ; Color 0"
     assert any("X" in line and "Y0" in line for line in first_layer_prints)
     assert any("X0" in line and "Y" in line for line in second_layer_prints)
 
@@ -696,10 +698,28 @@ def test_woodpile_raster_switches_print_axis_between_layers(tmp_path) -> None:
                 y += float(token[1:])
         x_positions.append(x)
         y_positions.append(y)
-    assert min(x_positions) == -1.0
-    assert max(x_positions) == 4.0
-    assert min(y_positions) == -1.0
-    assert max(y_positions) == 3.0
+    assert min(x_positions) == 0.0
+    assert max(x_positions) == 5.0
+    assert min(y_positions) == -1.5
+    assert max(y_positions) == 2.5
+
+    moves = _moves_with_colors(gcode_text)
+    first_layer_change = next(
+        move for move in moves if move["end"][2] > move["start"][2]
+    )
+    previous_xy = first_layer_change["start"][:2]
+    actual_restart_xy = first_layer_change["end"][:2]
+    old_restart_xy = (1.5, -1.5)
+    actual_restart_distance = (
+        (previous_xy[0] - actual_restart_xy[0]) ** 2
+        + (previous_xy[1] - actual_restart_xy[1]) ** 2
+    )
+    old_restart_distance = (
+        (previous_xy[0] - old_restart_xy[0]) ** 2
+        + (previous_xy[1] - old_restart_xy[1]) ** 2
+    )
+    assert actual_restart_xy != old_restart_xy
+    assert actual_restart_distance < old_restart_distance
 
 
 def test_y_direction_raster_prints_each_layer_along_y_axis(tmp_path) -> None:
@@ -724,9 +744,10 @@ def test_y_direction_raster_prints_each_layer_along_y_axis(tmp_path) -> None:
         raster_pattern=RASTER_PATTERN_Y_DIRECTION,
     )
 
+    gcode_text = gcode_path.read_text()
     move_lines = [
         line.strip()
-        for line in gcode_path.read_text().splitlines()
+        for line in gcode_text.splitlines()
         if line.startswith(("G0", "G1"))
     ]
     print_lines = [
@@ -735,6 +756,7 @@ def test_y_direction_raster_prints_each_layer_along_y_axis(tmp_path) -> None:
         if line.startswith("G1") and "; Color 255" in line
     ]
     assert print_lines
+    assert move_lines[0] == "G0 X0.0 Y1.0 ; Color 0"
     assert all("X0" in line and "Y0" not in line for line in print_lines)
 
     x = y = 0.0
@@ -748,10 +770,16 @@ def test_y_direction_raster_prints_each_layer_along_y_axis(tmp_path) -> None:
                 y += float(token[1:])
         x_positions.append(x)
         y_positions.append(y)
-    assert min(x_positions) >= 0.0
-    assert max(x_positions) <= 3.0
-    assert min(y_positions) == -1.0
-    assert max(y_positions) == 3.0
+    assert min(x_positions) == 0.0
+    assert max(x_positions) == 2.0
+    assert min(y_positions) == 0.0
+    assert max(y_positions) == 4.0
+
+    moves = _moves_with_colors(gcode_text)
+    first_layer_change = next(
+        move for move in moves if move["end"][2] > move["start"][2]
+    )
+    assert first_layer_change["start"][:2] == first_layer_change["end"][:2]
 
 
 def test_contour_tracing_skips_inactive_nozzle_outline(tmp_path) -> None:

@@ -829,6 +829,8 @@ def _woodpile_layer_segments(
     color_img: np.ndarray,
     pixel_size: float,
     raster_axis: str,
+    reverse_order: bool = False,
+    start_forward: bool = True,
 ) -> list[tuple[float, float, float, float, int]]:
     mask = path_img > 0
     segments: list[tuple[float, float, float, float, int]] = []
@@ -840,11 +842,14 @@ def _woodpile_layer_segments(
             mask.shape[0] - 1 - np.flipud(mask).argmax(axis=0),
             -1,
         )
-        for col_number, col in enumerate(np.where(first_nonblank != -1)[0]):
+        columns = list(np.where(first_nonblank != -1)[0])
+        if reverse_order:
+            columns.reverse()
+        for col_number, col in enumerate(columns):
             f_idx, l_idx = int(first_nonblank[col]), int(last_nonblank[col])
             if f_idx == -1:
                 continue
-            forward = col_number % 2 == 0
+            forward = (col_number % 2 == 0) == start_forward
             row_values = list(range(f_idx, l_idx + 1)) if forward else list(range(l_idx, f_idx - 1, -1))
             run_start = row_values[0]
             prev_row = row_values[0]
@@ -893,11 +898,14 @@ def _woodpile_layer_segments(
         mask.shape[1] - 1 - np.fliplr(mask).argmax(axis=1),
         -1,
     )
-    for row_number, row in enumerate(np.where(first_nonblank != -1)[0]):
+    rows = list(np.where(first_nonblank != -1)[0])
+    if reverse_order:
+        rows.reverse()
+    for row_number, row in enumerate(rows):
         f_idx, l_idx = int(first_nonblank[row]), int(last_nonblank[row])
         if f_idx == -1:
             continue
-        forward = row_number % 2 == 0
+        forward = (row_number % 2 == 0) == start_forward
         col_values = list(range(f_idx, l_idx + 1)) if forward else list(range(l_idx, f_idx - 1, -1))
         run_start = col_values[0]
         prev_col = col_values[0]
@@ -945,6 +953,49 @@ def _raster_axis_for_pattern(pattern: str, layer_number: int) -> str:
     return "X"
 
 
+def _oriented_woodpile_layer_segments(
+    path_img: np.ndarray,
+    color_img: np.ndarray,
+    pixel_size: float,
+    raster_axis: str,
+    current_x: float,
+    current_y: float,
+    prefer_default: bool = False,
+) -> list[tuple[float, float, float, float, int]]:
+    default_segments = _woodpile_layer_segments(
+        path_img,
+        color_img,
+        pixel_size,
+        raster_axis,
+    )
+    if prefer_default or not default_segments:
+        return default_segments
+
+    candidates: list[list[tuple[float, float, float, float, int]]] = [default_segments]
+    for reverse_order in (False, True):
+        for start_forward in (False, True):
+            segments = _woodpile_layer_segments(
+                path_img,
+                color_img,
+                pixel_size,
+                raster_axis,
+                reverse_order=reverse_order,
+                start_forward=start_forward,
+            )
+            if segments and segments not in candidates:
+                candidates.append(segments)
+
+    return min(
+        candidates,
+        key=lambda segments: _point_distance_sq(
+            current_x,
+            current_y,
+            segments[0][0],
+            segments[0][1],
+        ),
+    )
+
+
 def _build_footprint_raster_gcode_list(
     path_ref_list: list[np.ndarray],
     color_ref_list: list[np.ndarray],
@@ -957,11 +1008,20 @@ def _build_footprint_raster_gcode_list(
     gcode_list: list[dict] = []
     current_x = 0.0
     current_y = 0.0
+    raster_origin_initialized = False
     contour_layers = contour_layers or []
 
     for layer_number, (path_img, color_img) in enumerate(zip(path_ref_list, color_ref_list)):
         raster_axis = _raster_axis_for_pattern(raster_pattern, layer_number)
-        segments = _woodpile_layer_segments(path_img, color_img, pixel_size, raster_axis)
+        segments = _oriented_woodpile_layer_segments(
+            path_img,
+            color_img,
+            pixel_size,
+            raster_axis,
+            current_x,
+            current_y,
+            prefer_default=not raster_origin_initialized,
+        )
         if not segments:
             if layer_number > 0:
                 gcode_list.append({"X": 0.0, "Y": 0.0, "Z": layer_height, "Color": 0})
@@ -985,7 +1045,20 @@ def _build_footprint_raster_gcode_list(
             continue
 
         first_x, first_y = segments[0][0], segments[0][1]
-        if layer_number > 0:
+        if not raster_origin_initialized:
+            if layer_number > 0:
+                current_x, current_y = _append_relative_move(
+                    gcode_list,
+                    current_x,
+                    current_y,
+                    current_x,
+                    current_y,
+                    0,
+                    z_step=layer_height,
+                )
+            current_x, current_y = first_x, first_y
+            raster_origin_initialized = True
+        elif layer_number > 0:
             current_x, current_y = _append_relative_move(
                 gcode_list,
                 current_x,
