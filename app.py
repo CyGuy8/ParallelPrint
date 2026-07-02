@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import tempfile
 import math
+import tempfile
 import time
 import warnings
-import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +19,6 @@ warnings.filterwarnings(
 
 import gradio as gr
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
 import trimesh
 
 from gcode_viewer import (
@@ -31,22 +29,23 @@ from gcode_viewer import (
     parse_gcode_path,
 )
 from stl_slicer import (
-    SliceStack,
+    LayerStack,
     load_mesh,
     scale_factors_for_target_extents,
     scale_mesh,
-    slice_stl_to_tiffs,
+    slice_stl_to_layers,
 )
-from tiff_to_gcode import (
-    CONTOUR_MODE_ROW_ENVELOPE,
+from vector_gcode import generate_vector_gcode
+from vector_toolpath import (
     RASTER_PATTERN_CHOICES,
     RASTER_PATTERN_SAME_DIRECTION,
     RASTER_PATTERN_Y_DIRECTION,
-    generate_snake_path_gcode,
+    ContourSource,
+    build_reference_stack,
+    split_layer_stack_grid,
 )
 
 
-ViewerState = dict[str, Any]
 SAMPLE_STL_FILENAMES = ("Hollow_Pyramid.stl", "Rounded_Cube_Through_Holes.stl", "halfsphere.stl")
 SAMPLE_STL_DIR = Path(__file__).resolve().parent / "sample_stls"
 DEFAULT_TARGET_EXTENTS = (20.0, 20.0, 20.0)
@@ -783,54 +782,6 @@ PARALLEL_CONTROLS_HTML = """
 """
 
 
-def _read_slice_preview(path: str) -> Image.Image:
-    with Image.open(path) as image:
-        preview = image.copy()
-
-    # Upscale low-resolution TIFF previews so they fill the viewer area better.
-    min_display_side = 480
-    width, height = preview.size
-    max_dim = max(width, height)
-    if max_dim > 0 and max_dim < min_display_side:
-        scale = min_display_side / max_dim
-        new_size = (
-            max(1, int(round(width * scale))),
-            max(1, int(round(height * scale))),
-        )
-        preview = preview.resize(new_size, resample=Image.Resampling.NEAREST)
-
-    return preview
-
-
-def _empty_state() -> ViewerState:
-    return {
-        "tiff_paths": [],
-        "z_values": [],
-        "pixel_size": 0.0,
-        "x_min": 0.0,
-        "y_min": 0.0,
-        "image_width": 0,
-        "image_height": 0,
-    }
-
-
-def _reset_slider() -> dict[str, Any]:
-    return gr.update(minimum=0, maximum=0, value=0, step=1, interactive=False)
-
-
-def _stack_to_state(stack: SliceStack) -> ViewerState:
-    (x_min, y_min, _z_min), (_x_max, _y_max, _z_max) = stack.bounds
-    return {
-        "tiff_paths": [str(path) for path in stack.tiff_paths],
-        "z_values": stack.z_values,
-        "pixel_size": stack.pixel_size,
-        "x_min": x_min,
-        "y_min": y_min,
-        "image_width": stack.image_size[0],
-        "image_height": stack.image_size[1],
-    }
-
-
 def _format_model_details(
     source_name: str,
     mesh,
@@ -863,190 +814,6 @@ def _format_model_details(
         ]
     )
     return "\n".join(lines)
-
-
-def _slice_label(state: ViewerState, index: int) -> str:
-    path = Path(state["tiff_paths"][index]).name
-    z_value = state["z_values"][index]
-    total = len(state["tiff_paths"])
-    return f"Slice {index + 1} / {total} | z = {z_value:.4f} | {path}"
-
-
-def _annotate_preview(
-    image: Image.Image,
-    pixel_size: float,
-    x_min: float,
-    y_min: float,
-    orig_width: int,
-    orig_height: int,
-) -> Image.Image:
-    """Draw a blue origin crosshair with axis labels and a scale bar."""
-    rgb = image.convert("RGB")
-    draw = ImageDraw.Draw(rgb)
-
-    preview_w, preview_h = rgb.size
-    scale_x = preview_w / orig_width if orig_width else 1.0
-    scale_y = preview_h / orig_height if orig_height else 1.0
-
-    BLUE = (50, 120, 255)
-
-    try:
-        font = ImageFont.load_default(size=14)
-    except TypeError:
-        font = ImageFont.load_default()
-    try:
-        small_font = ImageFont.load_default(size=12)
-    except TypeError:
-        small_font = font
-
-    # --- Origin crosshair & axis indicators ---
-    origin_px = (0.0 - x_min) / pixel_size
-    origin_py_from_bottom = (0.0 - y_min) / pixel_size
-    origin_img_y = orig_height - 1 - origin_py_from_bottom
-
-    ox = int(round(origin_px * scale_x))
-    oy = int(round(origin_img_y * scale_y))
-
-    arm = 20
-    margin_edge = 8  # inset from image border for off-screen indicators
-    on_screen = 0 <= ox < preview_w and 0 <= oy < preview_h
-
-    if on_screen:
-        # +X axis (rightward)
-        x_start = max(0, ox)
-        x_end = min(preview_w - 1, ox + arm)
-        if x_end > x_start:
-            draw.line([(x_start, oy), (x_end, oy)], fill=BLUE, width=2)
-            draw.polygon(
-                [(x_end, oy), (x_end - 5, oy - 4), (x_end - 5, oy + 4)],
-                fill=BLUE,
-            )
-            if x_end + 4 < preview_w:
-                draw.text((x_end + 4, oy - 7), "X", fill=BLUE, font=small_font)
-
-        # +Y axis (upward in world = upward in image)
-        y_end = max(0, oy - arm)
-        y_start = min(preview_h - 1, oy)
-        if y_start > y_end:
-            draw.line([(ox, y_start), (ox, y_end)], fill=BLUE, width=2)
-            draw.polygon(
-                [(ox, y_end), (ox - 4, y_end + 5), (ox + 4, y_end + 5)],
-                fill=BLUE,
-            )
-            if y_end - 16 >= 0:
-                draw.text((ox + 5, y_end - 16), "Y", fill=BLUE, font=small_font)
-
-        # -X stub (leftward from origin)
-        stub = min(8, max(0, ox))
-        if stub > 0:
-            draw.line([(ox - stub, oy), (ox, oy)], fill=BLUE, width=2)
-
-        # -Y stub (downward from origin in image)
-        stub_y = min(8, max(0, preview_h - 1 - oy))
-        if stub_y > 0:
-            draw.line([(ox, oy), (ox, oy + stub_y)], fill=BLUE, width=2)
-
-        # Origin label
-        lx = ox + arm + 4 if ox + arm + 40 < preview_w else ox - 45
-        ly = oy + 6
-        if 0 <= ly < preview_h:
-            draw.text((max(0, lx), ly), "(0, 0)", fill=BLUE, font=small_font)
-
-    else:
-        # Origin is off-screen — draw edge indicator(s) pointing toward it.
-        arrow_len = 14
-        arrow_half = 5
-
-        # Compute direction label text showing approximate origin coordinates
-        origin_x_mm = x_min
-        origin_y_mm = y_min
-        coord_text = f"Origin ({-origin_x_mm:+.1f}, {-origin_y_mm:+.1f})"
-
-        if ox < 0:
-            # Origin is to the LEFT — draw left-pointing arrow on left edge
-            ay = max(margin_edge + arrow_half, min(preview_h - margin_edge - arrow_half, oy))
-            draw.polygon(
-                [(margin_edge, ay), (margin_edge + arrow_len, ay - arrow_half), (margin_edge + arrow_len, ay + arrow_half)],
-                fill=BLUE,
-            )
-            draw.text((margin_edge + arrow_len + 4, ay - 7), coord_text, fill=BLUE, font=small_font)
-        elif ox >= preview_w:
-            # Origin is to the RIGHT
-            ay = max(margin_edge + arrow_half, min(preview_h - margin_edge - arrow_half, oy))
-            rx = preview_w - margin_edge
-            draw.polygon(
-                [(rx, ay), (rx - arrow_len, ay - arrow_half), (rx - arrow_len, ay + arrow_half)],
-                fill=BLUE,
-            )
-            tw = len(coord_text) * 7
-            draw.text((max(0, rx - arrow_len - tw - 4), ay - 7), coord_text, fill=BLUE, font=small_font)
-
-        if oy < 0:
-            # Origin is ABOVE — draw upward-pointing arrow on top edge
-            ax = max(margin_edge + arrow_half, min(preview_w - margin_edge - arrow_half, ox))
-            draw.polygon(
-                [(ax, margin_edge), (ax - arrow_half, margin_edge + arrow_len), (ax + arrow_half, margin_edge + arrow_len)],
-                fill=BLUE,
-            )
-        elif oy >= preview_h:
-            # Origin is BELOW — draw downward-pointing arrow on bottom edge
-            ax = max(margin_edge + arrow_half, min(preview_w - margin_edge - arrow_half, ox))
-            by = preview_h - margin_edge
-            draw.polygon(
-                [(ax, by), (ax - arrow_half, by - arrow_len), (ax + arrow_half, by - arrow_len)],
-                fill=BLUE,
-            )
-            # If we didn't already draw a left/right label, label here
-            if 0 <= ox < preview_w:
-                draw.text((ax + arrow_half + 4, by - arrow_len - 2), coord_text, fill=BLUE, font=small_font)
-
-    # --- Scale bar (bottom-left) ---
-    image_width_mm = orig_width * pixel_size
-    target_bar_mm = image_width_mm * 0.2
-    nice = [0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
-    bar_mm = min(nice, key=lambda v: abs(v - target_bar_mm))
-
-    bar_px = (bar_mm / pixel_size) * scale_x
-    margin = 12
-    bar_y = preview_h - margin
-    bar_x0 = margin
-    bar_x1 = bar_x0 + bar_px
-    cap = 5
-
-    draw.line([(int(bar_x0), int(bar_y)), (int(bar_x1), int(bar_y))], fill=BLUE, width=3)
-    draw.line([(int(bar_x0), int(bar_y - cap)), (int(bar_x0), int(bar_y + cap))], fill=BLUE, width=2)
-    draw.line([(int(bar_x1), int(bar_y - cap)), (int(bar_x1), int(bar_y + cap))], fill=BLUE, width=2)
-
-    bar_label = f"{bar_mm:g} mm"
-    draw.text((int(bar_x0), int(bar_y - 20)), bar_label, fill=BLUE, font=font)
-
-    return rgb
-
-
-def _render_selected_slice(state: ViewerState, index: int) -> tuple[str, Image.Image | None]:
-    tiff_paths = state.get("tiff_paths", [])
-    if not tiff_paths:
-        return "No slice stack loaded yet.", None
-
-    bounded_index = max(0, min(int(index), len(tiff_paths) - 1))
-    selected_path = tiff_paths[bounded_index]
-    preview = _read_slice_preview(selected_path)
-
-    pixel_size = state.get("pixel_size", 0.0)
-    if pixel_size and pixel_size > 0:
-        preview = _annotate_preview(
-            preview,
-            pixel_size=pixel_size,
-            x_min=state.get("x_min", 0.0),
-            y_min=state.get("y_min", 0.0),
-            orig_width=state.get("image_width", 0) or preview.size[0],
-            orig_height=state.get("image_height", 0) or preview.size[1],
-        )
-
-    return (
-        _slice_label(state, bounded_index),
-        preview,
-    )
 
 
 def _opacity_to_alpha(opacity: float) -> int:
@@ -1383,10 +1150,6 @@ def load_single_model(
     return _viewer_update(glb_path), _format_model_details(Path(stl_file).name, mesh, scale_factors)
 
 
-def jump_to_slice(state: ViewerState, index: float) -> tuple[str, Image.Image | None]:
-    return _render_selected_slice(state, int(index))
-
-
 GCODE_SOURCE_UPLOAD = "Upload G-Code file"
 
 
@@ -1718,342 +1481,6 @@ def _format_nozzle_spacing_status(
     return "  \n".join(lines)
 
 
-def shift_slice(state: ViewerState, index: float, delta: int) -> tuple[int, str, Image.Image | None]:
-    tiff_paths = state.get("tiff_paths", [])
-    if not tiff_paths:
-        return 0, "No slice stack loaded yet.", None
-
-    new_index = max(0, min(int(index) + delta, len(tiff_paths) - 1))
-    label, preview = _render_selected_slice(state, new_index)
-    return new_index, label, preview
-
-
-def generate_reference_stack(
-    *states: ViewerState,
-    progress: gr.Progress = gr.Progress(),
-) -> tuple:
-    """Combine all available TIFF stacks into a single reference stack.
-
-    For each pixel in each layer the result is black (0) when *any* source
-    stack has a black pixel at that position, and white (255) only when *all*
-    sources are white.  Images of different sizes are centred on a canvas
-    sized to the largest dimensions.
-    """
-    active_states = [s for s in states if s.get("tiff_paths")]
-
-    if not active_states:
-        return (
-            _empty_state(),
-            _reset_slider(),
-            "No TIFF stacks available. Generate TIFF stacks first.",
-            None,
-        )
-
-    max_layers = max(len(s["tiff_paths"]) for s in active_states)
-
-    # Determine the largest image dimensions across all stacks.
-    max_width = 0
-    max_height = 0
-    source_sizes: list[tuple[int, int]] = []
-    for state in active_states:
-        w = state.get("image_width", 0)
-        h = state.get("image_height", 0)
-        if not w or not h:
-            with Image.open(state["tiff_paths"][0]) as img:
-                w, h = img.size
-        source_sizes.append((w, h))
-        max_width = max(max_width, w)
-        max_height = max(max_height, h)
-
-    # Compute annotation metadata from the first active state, accounting for
-    # the centering offset applied to its image on the larger canvas.
-    first = active_states[0]
-    first_w, first_h = source_sizes[0]
-    ref_pixel_size = first.get("pixel_size", 0.0)
-    x_off_first = (max_width - first_w) // 2
-    y_off_first = (max_height - first_h) // 2
-    ref_x_min = first.get("x_min", 0.0) - x_off_first * ref_pixel_size
-    ref_y_min = first.get("y_min", 0.0) - y_off_first * ref_pixel_size
-
-    output_dir = Path(tempfile.mkdtemp(prefix="reference_stack_"))
-    slices_dir = output_dir / "tiff_slices"
-    slices_dir.mkdir(parents=True, exist_ok=True)
-
-    tiff_paths: list[Path] = []
-    z_values: list[float] = []
-
-    for layer_idx in range(max_layers):
-        progress(
-            layer_idx / max_layers,
-            desc=f"Compositing reference layer {layer_idx + 1}/{max_layers}",
-        )
-
-        # Start with an all-white canvas.
-        ref_array = np.full((max_height, max_width), 255, dtype=np.uint8)
-
-        for state in active_states:
-            paths = state["tiff_paths"]
-            if layer_idx >= len(paths):
-                continue  # Stack exhausted – contributes white.
-
-            with Image.open(paths[layer_idx]) as img:
-                arr = np.asarray(img)
-
-            h, w = arr.shape[:2]
-            y_off = (max_height - h) // 2
-            x_off = (max_width - w) // 2
-
-            # Black (0) wins: pixel-wise minimum keeps any black pixel.
-            region = ref_array[y_off : y_off + h, x_off : x_off + w]
-            ref_array[y_off : y_off + h, x_off : x_off + w] = np.minimum(region, arr)
-
-        ref_image = Image.fromarray(ref_array, mode="L")
-        tiff_path = slices_dir / f"ref_slice_{layer_idx:04d}.tif"
-        ref_image.save(tiff_path, compression="tiff_deflate")
-        tiff_paths.append(tiff_path)
-
-        # Use z-value from the first active state that covers this layer.
-        z_val = 0.0
-        for state in active_states:
-            if layer_idx < len(state["z_values"]):
-                z_val = state["z_values"][layer_idx]
-                break
-        z_values.append(z_val)
-
-    ref_state: ViewerState = {
-        "tiff_paths": [str(p) for p in tiff_paths],
-        "z_values": z_values,
-        "pixel_size": ref_pixel_size,
-        "x_min": ref_x_min,
-        "y_min": ref_y_min,
-        "image_width": max_width,
-        "image_height": max_height,
-    }
-
-    label, preview = _render_selected_slice(ref_state, 0)
-    slider = gr.update(
-        minimum=0,
-        maximum=max(0, len(tiff_paths) - 1),
-        value=0,
-        step=1,
-        interactive=len(tiff_paths) > 1,
-    )
-
-    return ref_state, slider, label, preview
-
-
-def _zip_tiff_paths(tiff_paths: list[Path], zip_path: Path) -> None:
-    with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for tiff_path in tiff_paths:
-            archive.write(tiff_path, arcname=tiff_path.name)
-
-
-def _partition_length(length: int, count: int) -> list[tuple[int, int]]:
-    base = length // count
-    remainder = length % count
-    spans: list[tuple[int, int]] = []
-    start = 0
-    for index in range(count):
-        size = base + (1 if index < remainder else 0)
-        end = start + size
-        spans.append((start, end))
-        start = end
-    return spans
-
-
-def _padded_grid_axis(length: int, count: int) -> dict[str, Any]:
-    cell_size = max(1, math.ceil(length / count))
-    padded_length = cell_size * count
-    total_pad = padded_length - length
-    leading_pad = total_pad // 2
-    trailing_pad = total_pad - leading_pad
-    spans = [
-        (index * cell_size, (index + 1) * cell_size)
-        for index in range(count)
-    ]
-    return {
-        "cell_size": cell_size,
-        "padded_length": padded_length,
-        "leading_pad": leading_pad,
-        "trailing_pad": trailing_pad,
-        "spans": spans,
-    }
-
-
-def _layer_split_spans(length: int, count: int, layer_index: int, overlap_pixels: int) -> list[tuple[int, int]]:
-    base_spans = _partition_length(length, count)
-    if overlap_pixels <= 0 or count <= 1:
-        return base_spans
-
-    boundaries = [base_spans[0][0], *[end for _start, end in base_spans]]
-    adjusted = list(boundaries)
-    for boundary_index in range(1, len(boundaries) - 1):
-        direction = 1 if (layer_index + boundary_index) % 2 == 1 else -1
-        lower = adjusted[boundary_index - 1] + 1
-        upper = boundaries[boundary_index + 1] - 1
-        adjusted[boundary_index] = max(lower, min(upper, boundaries[boundary_index] + direction * overlap_pixels))
-    return [(adjusted[index], adjusted[index + 1]) for index in range(count)]
-
-
-def split_tiff_stack_grid(
-    state: ViewerState,
-    base_name: str = "split_shape",
-    columns: float = 2,
-    rows: float = 1,
-    overlapping_layers: bool | None = False,
-    progress: gr.Progress = gr.Progress(),
-) -> list[dict[str, Any]]:
-    tiff_paths = [Path(path) for path in state.get("tiff_paths", [])]
-    if not tiff_paths:
-        raise ValueError("Generate a TIFF stack for the selected shape before splitting it.")
-
-    with Image.open(tiff_paths[0]) as first_image:
-        width, height = first_image.size
-    column_count = max(1, _coerce_int(columns, 2))
-    row_count = max(1, _coerce_int(rows, 1))
-    if column_count > width:
-        raise ValueError(f"Cannot split {width}-pixel-wide TIFF slices into {column_count} columns.")
-    if row_count > height:
-        raise ValueError(f"Cannot split {height}-pixel-tall TIFF slices into {row_count} rows.")
-
-    safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in base_name).strip("_") or "split_shape"
-    output_dir = Path(tempfile.mkdtemp(prefix=f"{safe_name}_split_"))
-    x_axis = _padded_grid_axis(width, column_count)
-    y_axis = _padded_grid_axis(height, row_count)
-    x_spans = x_axis["spans"]
-    y_spans = y_axis["spans"]
-    overlap_pixels = 1 if overlapping_layers else 0
-    overlap_x = overlap_pixels if column_count > 1 else 0
-    overlap_y = overlap_pixels if row_count > 1 else 0
-    padded_width = int(x_axis["padded_length"])
-    padded_height = int(y_axis["padded_length"])
-    working_width = padded_width + (2 * overlap_x)
-    working_height = padded_height + (2 * overlap_y)
-    source_x = int(x_axis["leading_pad"]) + overlap_x
-    source_y = int(y_axis["leading_pad"]) + overlap_y
-    working_x_min = base_x_min = float(state.get("x_min", 0.0) or 0.0)
-    working_y_min = base_y_min = float(state.get("y_min", 0.0) or 0.0)
-    pixel_size = float(state.get("pixel_size", 0.0) or 0.0)
-    working_x_min = base_x_min - (source_x * pixel_size)
-    working_y_min = base_y_min - ((int(y_axis["trailing_pad"]) + overlap_y) * pixel_size)
-    pieces: list[dict[str, Any]] = []
-    for row_index, (y_start, y_end) in enumerate(y_spans, start=1):
-        for col_index, (x_start, x_end) in enumerate(x_spans, start=1):
-            piece_dir = output_dir / f"r{row_index:02d}_c{col_index:02d}_tiff_slices"
-            piece_dir.mkdir(parents=True, exist_ok=True)
-            pieces.append({
-                "row": row_index,
-                "col": col_index,
-                "x_start": x_start,
-                "x_end": x_end,
-                "y_start": y_start,
-                "y_end": y_end,
-                "tiff_dir": piece_dir,
-                "tiff_paths": [],
-            })
-
-    for index, source_path in enumerate(tiff_paths):
-        progress(index / max(len(tiff_paths), 1), desc=f"Splitting layer {index + 1}/{len(tiff_paths)}")
-        with Image.open(source_path) as image:
-            layer = image.convert("L")
-            if layer.size != (width, height):
-                raise ValueError("All TIFF slices must have the same dimensions to split the stack.")
-
-            padded_layer = Image.new("L", (working_width, working_height), 255)
-            padded_layer.paste(layer, (source_x, source_y))
-            layer_x_spans = [
-                (x_start + overlap_x, x_end + overlap_x)
-                for x_start, x_end in _layer_split_spans(
-                    padded_width,
-                    column_count,
-                    index,
-                    overlap_x,
-                )
-            ]
-            layer_y_spans = [
-                (y_start + overlap_y, y_end + overlap_y)
-                for y_start, y_end in _layer_split_spans(
-                    padded_height,
-                    row_count,
-                    index,
-                    overlap_y,
-                )
-            ]
-            for piece in pieces:
-                canvas_x_start = piece["x_start"]
-                canvas_x_end = piece["x_end"]
-                canvas_y_start = piece["y_start"]
-                canvas_y_end = piece["y_end"]
-                if overlapping_layers:
-                    canvas_x_start -= overlap_x
-                    canvas_x_end += overlap_x
-                    canvas_y_start -= overlap_y
-                    canvas_y_end += overlap_y
-                canvas_x_start += overlap_x
-                canvas_x_end += overlap_x
-                canvas_y_start += overlap_y
-                canvas_y_end += overlap_y
-                x_start, x_end = layer_x_spans[piece["col"] - 1]
-                y_start, y_end = layer_y_spans[piece["row"] - 1]
-                if overlapping_layers:
-                    piece_image = Image.new("L", (canvas_x_end - canvas_x_start, canvas_y_end - canvas_y_start), 255)
-                    piece_image.paste(
-                        padded_layer.crop((x_start, y_start, x_end, y_end)),
-                        (x_start - canvas_x_start, y_start - canvas_y_start),
-                    )
-                else:
-                    piece_image = padded_layer.crop((x_start, y_start, x_end, y_end))
-                piece_path = piece["tiff_dir"] / f"slice_{index:04d}.tif"
-                piece_image.save(piece_path, compression="tiff_deflate")
-                piece["tiff_paths"].append(piece_path)
-
-    z_values = list(state.get("z_values", []))
-    if len(z_values) < len(tiff_paths):
-        z_values.extend([0.0] * (len(tiff_paths) - len(z_values)))
-
-    for piece in pieces:
-        canvas_x_start = piece["x_start"]
-        canvas_x_end = piece["x_end"]
-        canvas_y_start = piece["y_start"]
-        canvas_y_end = piece["y_end"]
-        if overlapping_layers:
-            canvas_x_start -= overlap_x
-            canvas_x_end += overlap_x
-            canvas_y_start -= overlap_y
-            canvas_y_end += overlap_y
-        canvas_x_start += overlap_x
-        canvas_x_end += overlap_x
-        canvas_y_start += overlap_y
-        canvas_y_end += overlap_y
-        piece_width = canvas_x_end - canvas_x_start
-        piece_height = canvas_y_end - canvas_y_start
-        zip_path = output_dir / f"{safe_name}_r{piece['row']:02d}_c{piece['col']:02d}_tiff_slices.zip"
-        _zip_tiff_paths(piece["tiff_paths"], zip_path)
-        piece_state: ViewerState = {
-            "tiff_paths": [str(path) for path in piece["tiff_paths"]],
-            "z_values": z_values[: len(piece["tiff_paths"])],
-            "pixel_size": pixel_size,
-            "x_min": working_x_min + (canvas_x_start * pixel_size),
-            "y_min": working_y_min + ((working_height - canvas_y_end) * pixel_size),
-            "image_width": piece_width,
-            "image_height": piece_height,
-            "zip_path": str(zip_path),
-            "overlapping_layers": bool(overlapping_layers),
-        }
-        piece["state"] = piece_state
-        piece["zip_path"] = zip_path
-    return pieces
-
-
-def split_tiff_stack_left_right(
-    state: ViewerState,
-    base_name: str = "split_shape",
-    progress: gr.Progress = gr.Progress(),
-) -> tuple[ViewerState, ViewerState, Path, Path]:
-    pieces = split_tiff_stack_grid(state, base_name=base_name, columns=2, rows=1, progress=progress)
-    return pieces[0]["state"], pieces[1]["state"], pieces[0]["zip_path"], pieces[1]["zip_path"]
-
-
 SHAPE_SETTINGS_HEADERS = [
     "Shape",
     "STL",
@@ -2234,8 +1661,8 @@ def _records_from_files(files: Any, previous_records: list[dict] | None = None) 
             "port": previous.get("port", 1),
             "color": previous.get("color", _default_color(index)),
             "contour_tracing": previous.get("contour_tracing", False),
-            "tiff_state": previous.get("tiff_state", _empty_state()),
-            "zip_path": previous.get("zip_path"),
+            "layer_stack": previous.get("layer_stack"),
+            "slice_params": previous.get("slice_params"),
             "gcode_path": previous.get("gcode_path"),
         })
     return records
@@ -2697,7 +2124,6 @@ def sync_uploaded_shapes(
         _dropdown_update(next_records),
         _gcode_dropdown_update(next_records),
         _gcode_dropdown_update(next_records, include_upload=True),
-        [record.get("zip_path") for record in next_records if record.get("zip_path")],
         [record.get("gcode_path") for record in next_records if record.get("gcode_path")],
     )
 
@@ -2741,7 +2167,6 @@ def _shape_delete_outputs(
         _dropdown_update(records),
         _gcode_dropdown_update(records),
         _gcode_dropdown_update(records, include_upload=True),
-        [record.get("zip_path") for record in records if record.get("zip_path")],
         [record.get("gcode_path") for record in records if record.get("gcode_path")],
         float(last_delete_at or 0.0),
     )
@@ -2889,9 +2314,9 @@ def show_selected_model(
     records = _apply_shape_settings(records or [], settings_table)
     pos = _selected_record_index(records, selected)
     if pos < 0:
-        return _viewer_update(None), "No model loaded.", _reset_slider(), "No slice stack loaded yet.", None
+        return _viewer_update(None), "No model loaded."
     record = records[pos]
-    viewer, details = load_single_model(
+    return load_single_model(
         record.get("stl_path"),
         opacity,
         True,
@@ -2900,185 +2325,89 @@ def show_selected_model(
         record.get("target_y"),
         record.get("target_z"),
     )
-    state = record.get("tiff_state") or _empty_state()
-    label, preview = _render_selected_slice(state, 0)
-    slider = gr.update(
-        minimum=0,
-        maximum=max(0, len(state.get("tiff_paths", [])) - 1),
-        value=0,
-        step=1,
-        interactive=len(state.get("tiff_paths", [])) > 1,
+
+
+def _slice_params_snapshot(record: dict, layer_height: float, scale_mode: str | None) -> dict:
+    return {
+        "layer_height": float(layer_height),
+        "scale_mode": _normalize_scale_mode(scale_mode),
+        "target_x": record.get("target_x"),
+        "target_y": record.get("target_y"),
+        "target_z": record.get("target_z"),
+    }
+
+
+def _slice_record(
+    record: dict,
+    layer_height: float,
+    scale_mode: str | None,
+    progress_callback=None,
+) -> LayerStack:
+    stl_path = record["stl_path"]
+    mesh = load_mesh(stl_path)
+    scale_factors = _resolve_mesh_scale_factors(
+        mesh,
+        True,
+        scale_mode,
+        record.get("target_x"),
+        record.get("target_y"),
+        record.get("target_z"),
     )
-    return viewer, details, slider, label, preview
-
-
-def jump_to_selected_slice(records: list[dict] | None, selected: str | None, index: float) -> tuple[str, Image.Image | None]:
-    pos = _selected_record_index(records or [], selected)
-    if pos < 0:
-        return "No slice stack loaded yet.", None
-    return _render_selected_slice((records or [])[pos].get("tiff_state") or _empty_state(), int(index))
-
-
-def shift_selected_slice(records: list[dict] | None, selected: str | None, index: float, delta: int) -> tuple:
-    pos = _selected_record_index(records or [], selected)
-    if pos < 0:
-        return gr.update(value=0), "No slice stack loaded yet.", None
-    state = (records or [])[pos].get("tiff_state") or _empty_state()
-    paths = state.get("tiff_paths", [])
-    if not paths:
-        return gr.update(value=0), "No slice stack loaded yet.", None
-    next_index = max(0, min(int(index) + delta, len(paths) - 1))
-    label, preview = _render_selected_slice(state, next_index)
-    return gr.update(value=next_index), label, preview
-
-
-def _tiff_preview_update(records: list[dict], selected: str | None = None) -> tuple[dict[str, Any], dict[str, Any], str, Image.Image | None]:
-    dropdown = _dropdown_update(records, selected)
-    selected_value = dropdown.get("value") if isinstance(dropdown, dict) else selected
-    pos = _selected_record_index(records, selected_value)
-    state = (records[pos].get("tiff_state") if pos >= 0 else None) or _empty_state()
-    label, preview = _render_selected_slice(state, 0)
-    slider = gr.update(
-        minimum=0,
-        maximum=max(0, len(state.get("tiff_paths", [])) - 1),
-        value=0,
-        step=1,
-        interactive=len(state.get("tiff_paths", [])) > 1,
+    stack = slice_stl_to_layers(
+        stl_path,
+        layer_height=float(layer_height),
+        progress_callback=progress_callback,
+        scale_factors=scale_factors,
+        name=str(record.get("name") or Path(stl_path).stem),
     )
-    return dropdown, slider, label, preview
+    record["layer_stack"] = stack
+    record["slice_params"] = _slice_params_snapshot(record, layer_height, scale_mode)
+    return stack
 
 
-def generate_dynamic_stacks(
+def generate_dynamic_layer_stacks(
     records: list[dict] | None,
     settings_table: Any,
     layer_height: float,
-    pixel_size: float,
     scale_mode: str | None,
     progress: gr.Progress = gr.Progress(),
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
     if not records:
-        return (
-            records,
-            [],
-            "Upload at least one STL first.",
-            _dropdown_update(records),
-            _reset_slider(),
-            "No slice stack loaded yet.",
-            None,
-            _empty_state(),
-            _reset_slider(),
-            "No reference stack generated yet.",
-            None,
-        )
+        return records, "Upload at least one STL first.", None
     total = len(records)
     messages: list[str] = []
     for pos, record in enumerate(records):
         stl_path = record.get("stl_path")
         if not stl_path:
-            messages.append(f"Shape {record['idx']}: skipped (no STL file).")
+            if record.get("layer_stack") is not None:
+                messages.append(f"Shape {record['idx']}: kept existing split-piece slices.")
+            else:
+                messages.append(f"Shape {record['idx']}: skipped (no STL file).")
             continue
 
         def report_progress(cur: int, tot: int, offset: int = pos) -> None:
             progress((offset + cur / tot) / total, desc=f"Slicing shape {offset + 1} of {total}...")
 
-        mesh = load_mesh(stl_path)
-        scale_factors = _resolve_mesh_scale_factors(
-            mesh,
-            True,
-            scale_mode,
-            record.get("target_x"),
-            record.get("target_y"),
-            record.get("target_z"),
-        )
         try:
-            stack = slice_stl_to_tiffs(
-                stl_path,
-                layer_height=float(layer_height),
-                pixel_size=float(pixel_size),
-                progress_callback=report_progress,
-                scale_factors=scale_factors,
+            stack = _slice_record(record, layer_height, scale_mode, report_progress)
+            (x_min, y_min, _z_min), (x_max, y_max, _z_max) = stack.bounds
+            messages.append(
+                f"Shape {record['idx']}: sliced {len(stack.layers)} layers "
+                f"(footprint {x_max - x_min:.2f} x {y_max - y_min:.2f} mm)."
             )
-            record["tiff_state"] = _stack_to_state(stack)
-            record["zip_path"] = str(stack.zip_path)
-            messages.append(f"Shape {record['idx']}: wrote `{stack.zip_path.name}`.")
         except Exception as exc:
             messages.append(f"Shape {record['idx']}: failed ({exc}).")
-    ref_state, ref_slider, ref_label, ref_preview = generate_dynamic_reference_stack(records, progress=progress)
-    if (ref_state or {}).get("tiff_paths"):
-        messages.append("Reference TIFF Stack: updated automatically.")
+    ref_layers = generate_dynamic_reference_stack(records)
+    if ref_layers is not None:
+        messages.append("Reference layers: updated automatically.")
     else:
-        messages.append("Reference TIFF Stack: skipped (no generated shape slices available).")
-    selected_update, slider, label, preview = _tiff_preview_update(records)
-    return (
-        records,
-        [record.get("zip_path") for record in records if record.get("zip_path")],
-        "\n".join(messages),
-        selected_update,
-        slider,
-        label,
-        preview,
-        ref_state,
-        ref_slider,
-        ref_label,
-        ref_preview,
-    )
+        messages.append("Reference layers: skipped (no sliced shapes available).")
+    return records, "\n".join(messages), ref_layers
 
 
-def generate_dynamic_reference_stack(records: list[dict] | None, progress: gr.Progress = gr.Progress()) -> tuple:
-    states = [record.get("tiff_state") or _empty_state() for record in (records or [])]
-    return generate_reference_stack(*states, progress=progress)
-
-
-def _split_piece_choice(piece: dict[str, Any]) -> str:
-    return f"R{piece['row']} C{piece['col']}"
-
-
-def _split_piece_dropdown_update(pieces: list[dict[str, Any]], selected: str | None = None) -> dict[str, Any]:
-    choices = [_split_piece_choice(piece) for piece in pieces]
-    value = selected if selected in choices else (choices[0] if choices else None)
-    return gr.update(choices=choices, value=value)
-
-
-def _selected_split_piece(pieces: list[dict[str, Any]] | None, selected: str | None) -> dict[str, Any] | None:
-    if not pieces:
-        return None
-    for piece in pieces:
-        if _split_piece_choice(piece) == selected:
-            return piece
-    return pieces[0]
-
-
-def preview_selected_split_piece(pieces: list[dict[str, Any]] | None, selected: str | None) -> tuple:
-    piece = _selected_split_piece(pieces, selected)
-    if not piece:
-        return _reset_slider(), "No split stack generated yet.", None
-    state = piece.get("state") or _empty_state()
-    label, preview = _render_selected_slice(state, 0)
-    slider = gr.update(
-        minimum=0,
-        maximum=max(0, len(state.get("tiff_paths", [])) - 1),
-        value=0,
-        step=1,
-        interactive=len(state.get("tiff_paths", [])) > 1,
-    )
-    return slider, label, preview
-
-
-def jump_to_selected_split_piece(pieces: list[dict[str, Any]] | None, selected: str | None, index: float) -> tuple:
-    piece = _selected_split_piece(pieces, selected)
-    if not piece:
-        return "No split stack generated yet.", None
-    return _render_selected_slice(piece.get("state") or _empty_state(), int(index))
-
-
-def shift_selected_split_piece(pieces: list[dict[str, Any]] | None, selected: str | None, index: float, delta: int) -> tuple:
-    piece = _selected_split_piece(pieces, selected)
-    if not piece:
-        return gr.update(value=0), "No split stack generated yet.", None
-    state = piece.get("state") or _empty_state()
-    new_index, label, preview = shift_slice(state, index, delta)
-    return gr.update(value=new_index), label, preview
+def generate_dynamic_reference_stack(records: list[dict] | None) -> LayerStack | None:
+    return build_reference_stack([record.get("layer_stack") for record in (records or [])])
 
 
 def split_selected_shape_for_grid(
@@ -3092,151 +2421,136 @@ def split_selected_shape_for_grid(
     overlapping_layers: bool,
     starting_nozzle: float,
     starting_valve: float,
-    progress: gr.Progress = gr.Progress(),
+    fil_width: float,
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
-    if not records:
-        empty = _empty_state()
+
+    def _outputs(next_records: list[dict], selected_value: str | None, status: str) -> tuple:
         return (
-            records,
-            _shape_settings_rows(records),
-            _spacing_table_update(records, existing_spacing, use_individual_spacing),
-            _dropdown_update(records),
-            _reset_slider(),
-            "No slice stack loaded yet.",
-            None,
-            [],
-            [],
-            _gcode_dropdown_update(records),
-            _gcode_dropdown_update(records, include_upload=True),
-            _dropdown_update(records),
-            [],
-            [],
-            _split_piece_dropdown_update([]),
-            _reset_slider(),
-            "No split stack generated yet.",
-            None,
-            "Generate TIFF stacks for a shape before splitting it.",
+            next_records,
+            _shape_settings_rows(next_records),
+            _spacing_table_update(next_records, existing_spacing, use_individual_spacing),
+            _dropdown_update(next_records, selected_value),
+            [record.get("gcode_path") for record in next_records if record.get("gcode_path")],
+            _gcode_dropdown_update(next_records),
+            _gcode_dropdown_update(next_records, include_upload=True),
+            _dropdown_update(next_records, selected_value),
+            status,
         )
+
+    if not records:
+        return _outputs(records, None, "Slice a shape before splitting it.")
 
     pos = _selected_record_index(records, selected)
     if pos < 0:
         pos = 0
     source = records[pos]
-    state = source.get("tiff_state") or _empty_state()
+    stack = source.get("layer_stack")
+    if stack is None or not getattr(stack, "layers", None):
+        return _outputs(
+            records,
+            selected,
+            f"Split failed: Shape {source.get('idx', pos + 1)} has no sliced layers yet - press Slice Shapes first.",
+        )
+
+    split_column_count = max(1, _coerce_int(columns, 2))
+    split_row_count = max(1, _coerce_int(rows, 1))
     try:
-        pieces = split_tiff_stack_grid(
-            state,
-            base_name=str(source.get("name") or f"shape_{source.get('idx', pos + 1)}"),
-            columns=columns,
-            rows=rows,
-            overlapping_layers=overlapping_layers,
-            progress=progress,
+        pieces = split_layer_stack_grid(
+            stack,
+            columns=split_column_count,
+            rows=split_row_count,
+            overlapping_layers=bool(overlapping_layers),
+            overlap=float(fil_width) if overlapping_layers else 0.0,
         )
     except Exception as exc:
-        empty = _empty_state()
-        return (
-            records,
-            _shape_settings_rows(records),
-            _spacing_table_update(records, existing_spacing, use_individual_spacing),
-            _dropdown_update(records, selected),
-            _reset_slider(),
-            "No slice stack loaded yet.",
-            None,
-            [record.get("zip_path") for record in records if record.get("zip_path")],
-            [record.get("gcode_path") for record in records if record.get("gcode_path")],
-            _gcode_dropdown_update(records),
-            _gcode_dropdown_update(records, include_upload=True),
-            _dropdown_update(records, selected),
-            [],
-            [],
-            _split_piece_dropdown_update([]),
-            _reset_slider(),
-            "No split stack generated yet.",
-            None,
-            f"Split failed: {exc}",
-        )
+        return _outputs(records, selected, f"Split failed: {exc}")
 
     base_name = str(source.get("name") or f"Shape {source.get('idx', pos + 1)}")
     first_nozzle = max(1, _coerce_int(starting_nozzle, 1))
     first_valve = max(1, _coerce_int(starting_valve, _coerce_int(source.get("valve", 4), 4)))
-    split_column_count = max(1, _coerce_int(columns, 2))
-    split_row_count = max(1, _coerce_int(rows, 1))
     split_group_id = f"split-{int(time.time() * 1_000_000)}-{source.get('idx', pos + 1)}"
     split_records: list[dict] = []
     for index, piece in enumerate(pieces):
-        piece_state = piece["state"]
-        piece_width_mm = float(piece_state.get("image_width", 0) or 0) * float(piece_state.get("pixel_size", 0.0) or 0.0)
-        piece_height_mm = float(piece_state.get("image_height", 0) or 0) * float(piece_state.get("pixel_size", 0.0) or 0.0)
+        row_index = index // split_column_count + 1
+        col_index = index % split_column_count + 1
+        (piece_x_min, piece_y_min, _z_min), (piece_x_max, piece_y_max, _z_max) = piece.bounds
         piece_record = dict(source)
         piece_record.update({
-            "name": f"{base_name} - R{piece['row']}C{piece['col']}",
+            "name": f"{base_name} - R{row_index}C{col_index}",
             "stl_path": None,
-            "target_x": piece_width_mm or source.get("target_x", DEFAULT_TARGET_EXTENTS[0]),
-            "target_y": piece_height_mm or source.get("target_y", DEFAULT_TARGET_EXTENTS[1]),
+            "target_x": (piece_x_max - piece_x_min) or source.get("target_x", DEFAULT_TARGET_EXTENTS[0]),
+            "target_y": (piece_y_max - piece_y_min) or source.get("target_y", DEFAULT_TARGET_EXTENTS[1]),
             "nozzle": first_nozzle + index,
             "valve": first_valve + index,
             "split_group_id": split_group_id,
             "split_index": index,
-            "split_row": int(piece["row"]),
-            "split_col": int(piece["col"]),
+            "split_row": row_index,
+            "split_col": col_index,
             "split_rows": split_row_count,
             "split_columns": split_column_count,
-            "tiff_state": piece_state,
-            "zip_path": str(piece["zip_path"]),
+            "layer_stack": piece,
+            "slice_params": source.get("slice_params"),
             "gcode_path": None,
         })
         split_records.append(piece_record)
     next_records = _reindex_shape_records([*records[:pos], *split_records, *records[pos + 1:]])
     split_selected = _shape_choice(next_records[pos]) if pos < len(next_records) else None
-    selected_update, main_slider, main_label, main_preview = _tiff_preview_update(next_records, split_selected)
-    slider, label, preview = preview_selected_split_piece(pieces, None)
     status = (
-        f"Split Shape {source.get('idx', pos + 1)} into {len(pieces)} print-ready stacks "
-        f"({max(1, _coerce_int(columns, 2))} columns x {max(1, _coerce_int(rows, 1))} rows).  \n"
+        f"Split Shape {source.get('idx', pos + 1)} into {len(pieces)} print-ready piece stacks "
+        f"({split_column_count} columns x {split_row_count} rows).  \n"
         f"Nozzles {first_nozzle}-{first_nozzle + len(pieces) - 1}; valves {first_valve}-{first_valve + len(pieces) - 1}."
     )
     if overlapping_layers:
-        status += "  \nOverlapping Layers is enabled: split boundaries alternate by 1 pixel per layer with small blank margins for alignment."
-    return (
-        next_records,
-        _shape_settings_rows(next_records),
-        _spacing_table_update(next_records, existing_spacing, use_individual_spacing),
-        selected_update,
-        main_slider,
-        main_label,
-        main_preview,
-        [record.get("zip_path") for record in next_records if record.get("zip_path")],
-        [record.get("gcode_path") for record in next_records if record.get("gcode_path")],
-        _gcode_dropdown_update(next_records),
-        _gcode_dropdown_update(next_records, include_upload=True),
-        _dropdown_update(next_records),
-        [str(piece["zip_path"]) for piece in pieces],
-        pieces,
-        _split_piece_dropdown_update(pieces),
-        slider,
-        label,
-        preview,
-        status,
-    )
+        status += (
+            "  \nOverlapping Layers is enabled: split boundaries alternate by one "
+            "filament width per layer so neighbouring pieces interlock."
+        )
+    return _outputs(next_records, split_selected, status)
 
 
-def _contour_tracing_sources(records: list[dict]) -> list[dict]:
-    sources: list[dict] = []
+def _contour_tracing_sources(records: list[dict]) -> list[ContourSource]:
+    sources: list[ContourSource] = []
     for record in records:
         if not record.get("contour_tracing"):
             continue
-        state = record.get("tiff_state") or {}
-        tiff_paths = state.get("tiff_paths") or []
-        source = {
-            "owner_idx": int(record.get("idx", len(sources) + 1)),
-            "contour_mode": CONTOUR_MODE_ROW_ENVELOPE,
-            "tiff_paths": list(tiff_paths),
-            "zip_path": record.get("zip_path"),
-        }
-        if source["tiff_paths"] or source["zip_path"]:
-            sources.append(source)
+        stack = record.get("layer_stack")
+        if stack is None or not getattr(stack, "layers", None):
+            continue
+        sources.append(
+            ContourSource(
+                owner_idx=int(record.get("idx", len(sources) + 1)),
+                stack=stack,
+            )
+        )
     return sources
+
+
+def _ensure_records_sliced(
+    records: list[dict],
+    layer_height: float,
+    scale_mode: str | None,
+    messages: list[str],
+) -> bool:
+    """Re-slice records whose layers are missing or stale for the current settings."""
+    resliced = False
+    for record in records:
+        stl_path = record.get("stl_path")
+        if not stl_path:
+            continue  # Split pieces carry their clipped layers; nothing to re-slice.
+        current = _slice_params_snapshot(record, layer_height, scale_mode)
+        if record.get("layer_stack") is not None and record.get("slice_params") == current:
+            continue
+        try:
+            stack = _slice_record(record, layer_height, scale_mode)
+            messages.append(
+                f"Shape {record['idx']}: sliced automatically ({len(stack.layers)} layers)."
+            )
+        except Exception as exc:
+            record["layer_stack"] = None
+            messages.append(f"Shape {record['idx']}: slicing failed ({exc}).")
+        resliced = True
+    return resliced
 
 
 def generate_dynamic_gcode(
@@ -3250,40 +2564,43 @@ def generate_dynamic_gcode(
     lead_in_length: float,
     lead_in_clearance: float,
     lead_in_lines: float,
-    ref_state: ViewerState | None,
+    ref_layers: LayerStack | None,
     layer_height: float,
-    pixel_size: float,
+    fil_width: float,
+    scale_mode: str | None,
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
-    motion_tiffs = (ref_state or {}).get("tiff_paths") if use_reference_motion else None
-    contour_sources = _contour_tracing_sources(records)
     messages: list[str] = []
+    if _ensure_records_sliced(records, layer_height, scale_mode, messages):
+        # Anything re-sliced invalidates the previous reference union.
+        ref_layers = generate_dynamic_reference_stack(records)
+    contour_sources = _contour_tracing_sources(records)
     if contour_sources:
-        enabled = ", ".join(f"Shape {source['owner_idx']}" for source in contour_sources)
-        messages.append(f"Shape-optimized contour tracing enabled for {enabled}.")
+        enabled = ", ".join(f"Shape {source.owner_idx}" for source in contour_sources)
+        messages.append(f"Contour tracing enabled for {enabled}.")
     for record in records:
-        zip_path = record.get("zip_path")
-        if not zip_path:
-            messages.append(f"Shape {record['idx']}: skipped (no TIFF ZIP available).")
+        stack = record.get("layer_stack")
+        if stack is None or not getattr(stack, "layers", None):
+            messages.append(f"Shape {record['idx']}: skipped (no sliced layers).")
             continue
-        if use_reference_motion and not motion_tiffs:
-            messages.append(f"Shape {record['idx']}: skipped (Reference motion selected, but no Reference TIFF Stack exists).")
+        if use_reference_motion and ref_layers is None:
+            messages.append(f"Shape {record['idx']}: skipped (Reference motion selected, but no shapes are sliced).")
             continue
-        shape_name = str(record.get("name") or Path(zip_path).stem).replace(" ", "_")
+        shape_name = str(record.get("name") or stack.name or f"shape_{record['idx']}").replace(" ", "_")
         try:
-            gcode_path = generate_snake_path_gcode(
-                zip_path=zip_path,
+            gcode_path = generate_vector_gcode(
+                stack,
                 shape_name=shape_name,
                 pressure=float(record.get("pressure", 25.0)),
                 valve=int(record.get("valve", 4)),
                 port=int(record.get("port", 1)),
                 layer_height=float(layer_height),
-                fil_width=float(pixel_size),
+                fil_width=float(fil_width),
                 pressure_ramp_enabled=bool(pressure_ramp_enabled),
                 all_g1=bool(all_g1),
-                motion_tiffs=motion_tiffs,
+                motion=ref_layers if use_reference_motion else None,
                 raster_pattern=raster_pattern,
-                contour_tiff_sets=contour_sources,
+                contour_sources=contour_sources,
                 active_contour_owner=int(record.get("idx", 0)),
                 lead_in_enabled=bool(lead_in_enabled),
                 lead_in_length=float(lead_in_length),
@@ -3296,6 +2613,7 @@ def generate_dynamic_gcode(
             messages.append(f"Shape {record['idx']}: failed ({exc}).")
     return (
         records,
+        ref_layers,
         [record.get("gcode_path") for record in records if record.get("gcode_path")],
         "\n".join(messages),
         _gcode_dropdown_update(records),
@@ -3323,7 +2641,7 @@ def _parts_from_records(records: list[dict] | None) -> tuple[list[dict], list[st
         path = record.get("gcode_path")
         idx = int(record.get("idx", len(parts) + 1))
         if not path:
-            messages.append(f"Shape {idx}: no G-code (generate it on the TIFF Slices to GCode tab).")
+            messages.append(f"Shape {idx}: no G-code (generate it on the Generate G-Code tab).")
             continue
         try:
             parsed = parse_gcode_path(Path(path).read_text())
@@ -3461,7 +2779,7 @@ def render_dynamic_parallel(
     records = _apply_shape_settings(records or [], settings_table)
     parts, messages = _parts_from_records(records)
     if not parts:
-        return None, "No shape G-code available. Generate G-code on the TIFF Slices to GCode tab first."
+        return None, "No shape G-code available. Generate G-code on the Generate G-Code tab first."
     offsets, spacings = _resolve_layout_from_spacing_controls(
         parts,
         layout_mode,
@@ -3556,17 +2874,16 @@ def export_dynamic_parallel_gif(
     return str(result) if result else None
 
 def build_dynamic_demo() -> gr.Blocks:
-    with gr.Blocks(title="STL TIFF Slicer", css=APP_CSS, head=APP_HEAD + TOOLPATH_ANIM_HEAD + PARALLEL_ANIM_HEAD) as demo:
+    with gr.Blocks(title="ParallelPrint: STL to G-Code", css=APP_CSS, head=APP_HEAD + TOOLPATH_ANIM_HEAD + PARALLEL_ANIM_HEAD) as demo:
         shape_records = gr.State([])
         last_shape_delete_at = gr.State(0.0)
-        ref_state = gr.State(_empty_state())
-        split_piece_states = gr.State([])
+        ref_layers = gr.State(None)
 
-        with gr.Tab("STL to TIFF Slicer"):
+        with gr.Tab("Shapes & Slicing"):
             gr.Markdown(
                 """
-                # STL to TIFF Slicer
-                Upload any number of STL files, edit per-shape dimensions and print settings in the table, then generate TIFF stacks.
+                # Shapes & Slicing
+                Upload any number of STL files, edit per-shape dimensions and print settings in the table, then slice each shape into per-layer outlines.
                 """
             )
             with gr.Row():
@@ -3600,8 +2917,8 @@ def build_dynamic_demo() -> gr.Blocks:
             )
             with gr.Row():
                 layer_height = gr.Number(label="Layer Height (mm)", value=0.8, minimum=0.0001, step=0.01)
-                pixel_size = gr.Number(label="Pixel Size/Fill Width (mm)", value=0.8, minimum=0.0001, step=0.01)
-                generate_button = gr.Button("Generate TIFF Stacks", variant="primary")
+                fil_width = gr.Number(label="Filament/Line Width (mm)", value=0.8, minimum=0.0001, step=0.01)
+                generate_button = gr.Button("Slice Shapes", variant="primary")
 
             with gr.Accordion("Multi-Nozzle Split", open=False, elem_classes=["settings-accordion"]):
                 with gr.Row():
@@ -3614,18 +2931,7 @@ def build_dynamic_demo() -> gr.Blocks:
                     split_start_valve = gr.Number(label="Starting Valve", value=4, minimum=1, step=1)
                 split_overlapping_layers = gr.Checkbox(label="Overlapping Layers", value=False)
                 split_button = gr.Button("Split Selected Shape into Grid Pieces", variant="primary")
-                split_status = gr.Markdown("Generate a TIFF stack, then split it for multi-nozzle printing.")
-                split_downloads = gr.File(label="Download Split TIFF ZIPs", file_count="multiple", interactive=False)
-                with gr.Row():
-                    with gr.Column(scale=1, min_width=260):
-                        split_piece_source = gr.Dropdown(label="Preview Generated Piece", choices=[], value=None, allow_custom_value=False)
-                        with gr.Row():
-                            split_piece_prev = gr.Button("Prev", scale=1, min_width=90, size="sm")
-                            split_piece_next = gr.Button("Next", scale=1, min_width=90, size="sm")
-                        split_piece_slider = gr.Slider(label="Piece Slice Index", minimum=0, maximum=0, value=0, step=1, interactive=False)
-                        split_piece_label = gr.Markdown("No split stack generated yet.")
-                    with gr.Column(scale=2, min_width=420):
-                        split_piece_preview = gr.Image(label="Generated Piece Preview", type="pil", image_mode="RGB", height=330)
+                split_status = gr.Markdown("Slice a shape, then split it for multi-nozzle printing.")
 
             with gr.Accordion("Selected Shape Preview", open=False, elem_classes=["settings-accordion"]):
                 with gr.Row():
@@ -3644,40 +2950,17 @@ def build_dynamic_demo() -> gr.Blocks:
                     with gr.Column(scale=1, min_width=300):
                         model_details = gr.Markdown("No model loaded.")
 
-                with gr.Row():
-                    with gr.Column(scale=2, min_width=420):
-                        slice_preview = gr.Image(label="Selected Slice Preview", type="pil", image_mode="RGB", height=320)
-                    with gr.Column(scale=1, min_width=300):
-                        slice_label = gr.Markdown("No slice stack loaded yet.")
-                        with gr.Row():
-                            prev_button = gr.Button("Prev", scale=1, min_width=90, size="sm")
-                            next_button = gr.Button("Next", scale=1, min_width=90, size="sm")
-                        slice_slider = gr.Slider(label="Slice Index", minimum=0, maximum=0, value=0, step=1, interactive=False)
-
-            tiff_downloads = gr.File(label="Download TIFF ZIPs", file_count="multiple", interactive=False)
             slicer_status = gr.Markdown("")
 
-            with gr.Accordion("Reference TIFF Stack Preview", open=False, elem_classes=["settings-accordion"]):
-                with gr.Row():
-                    with gr.Column(scale=1, min_width=200):
-                        ref_generate_button = gr.Button("Generate Reference TIFF Stack", variant="primary")
-                    with gr.Column(scale=3, min_width=250):
-                        ref_slice_label = gr.Markdown("No reference stack generated yet.")
-                        ref_slice_preview = gr.Image(label="Reference Slice Preview", type="pil", image_mode="RGB", height=270)
-                        with gr.Row():
-                            ref_prev_button = gr.Button("Prev", scale=1, min_width=90, size="sm")
-                            ref_next_button = gr.Button("Next", scale=1, min_width=90, size="sm")
-                        ref_slice_slider = gr.Slider(label="Slice Index", minimum=0, maximum=0, value=0, step=1, interactive=False)
-
-        with gr.Tab("TIFF Slices to GCode"):
+        with gr.Tab("Generate G-Code"):
             gr.Markdown(
                 """
-                # TIFF Slices to GCode
-                Generate G-code for every shape with a TIFF stack. Pressure, valve, nozzle, port, and color come from the Shape Settings table.
+                # Generate G-Code
+                Generate G-code for every sliced shape. Pressure, valve, nozzle, port, and color come from the Shape Settings table.
                 """
             )
             gcode_use_ref_motion = gr.Checkbox(
-                label="Use Reference Stack for motion (all shapes share one nozzle path; each dispenses only its own geometry).",
+                label="Use combined reference outline for motion (all shapes share one nozzle path; each dispenses only its own geometry).",
                 value=True,
             )
             gcode_all_g1 = gr.Checkbox(label="Move at one constant speed (no fast travel moves)", value=True)
@@ -3798,7 +3081,7 @@ def build_dynamic_demo() -> gr.Blocks:
         with gr.Tab("Parallel Printing Visualization"):
             gr.Markdown(
                 "### Parallel Printing Visualization\n"
-                "Plots all generated shapes using the nozzle spacing configured on the TIFF Slices to GCode tab."
+                "Plots all generated shapes using the nozzle spacing configured on the Generate G-Code tab."
             )
             with gr.Row():
                 with gr.Column(scale=1, min_width=340):
@@ -3837,7 +3120,7 @@ def build_dynamic_demo() -> gr.Blocks:
             nozzle_grid_use_individual_spacing,
         ]
 
-        shape_sync_outputs = [shape_records, shape_settings, nozzle_spacing_table, selected_shape, gcode_text_source, gcode_source, tiff_downloads, gcode_downloads]
+        shape_sync_outputs = [shape_records, shape_settings, nozzle_spacing_table, selected_shape, gcode_text_source, gcode_source, gcode_downloads]
         stl_upload.change(fn=sync_uploaded_shapes, inputs=[stl_upload, shape_records, shape_settings, nozzle_spacing_table, nozzle_use_individual_spacing], outputs=shape_sync_outputs).then(
             fn=lambda records: _dropdown_update(records),
             inputs=[shape_records],
@@ -3899,9 +3182,9 @@ def build_dynamic_demo() -> gr.Blocks:
             outputs=[nozzle_grid_spacing_table],
             queue=False,
         )
-        selected_shape.change(fn=show_selected_model, inputs=preview_inputs, outputs=[model_viewer, model_details, slice_slider, slice_label, slice_preview])
-        refresh_preview_button.click(fn=show_selected_model, inputs=preview_inputs, outputs=[model_viewer, model_details, slice_slider, slice_label, slice_preview])
-        model_opacity.change(fn=show_selected_model, inputs=preview_inputs, outputs=[model_viewer, model_details, slice_slider, slice_label, slice_preview])
+        selected_shape.change(fn=show_selected_model, inputs=preview_inputs, outputs=[model_viewer, model_details])
+        refresh_preview_button.click(fn=show_selected_model, inputs=preview_inputs, outputs=[model_viewer, model_details])
+        model_opacity.change(fn=show_selected_model, inputs=preview_inputs, outputs=[model_viewer, model_details])
         scale_mode.change(
             fn=normalize_shape_dimensions_for_mode,
             inputs=[shape_records, shape_settings, scale_mode],
@@ -3910,7 +3193,7 @@ def build_dynamic_demo() -> gr.Blocks:
         ).then(
             fn=show_selected_model,
             inputs=preview_inputs,
-            outputs=[model_viewer, model_details, slice_slider, slice_label, slice_preview],
+            outputs=[model_viewer, model_details],
         )
         reset_dimensions_button.click(
             fn=reset_shape_dimensions,
@@ -3919,39 +3202,19 @@ def build_dynamic_demo() -> gr.Blocks:
         ).then(
             fn=show_selected_model,
             inputs=preview_inputs,
-            outputs=[model_viewer, model_details, slice_slider, slice_label, slice_preview],
+            outputs=[model_viewer, model_details],
         )
 
-        slice_slider.release(fn=jump_to_selected_slice, inputs=[shape_records, selected_shape, slice_slider], outputs=[slice_label, slice_preview], queue=False)
-        prev_button.click(fn=lambda records, selected, idx: shift_selected_slice(records, selected, idx, -1), inputs=[shape_records, selected_shape, slice_slider], outputs=[slice_slider, slice_label, slice_preview], queue=False)
-        next_button.click(fn=lambda records, selected, idx: shift_selected_slice(records, selected, idx, 1), inputs=[shape_records, selected_shape, slice_slider], outputs=[slice_slider, slice_label, slice_preview], queue=False)
-
         generate_button.click(
-            fn=generate_dynamic_stacks,
-            inputs=[shape_records, shape_settings, layer_height, pixel_size, scale_mode],
-            outputs=[
-                shape_records,
-                tiff_downloads,
-                slicer_status,
-                selected_shape,
-                slice_slider,
-                slice_label,
-                slice_preview,
-                ref_state,
-                ref_slice_slider,
-                ref_slice_label,
-                ref_slice_preview,
-            ],
+            fn=generate_dynamic_layer_stacks,
+            inputs=[shape_records, shape_settings, layer_height, scale_mode],
+            outputs=[shape_records, slicer_status, ref_layers],
         ).then(
             fn=lambda records: _dropdown_update(records),
             inputs=[shape_records],
             outputs=[split_source],
             queue=False,
         )
-        ref_generate_button.click(fn=generate_dynamic_reference_stack, inputs=[shape_records], outputs=[ref_state, ref_slice_slider, ref_slice_label, ref_slice_preview])
-        ref_slice_slider.release(fn=jump_to_slice, inputs=[ref_state, ref_slice_slider], outputs=[ref_slice_label, ref_slice_preview], queue=False)
-        ref_prev_button.click(fn=lambda sv, idx: shift_slice(sv, idx, -1), inputs=[ref_state, ref_slice_slider], outputs=[ref_slice_slider, ref_slice_label, ref_slice_preview], queue=False)
-        ref_next_button.click(fn=lambda sv, idx: shift_slice(sv, idx, 1), inputs=[ref_state, ref_slice_slider], outputs=[ref_slice_slider, ref_slice_label, ref_slice_preview], queue=False)
 
         split_refresh_sources.click(fn=lambda records: _dropdown_update(records), inputs=[shape_records], outputs=[split_source], queue=False)
         split_button.click(
@@ -3967,42 +3230,29 @@ def build_dynamic_demo() -> gr.Blocks:
                 split_overlapping_layers,
                 split_start_nozzle,
                 split_start_valve,
+                fil_width,
             ],
             outputs=[
                 shape_records,
                 shape_settings,
                 nozzle_spacing_table,
                 selected_shape,
-                slice_slider,
-                slice_label,
-                slice_preview,
-                tiff_downloads,
                 gcode_downloads,
                 gcode_text_source,
                 gcode_source,
                 split_source,
-                split_downloads,
-                split_piece_states,
-                split_piece_source,
-                split_piece_slider,
-                split_piece_label,
-                split_piece_preview,
                 split_status,
             ],
         ).then(
             fn=generate_dynamic_reference_stack,
             inputs=[shape_records],
-            outputs=[ref_state, ref_slice_slider, ref_slice_label, ref_slice_preview],
+            outputs=[ref_layers],
         ).then(
             fn=_grid_spacing_table_update,
             inputs=grid_spacing_refresh_inputs,
             outputs=[nozzle_grid_spacing_table],
             queue=False,
         )
-        split_piece_source.change(fn=preview_selected_split_piece, inputs=[split_piece_states, split_piece_source], outputs=[split_piece_slider, split_piece_label, split_piece_preview], queue=False)
-        split_piece_slider.release(fn=jump_to_selected_split_piece, inputs=[split_piece_states, split_piece_source, split_piece_slider], outputs=[split_piece_label, split_piece_preview], queue=False)
-        split_piece_prev.click(fn=lambda pieces, selected, idx: shift_selected_split_piece(pieces, selected, idx, -1), inputs=[split_piece_states, split_piece_source, split_piece_slider], outputs=[split_piece_slider, split_piece_label, split_piece_preview], queue=False)
-        split_piece_next.click(fn=lambda pieces, selected, idx: shift_selected_split_piece(pieces, selected, idx, 1), inputs=[split_piece_states, split_piece_source, split_piece_slider], outputs=[split_piece_slider, split_piece_label, split_piece_preview], queue=False)
 
         gcode_button.click(
             fn=generate_dynamic_gcode,
@@ -4017,11 +3267,12 @@ def build_dynamic_demo() -> gr.Blocks:
                 gcode_lead_in_length,
                 gcode_lead_in_clearance,
                 gcode_lead_in_lines,
-                ref_state,
+                ref_layers,
                 layer_height,
-                pixel_size,
+                fil_width,
+                scale_mode,
             ],
-            outputs=[shape_records, gcode_downloads, gcode_status, gcode_text_source, gcode_source],
+            outputs=[shape_records, ref_layers, gcode_downloads, gcode_status, gcode_text_source, gcode_source],
         ).then(
             fn=load_selected_gcode_text,
             inputs=[shape_records, gcode_text_source],

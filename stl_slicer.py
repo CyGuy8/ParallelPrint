@@ -1,33 +1,37 @@
 from __future__ import annotations
 
 import math
-import tempfile
-import uuid
-import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
 import numpy as np
-from PIL import Image, ImageDraw
 from shapely.geometry import GeometryCollection, MultiPolygon, Polygon
+from shapely.validation import make_valid
 import trimesh
 
 
 ProgressCallback = Callable[[int, int], None] | None
 ScaleFactors = tuple[float, float, float]
+Bounds3D = tuple[tuple[float, float, float], tuple[float, float, float]]
+
+MIN_POLYGON_AREA = 1e-9
 
 
 @dataclass(slots=True)
-class SliceStack:
-    output_dir: Path
-    zip_path: Path
-    tiff_paths: list[Path]
+class LayerStack:
+    """A sliced shape as per-layer vector outlines in world-XY millimetres.
+
+    `bounds` is the scaled mesh's axis-aligned bounding box. For grid-split
+    pieces it is the piece's nominal cell box, which keeps reference-stack
+    centring stable even when the clipped geometry shrinks.
+    """
+
+    layers: list[MultiPolygon]
     z_values: list[float]
-    image_size: tuple[int, int]
-    bounds: tuple[tuple[float, float, float], tuple[float, float, float]]
+    bounds: Bounds3D
     layer_height: float
-    pixel_size: float
+    name: str = ""
 
 
 def load_mesh(stl_path: str | Path) -> trimesh.Trimesh:
@@ -110,21 +114,6 @@ def calculate_z_levels(z_min: float, z_max: float, layer_height: float) -> list[
     ]
 
 
-def _to_pixel_ring(
-    coords: np.ndarray,
-    x_min: float,
-    y_min: float,
-    pixel_size: float,
-    image_height: int,
-) -> list[tuple[int, int]]:
-    pixels: list[tuple[int, int]] = []
-    for x_value, y_value in coords:
-        x_pixel = int(round((float(x_value) - x_min) / pixel_size))
-        y_pixel = int(round((float(y_value) - y_min) / pixel_size))
-        pixels.append((x_pixel, image_height - 1 - y_pixel))
-    return pixels
-
-
 def _ring_to_world_xy(ring_coords: object, to_3d: np.ndarray) -> np.ndarray:
     planar = np.asarray(ring_coords, dtype=float)
     if planar.ndim != 2 or planar.shape[1] < 2:
@@ -171,102 +160,75 @@ def _extract_world_polygons(section: trimesh.path.Path3D) -> list[tuple[np.ndarr
     return polygons
 
 
-def _render_slice(
-    section: trimesh.path.Path3D | None,
-    x_min: float,
-    y_min: float,
-    image_size: tuple[int, int],
-    pixel_size: float,
-) -> Image.Image:
-    image = Image.new("L", image_size, 255)
+def _as_multipolygon(geometry: object, min_area: float = MIN_POLYGON_AREA) -> MultiPolygon:
+    """Flatten any shapely result into a MultiPolygon, dropping slivers.
 
+    Single choke point for shapely's habit of returning mixed geometry types
+    from overlay operations (Polygon / MultiPolygon / GeometryCollection /
+    lines / points / empties).
+    """
+    polygons: list[Polygon] = []
+
+    def collect(geom: object) -> None:
+        if geom is None or getattr(geom, "is_empty", True):
+            return
+        if isinstance(geom, Polygon):
+            if geom.area > min_area:
+                polygons.append(geom)
+        elif isinstance(geom, (MultiPolygon, GeometryCollection)):
+            for part in geom.geoms:
+                collect(part)
+
+    collect(geometry)
+    return MultiPolygon(polygons)
+
+
+def _section_to_multipolygon(section: trimesh.path.Path3D | None) -> MultiPolygon:
     if section is None:
-        return image
+        return MultiPolygon()
 
-    polygons = _extract_world_polygons(section)
+    polygons = [
+        Polygon(exterior, holes)
+        for exterior, holes in _extract_world_polygons(section)
+    ]
     if not polygons:
-        return image
+        return MultiPolygon()
 
-    draw = ImageDraw.Draw(image)
-    for exterior, holes in polygons:
-        draw.polygon(
-            _to_pixel_ring(exterior, x_min, y_min, pixel_size, image.height),
-            fill=0,
-        )
-        for hole in holes:
-            draw.polygon(
-                _to_pixel_ring(hole, x_min, y_min, pixel_size, image.height),
-                fill=255,
-            )
-
-    return image
+    return _as_multipolygon(make_valid(MultiPolygon(polygons)))
 
 
-def _make_output_paths(stl_path: Path, output_root: str | Path | None) -> tuple[Path, Path]:
-    root = Path(output_root) if output_root else Path(tempfile.mkdtemp(prefix="stl_slices_"))
-    stem = stl_path.stem or "mesh"
-    job_dir = root / f"{stem}_{uuid.uuid4().hex[:8]}"
-    slices_dir = job_dir / "tiff_slices"
-    slices_dir.mkdir(parents=True, exist_ok=True)
-    zip_path = job_dir / f"{stem}_tiff_slices.zip"
-    return slices_dir, zip_path
-
-
-def _zip_tiffs(tiff_paths: list[Path], zip_path: Path) -> None:
-    with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for tiff_path in tiff_paths:
-            archive.write(tiff_path, arcname=tiff_path.name)
-
-
-def slice_stl_to_tiffs(
+def slice_stl_to_layers(
     stl_path: str | Path,
     layer_height: float,
-    pixel_size: float,
-    output_root: str | Path | None = None,
     progress_callback: ProgressCallback = None,
     scale_factors: Sequence[float] | None = None,
-) -> SliceStack:
-    if pixel_size <= 0:
-        raise ValueError("Pixel size must be greater than zero.")
-
+    name: str | None = None,
+) -> LayerStack:
+    """Slice an STL into per-layer vector outlines (world-XY millimetres)."""
     stl_path = Path(stl_path)
     mesh = scale_mesh(load_mesh(stl_path), scale_factors)
-    bounds = mesh.bounds
-    (x_min, y_min, z_min), (x_max, y_max, z_max) = bounds
+    (x_min, y_min, z_min), (x_max, y_max, z_max) = mesh.bounds
 
     z_values = calculate_z_levels(float(z_min), float(z_max), layer_height)
-    width = max(1, math.ceil((float(x_max) - float(x_min)) / pixel_size) + 1)
-    height = max(1, math.ceil((float(y_max) - float(y_min)) / pixel_size) + 1)
-    image_size = (width, height)
 
-    output_dir, zip_path = _make_output_paths(stl_path, output_root)
-    tiff_paths: list[Path] = []
-
+    layers: list[MultiPolygon] = []
     for index, z_value in enumerate(z_values):
         section = mesh.section(
             plane_origin=np.array([0.0, 0.0, z_value], dtype=float),
             plane_normal=np.array([0.0, 0.0, 1.0], dtype=float),
         )
-        image = _render_slice(section, float(x_min), float(y_min), image_size, pixel_size)
-        tiff_path = output_dir / f"slice_{index:04d}.tif"
-        image.save(tiff_path, compression="tiff_deflate")
-        tiff_paths.append(tiff_path)
+        layers.append(_section_to_multipolygon(section))
 
         if progress_callback is not None:
             progress_callback(index + 1, len(z_values))
 
-    _zip_tiffs(tiff_paths, zip_path)
-
-    return SliceStack(
-        output_dir=output_dir,
-        zip_path=zip_path,
-        tiff_paths=tiff_paths,
+    return LayerStack(
+        layers=layers,
         z_values=z_values,
-        image_size=image_size,
         bounds=(
             (float(x_min), float(y_min), float(z_min)),
             (float(x_max), float(y_max), float(z_max)),
         ),
         layer_height=layer_height,
-        pixel_size=pixel_size,
+        name=name if name is not None else (stl_path.stem or "mesh"),
     )

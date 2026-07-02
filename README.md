@@ -5,12 +5,12 @@ sdk_version: 6.10.0
 python_version: "3.12"
 app_file: app.py
 fullWidth: true
-short_description: Upload STLs, export TIFF stacks, and generate G-code.
+short_description: Upload STLs, slice to vector outlines, and generate G-code.
 ---
 
 # STL to G-Code Gradio App
 
-This project provides a Gradio app that takes any number of uploaded STL files, shows a selected-shape 3D viewer, slices each model along the Z axis, saves slices as TIFF images, generates G-code from those TIFF stacks, previews the resulting tool path (a fast line plot or an animated 3D tube plot), and can visualize the shapes printing in parallel and export that animation as a GIF.
+This project provides a Gradio app that takes any number of uploaded STL files, shows a selected-shape 3D viewer, slices each model along the Z axis into per-layer vector outlines (shapely polygons), generates parallel-nozzle G-code directly from those outlines, previews the resulting tool path (a fast line plot or an animated 3D tube plot), and can visualize the shapes printing in parallel and export that animation as a GIF.
 
 ## Prerequisites
 
@@ -33,7 +33,7 @@ uv run gradio app.py
 
 When `app.py` changes, Gradio will automatically rerun the file and refresh the demo.
 
-Then open the local Gradio URL in your browser, upload STL files or load the bundled samples, and generate the TIFF stacks.
+Then open the local Gradio URL in your browser, upload STL files or load the bundled samples, and slice the shapes.
 
 ## What the app does
 
@@ -43,17 +43,14 @@ Then open the local Gradio URL in your browser, upload STL files or load the bun
 - Shows an interactive selected-shape 3D viewer for rotating each model
 - Shows model extents, face count, vertex count, and watertight status
 - Scales loaded STLs from editable target X/Y/Z dimensions in the Shape Settings table; new rows default to the STL's original dimensions, **Reset Dimensions** restores them, and **Keep Proportions** updates the other target sides from the edited side
-- Keeps optional shape, TIFF, reference-stack, and nozzle-spacing previews in closed accordions to reduce clutter
-- Lets you choose layer height and XY pixel size
-- Produces one `.tif` image per slice
-- Encodes material as black (`0`) and empty space as white (`255`) in each TIFF slice
-- Lets you step through the slice stack in the browser
-- Exports a ZIP containing the generated TIFF images
-- Automatically combines generated stacks into a reference TIFF stack when TIFF stacks are generated
-- Splits one generated TIFF stack into an editable row/column grid for multi-nozzle printing of one large shape
-- Converts generated TIFF ZIPs into G-code files with pressure, valve, nozzle, and port settings per shape from the Shape Settings table
-- Appends a shape-optimized outer contour after each enabled shape layer by tracing that layer's active row envelope
-- Offers G-code generation options for raster pattern, **Use G1 for all moves** (no rapid travel command), and **Use Reference Stack for motion** (all shapes share one nozzle path; each dispenses only its own geometry)
+- Lets you choose layer height and filament/line width
+- Slices each shape into per-layer vector outlines held in memory (no intermediate image files)
+- Automatically unions the sliced shapes into a combined reference layer set whenever shapes are sliced
+- Splits one sliced shape's geometry into an editable row/column grid for multi-nozzle printing of one large shape
+- Converts sliced layers into G-code files with pressure, valve, nozzle, and port settings per shape from the Shape Settings table
+- Appends a shape outline contour after each enabled shape layer by tracing that layer's polygon boundary
+- Offers G-code generation options for raster pattern, **Use G1 for all moves** (no rapid travel command), and **Use combined reference outline for motion** (all shapes share one nozzle path; each dispenses only its own geometry)
+- Re-slices shapes automatically during G-code generation when their slices are missing or stale, so "upload, then Generate G-Code" works in one click
 - Calculates X/Y nozzle spacing from an editable adjacent-pair spacing table, then visualizes the resulting nozzle layout
 - Previews selected generated G-code inline
 - Visualizes generated or uploaded G-code tool paths, with the source selectable from any active generated shape or an uploaded file
@@ -62,40 +59,42 @@ Then open the local Gradio URL in your browser, upload STL files or load the bun
 
 ## Behavior and Implementation Notes
 
-### Reference TIFF Stack Alignment
+### Vector Slicing
 
-When you click **Generate TIFF Stacks**, the app automatically combines available TIFF stacks layer-by-layer into the Reference TIFF Stack. The **Generate Reference TIFF Stack** button can still rebuild it manually from the current shape stacks.
+Slicing uses `trimesh` cross-sections composed into shapely polygons (`slice_stl_to_layers` in `stl_slicer.py`). Each layer is a `MultiPolygon` in world-XY millimetres; the whole shape is a `LayerStack` (layers, z-values, bounds, layer height) held in the Gradio session state — no files are written until G-code is generated.
 
-- If source TIFFs have different dimensions, each layer is placed on a canvas using the largest width and height.
-- Layers are centered in X and Y before merging.
-- Pixel merge uses a black-wins rule: a pixel is black in the reference if any source has black at that pixel.
-- Alignment is centered image placement, not bottom-left anchoring.
-- If image-size differences are odd, centering may produce a one-pixel shift due to integer rounding.
+### Reference Layer Union
+
+When you click **Slice Shapes**, the app automatically unions the sliced shapes layer-by-layer into a combined reference layer set (used for shared-motion G-code).
+
+- Shapes are aligned by centering each shape's XY bounding box on a common center before the union.
+- Alignment is centered placement (in exact millimetres), not bottom-left anchoring.
 
 ### Multi-Nozzle Split
 
-The **Multi-Nozzle Split** accordion on the **STL to TIFF Slicer** tab can split one generated shape stack into a grid of print-ready stacks. Choose a source shape that already has TIFF slices, set the number of columns and rows, choose the starting nozzle and valve numbers, then click **Split Selected Shape into Grid Pieces**.
+The **Multi-Nozzle Split** accordion on the **Shapes & Slicing** tab can split one sliced shape into a grid of print-ready piece stacks. Choose a source shape that has been sliced, set the number of columns and rows, choose the starting nozzle and valve numbers, then click **Split Selected Shape into Grid Pieces**.
 
-- Each slice is padded with white pixels as needed, then split into equal-width columns and equal-height rows so every generated piece in the grid has a matching TIFF canvas.
+- Each layer's geometry is clipped against equal-size grid cells, so every piece keeps exact vector outlines.
 - The selected shape is replaced in Shape Settings by one generated record per grid cell, named by row and column.
-- Nozzle and valve numbers are assigned sequentially from the starting values, and the existing **TIFF Slices to GCode** tab can generate separate G-code for each piece.
+- Nozzle and valve numbers are assigned sequentially from the starting values, and the **Generate G-Code** tab can generate separate G-code for each piece.
+- **Overlapping Layers** alternates the interior cut lines by one filament width per layer so neighbouring pieces interlock.
 
 ### G-code XY Step Size
 
-- G-code generation uses the slicer's `Pixel Size/Fill Width` for XY step distance by passing `fil_width=pixel_size` into `generate_snake_path_gcode()`.
+- G-code generation uses the slicer tab's `Filament/Line Width` as the raster line spacing by passing `fil_width` into `generate_vector_gcode()`.
 
 ### G-code Output
 
 - Generated G-code starts in relative coordinate mode (`G91`).
 - `G0` is travel and `G1` is print/feed.
-- The app generates print/feed moves from material pixels and travel moves between material regions.
+- The app generates print/feed moves where the tool path is inside a shape's layer polygons and travel moves elsewhere.
 - Generated files include pressure preset commands and WAGO valve commands based on the selected pressure, valve, and port; the nozzle number controls layout/spacing assignment.
 - Pressure increases by `0.1` psi per layer by default.
 - **Use G1 for all moves**: when enabled, every movement line is emitted as `G1` (no `G0` rapid travel); the WAGO valve still marks where material is dispensed. Applies to all shapes.
-- **Use Reference Stack for motion**: when enabled, every shape's snake-path *motion* is taken from the combined Reference TIFF Stack while each shape's *valve/dispensing* comes from its own slices — so parallel print heads share one synchronized nozzle path and each deposits only its own geometry. The reference stack is generated automatically with TIFF stacks; shapes are skipped with a message if it is missing.
-- **Raster Pattern**: `X-direction raster` keeps the existing X-direction back-and-forth raster on every layer. `Y-direction raster` rasters every layer in Y. `Woodpile raster` alternates the raster axis by layer, switching between X-direction and Y-direction sweeps. `Rectangular Spiral raster` walks each layer from the outer layer bounds toward the center, then reverses from center to edge on the next layer. `Circle Spiral raster` uses a shrinking circular spiral from the layer bounds toward the center, then reverses outward on the next layer.
+- **Use combined reference outline for motion**: when enabled, every shape's *motion* is taken from the combined reference layer union while each shape's *valve/dispensing* comes from its own layer polygons — so parallel print heads share one synchronized nozzle path and each deposits only its own geometry. The reference union is rebuilt automatically when shapes are sliced.
+- **Raster Pattern**: `X-direction raster` sweeps every layer back-and-forth in X. `Y-direction raster` rasters every layer in Y. `Woodpile raster` alternates the raster axis by layer, switching between X-direction and Y-direction sweeps. `Rectangular Spiral raster` walks each layer from the outer layer bounds toward the center, then reverses from center to edge on the next layer. `Circle Spiral raster` uses a shrinking circular spiral from the layer bounds toward the center, then reverses outward on the next layer. Spiral motion covers the layer bounds; the valve opens only where the path is inside material.
 - **Auto Align Split Parts**: in Nozzle Spacing, fills Grid Layout gaps for split-piece alignment. X-direction raster uses X `-3.2` mm and Y `-0.8` mm; Y-direction raster switches those values.
-- **Contour Tracing**: enabled per row in Shape Settings. The app uses the shape-optimized row-envelope tracer, travels from the layer raster end to the nearest contour point, prints the contour, then returns to the raster endpoint before the next layer.
+- **Contour Tracing**: enabled per row in Shape Settings. The app traces the layer polygon's boundary rings (holes traced separately), travels from the layer raster end to the nearest contour point, prints the contour, then returns to the raster endpoint before the next layer.
 
 ### Print vs Travel Classification
 
@@ -115,7 +114,7 @@ The G-code visualization tab renders generated shape G-code or an uploaded `.txt
 
 ### Parallel Printing Visualization
 
-The fourth tab plots the generated shapes' G-code at once using the nozzle spacing configured on the TIFF-to-G-code tab, each in its own color. Shape Settings maps each STL to a nozzle number, so multiple shapes can share one nozzle offset while valves remain independent. Like the visualization tab it has a fast **Line Plot** and an animated **Tube Plot**; the animation advances all parts on a shared cumulative-path-length timeline, so a shorter part finishes first.
+The fourth tab plots the generated shapes' G-code at once using the nozzle spacing configured on the Generate G-Code tab, each in its own color. Shape Settings maps each STL to a nozzle number, so multiple shapes can share one nozzle offset while valves remain independent. Like the visualization tab it has a fast **Line Plot** and an animated **Tube Plot**; the animation advances all parts on a shared cumulative-path-length timeline, so a shorter part finishes first.
 
 It can also **export the animation as a GIF**, rendered server-side with Matplotlib (the `Agg` CPU backend — no WebGL, no headless browser, and no `ffmpeg`, so it works locally and on Hugging Face). The GIF is line-style with faint grey travel and white, black-outlined nozzle markers drawn on top; controls cover duration, frames per second, elevation/azimuth viewing angle, and travel opacity (0 hides travel).
 

@@ -13,7 +13,11 @@ import plotly.graph_objects as go
 # the axes named on a line change. This matches standard slicer/firmware G-code
 # as well as this app's own always-paired "X Y" output.
 _CMD_RE = re.compile(r"^G0*([01])(?![0-9])", re.IGNORECASE)
-_AXIS_RE = re.compile(r"([XYZ])\s*([-+]?(?:\d*\.\d+|\d+\.?))", re.IGNORECASE)
+# The value accepts a lowercase scientific exponent ("X-5.1e-08") so
+# Python-formatted floats never get truncated to their mantissa ("X-5.1").
+# Uppercase "E" is deliberately NOT treated as an exponent: in compact G-code
+# it starts the extrusion token ("X1.2E3" means X=1.2, E=3).
+_AXIS_RE = re.compile(r"([XYZxyz])\s*([-+]?(?:\d*\.\d+|\d+\.?)(?:e[-+]?\d+)?)")
 # Pneumatic valve toggle: WAGO_ValveCommands(<valve>, <0=close|1=open>). Some
 # generators emit every move as G1 and convey extrusion only through the valve.
 _VALVE_RE = re.compile(r"WAGO_ValveCommands\(\s*(\d+)\s*,\s*(\d+)\s*\)", re.IGNORECASE)

@@ -22,8 +22,7 @@ from app import (
     _resolve_nozzle_grid_layout,
     _resolve_nozzle_layout,
 )
-from tiff_to_gcode import (
-    CONTOUR_MODE_ROW_ENVELOPE,
+from vector_toolpath import (
     RASTER_PATTERN_SAME_DIRECTION,
     RASTER_PATTERN_Y_DIRECTION,
 )
@@ -256,25 +255,29 @@ def test_shape_settings_round_trip_contour_tracing_column() -> None:
     assert updated[0]["contour_tracing"] is True
 
 
-def test_contour_tracing_sources_request_shape_optimized_mode() -> None:
+def test_contour_tracing_sources_use_sliced_layer_stacks() -> None:
+    from shapely.geometry import MultiPolygon, box
+
+    from stl_slicer import LayerStack
+
+    stack = LayerStack(
+        layers=[MultiPolygon([box(0.0, 0.0, 1.0, 1.0)])],
+        z_values=[0.5],
+        bounds=((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+        layer_height=1.0,
+        name="traced",
+    )
     sources = _contour_tracing_sources(
         [
-            {
-                "idx": 2,
-                "contour_tracing": True,
-                "tiff_state": {"tiff_paths": ["slice_0000.tif"]},
-            }
+            {"idx": 1, "contour_tracing": False, "layer_stack": stack},
+            {"idx": 2, "contour_tracing": True, "layer_stack": stack},
+            {"idx": 3, "contour_tracing": True, "layer_stack": None},
         ]
     )
 
-    assert sources == [
-        {
-            "owner_idx": 2,
-            "contour_mode": CONTOUR_MODE_ROW_ENVELOPE,
-            "tiff_paths": ["slice_0000.tif"],
-            "zip_path": None,
-        }
-    ]
+    assert len(sources) == 1
+    assert sources[0].owner_idx == 2
+    assert sources[0].stack is stack
 
 
 def test_repeated_sample_path_gets_next_unused_nozzle() -> None:
