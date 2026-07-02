@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import tempfile
 import zipfile
@@ -15,10 +16,14 @@ from PIL import Image
 RASTER_PATTERN_SAME_DIRECTION = "X-direction raster"
 RASTER_PATTERN_Y_DIRECTION = "Y-direction raster"
 RASTER_PATTERN_WOODPILE = "Woodpile raster"
+RASTER_PATTERN_RECTANGULAR_SPIRAL = "Rectangular Spiral raster"
+RASTER_PATTERN_CIRCLE_SPIRAL = "Circle Spiral raster"
 RASTER_PATTERN_CHOICES = (
     RASTER_PATTERN_SAME_DIRECTION,
     RASTER_PATTERN_Y_DIRECTION,
     RASTER_PATTERN_WOODPILE,
+    RASTER_PATTERN_RECTANGULAR_SPIRAL,
+    RASTER_PATTERN_CIRCLE_SPIRAL,
 )
 CONTOUR_MODE_EXACT = "Exact pixel border"
 CONTOUR_MODE_ROW_ENVELOPE = "Shape-optimized row envelope"
@@ -28,6 +33,10 @@ CONTOUR_MODE_CHOICES = (
 )
 
 def _normalize_raster_pattern(pattern: str | None) -> str:
+    if pattern == RASTER_PATTERN_CIRCLE_SPIRAL:
+        return RASTER_PATTERN_CIRCLE_SPIRAL
+    if pattern == RASTER_PATTERN_RECTANGULAR_SPIRAL:
+        return RASTER_PATTERN_RECTANGULAR_SPIRAL
     if pattern == RASTER_PATTERN_WOODPILE:
         return RASTER_PATTERN_WOODPILE
     if pattern == RASTER_PATTERN_Y_DIRECTION:
@@ -996,6 +1005,250 @@ def _oriented_woodpile_layer_segments(
     )
 
 
+def _rectangular_spiral_positions(
+    top: int,
+    bottom: int,
+    left: int,
+    right: int,
+) -> list[tuple[int, int]]:
+    positions: list[tuple[int, int]] = []
+    while top <= bottom and left <= right:
+        for col in range(left, right + 1):
+            positions.append((top, col))
+        top += 1
+
+        for row in range(top, bottom + 1):
+            positions.append((row, right))
+        right -= 1
+
+        if top <= bottom:
+            for col in range(right, left - 1, -1):
+                positions.append((bottom, col))
+            bottom -= 1
+
+        if left <= right:
+            for row in range(bottom, top - 1, -1):
+                positions.append((row, left))
+            left += 1
+
+    return positions
+
+
+def _append_colored_segment(
+    segments: list[tuple[float, float, float, float, int]],
+    start_x: float,
+    start_y: float,
+    end_x: float,
+    end_y: float,
+    color: int,
+) -> None:
+    if start_x == end_x and start_y == end_y:
+        return
+
+    if segments:
+        prev_start_x, prev_start_y, prev_end_x, prev_end_y, prev_color = segments[-1]
+        if (
+            prev_color == color
+            and prev_end_x == start_x
+            and prev_end_y == start_y
+        ):
+            prev_dx = prev_end_x - prev_start_x
+            prev_dy = prev_end_y - prev_start_y
+            next_dx = end_x - start_x
+            next_dy = end_y - start_y
+            if abs((prev_dx * next_dy) - (prev_dy * next_dx)) < 1e-9:
+                segments[-1] = (
+                    prev_start_x,
+                    prev_start_y,
+                    end_x,
+                    end_y,
+                    color,
+                )
+                return
+
+    segments.append((start_x, start_y, end_x, end_y, color))
+
+
+def _rectangular_spiral_layer_segments(
+    path_img: np.ndarray,
+    color_img: np.ndarray,
+    pixel_size: float,
+    reverse: bool = False,
+) -> list[tuple[float, float, float, float, int]]:
+    bounds = _active_pixel_bounds(path_img > 0)
+    if bounds is None:
+        return []
+
+    top, bottom, left, right = bounds
+    positions = _rectangular_spiral_positions(top, bottom, left, right)
+    if reverse:
+        positions.reverse()
+    if not positions:
+        return []
+
+    def center(row: int, col: int) -> tuple[float, float]:
+        return (float(col) + 0.5) * pixel_size, (float(row) + 0.5) * pixel_size
+
+    def pixel_color(row: int, col: int) -> int:
+        return int(color_img[row, col])
+
+    segments: list[tuple[float, float, float, float, int]] = []
+    if len(positions) == 1:
+        row, col = positions[0]
+        y = (float(row) + 0.5) * pixel_size
+        _append_colored_segment(
+            segments,
+            float(col) * pixel_size,
+            y,
+            (float(col) + 1.0) * pixel_size,
+            y,
+            pixel_color(row, col),
+        )
+        return segments
+
+    centers = [center(row, col) for row, col in positions]
+    first_dx = centers[1][0] - centers[0][0]
+    first_dy = centers[1][1] - centers[0][1]
+    last_dx = centers[-1][0] - centers[-2][0]
+    last_dy = centers[-1][1] - centers[-2][1]
+
+    start_x = centers[0][0] - (first_dx * 0.5)
+    start_y = centers[0][1] - (first_dy * 0.5)
+    first_row, first_col = positions[0]
+    _append_colored_segment(
+        segments,
+        start_x,
+        start_y,
+        centers[0][0],
+        centers[0][1],
+        pixel_color(first_row, first_col),
+    )
+
+    for idx, ((row, col), (next_row, next_col)) in enumerate(
+        zip(positions, positions[1:])
+    ):
+        start_center_x, start_center_y = centers[idx]
+        end_center_x, end_center_y = centers[idx + 1]
+        mid_x = (start_center_x + end_center_x) / 2.0
+        mid_y = (start_center_y + end_center_y) / 2.0
+        _append_colored_segment(
+            segments,
+            start_center_x,
+            start_center_y,
+            mid_x,
+            mid_y,
+            pixel_color(row, col),
+        )
+        _append_colored_segment(
+            segments,
+            mid_x,
+            mid_y,
+            end_center_x,
+            end_center_y,
+            pixel_color(next_row, next_col),
+        )
+
+    last_row, last_col = positions[-1]
+    end_x = centers[-1][0] + (last_dx * 0.5)
+    end_y = centers[-1][1] + (last_dy * 0.5)
+    _append_colored_segment(
+        segments,
+        centers[-1][0],
+        centers[-1][1],
+        end_x,
+        end_y,
+        pixel_color(last_row, last_col),
+    )
+    return segments
+
+
+def _circle_spiral_points(
+    center_x: float,
+    center_y: float,
+    outer_radius: float,
+    pitch: float,
+) -> list[tuple[float, float]]:
+    if outer_radius <= 0.0:
+        return [(center_x, center_y)]
+
+    pitch = max(float(pitch), 1e-9)
+    sample_spacing = pitch
+    theta_max = (outer_radius / pitch) * 2.0 * math.pi
+    theta = 0.0
+    points = [(center_x + outer_radius, center_y)]
+
+    while theta < theta_max:
+        radius = max(outer_radius - (pitch * theta / (2.0 * math.pi)), 0.0)
+        d_theta = min(math.pi / 10.0, sample_spacing / max(radius, pitch))
+        theta = min(theta + d_theta, theta_max)
+        radius = max(outer_radius - (pitch * theta / (2.0 * math.pi)), 0.0)
+        points.append(
+            (
+                center_x + (radius * math.cos(theta)),
+                center_y + (radius * math.sin(theta)),
+            )
+        )
+
+    if points[-1] != (center_x, center_y):
+        points.append((center_x, center_y))
+    return points
+
+
+def _circle_spiral_layer_segments(
+    path_img: np.ndarray,
+    color_img: np.ndarray,
+    pixel_size: float,
+    reverse: bool = False,
+) -> list[tuple[float, float, float, float, int]]:
+    bounds = _active_pixel_bounds(path_img > 0)
+    if bounds is None:
+        return []
+
+    top, bottom, left, right = bounds
+    left_x = float(left) * pixel_size
+    right_x = float(right + 1) * pixel_size
+    top_y = float(top) * pixel_size
+    bottom_y = float(bottom + 1) * pixel_size
+    center_x = (left_x + right_x) / 2.0
+    center_y = (top_y + bottom_y) / 2.0
+    outer_radius = max(
+        math.hypot(corner_x - center_x, corner_y - center_y)
+        for corner_x, corner_y in (
+            (left_x, top_y),
+            (right_x, top_y),
+            (right_x, bottom_y),
+            (left_x, bottom_y),
+        )
+    )
+
+    points = _circle_spiral_points(center_x, center_y, outer_radius, pixel_size)
+    if reverse:
+        points.reverse()
+
+    height, width = color_img.shape[:2]
+
+    def point_color(x: float, y: float) -> int:
+        col = int(math.floor(x / pixel_size))
+        row = int(math.floor(y / pixel_size))
+        if row < 0 or row >= height or col < 0 or col >= width:
+            return 0
+        return int(color_img[row, col])
+
+    segments: list[tuple[float, float, float, float, int]] = []
+    for (start_x, start_y), (end_x, end_y) in zip(points, points[1:]):
+        mid_x = (start_x + end_x) / 2.0
+        mid_y = (start_y + end_y) / 2.0
+        _append_colored_segment(
+            segments,
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+            point_color(mid_x, mid_y),
+        )
+    return segments
+
+
 def _build_footprint_raster_gcode_list(
     path_ref_list: list[np.ndarray],
     color_ref_list: list[np.ndarray],
@@ -1012,16 +1265,31 @@ def _build_footprint_raster_gcode_list(
     contour_layers = contour_layers or []
 
     for layer_number, (path_img, color_img) in enumerate(zip(path_ref_list, color_ref_list)):
-        raster_axis = _raster_axis_for_pattern(raster_pattern, layer_number)
-        segments = _oriented_woodpile_layer_segments(
-            path_img,
-            color_img,
-            pixel_size,
-            raster_axis,
-            current_x,
-            current_y,
-            prefer_default=not raster_origin_initialized,
-        )
+        if raster_pattern == RASTER_PATTERN_CIRCLE_SPIRAL:
+            segments = _circle_spiral_layer_segments(
+                path_img,
+                color_img,
+                pixel_size,
+                reverse=layer_number % 2 == 1,
+            )
+        elif raster_pattern == RASTER_PATTERN_RECTANGULAR_SPIRAL:
+            segments = _rectangular_spiral_layer_segments(
+                path_img,
+                color_img,
+                pixel_size,
+                reverse=layer_number % 2 == 1,
+            )
+        else:
+            raster_axis = _raster_axis_for_pattern(raster_pattern, layer_number)
+            segments = _oriented_woodpile_layer_segments(
+                path_img,
+                color_img,
+                pixel_size,
+                raster_axis,
+                current_x,
+                current_y,
+                prefer_default=not raster_origin_initialized,
+            )
         if not segments:
             if layer_number > 0:
                 gcode_list.append({"X": 0.0, "Y": 0.0, "Z": layer_height, "Color": 0})
@@ -1206,7 +1474,12 @@ def generate_snake_path_gcode(
     pressure_on_lines = [_toggle_cmd(com_port, start=True)]
     pressure_off_lines = [_toggle_cmd(com_port, start=False)]
 
-    if raster_pattern in (RASTER_PATTERN_Y_DIRECTION, RASTER_PATTERN_WOODPILE):
+    if raster_pattern in (
+        RASTER_PATTERN_Y_DIRECTION,
+        RASTER_PATTERN_WOODPILE,
+        RASTER_PATTERN_RECTANGULAR_SPIRAL,
+        RASTER_PATTERN_CIRCLE_SPIRAL,
+    ):
         gcode_list = _build_footprint_raster_gcode_list(
             path_ref_list,
             color_ref_list,

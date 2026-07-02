@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import zipfile
 
 import numpy as np
@@ -7,11 +8,17 @@ from PIL import Image
 
 from tiff_to_gcode import (
     CONTOUR_MODE_ROW_ENVELOPE,
+    RASTER_PATTERN_CIRCLE_SPIRAL,
+    RASTER_PATTERN_RECTANGULAR_SPIRAL,
     RASTER_PATTERN_SAME_DIRECTION,
     RASTER_PATTERN_WOODPILE,
     RASTER_PATTERN_Y_DIRECTION,
     _build_contour_layers,
     _append_layer_contours,
+    _circle_spiral_layer_segments,
+    _circle_spiral_points,
+    _rectangular_spiral_layer_segments,
+    _rectangular_spiral_positions,
     _trace_mask_contours,
     _trace_row_envelope_contours,
     generate_snake_path_gcode,
@@ -720,6 +727,141 @@ def test_woodpile_raster_switches_print_axis_between_layers(tmp_path) -> None:
     )
     assert actual_restart_xy != old_restart_xy
     assert actual_restart_distance < old_restart_distance
+
+
+def test_rectangular_spiral_positions_walk_edge_to_center() -> None:
+    assert _rectangular_spiral_positions(0, 2, 0, 3) == [
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (0, 3),
+        (1, 3),
+        (2, 3),
+        (2, 2),
+        (2, 1),
+        (2, 0),
+        (1, 0),
+        (1, 1),
+        (1, 2),
+    ]
+
+
+def test_rectangular_spiral_segments_can_reverse_center_to_edge() -> None:
+    path_img = np.full((3, 3), 255, dtype=np.uint8)
+    color_img = np.full((3, 3), 255, dtype=np.uint8)
+
+    inward = _rectangular_spiral_layer_segments(path_img, color_img, 1.0)
+    outward = _rectangular_spiral_layer_segments(
+        path_img,
+        color_img,
+        1.0,
+        reverse=True,
+    )
+
+    assert inward[0] == (0.0, 0.5, 2.5, 0.5, 255)
+    assert inward[-1] == (0.5, 1.5, 2.0, 1.5, 255)
+    assert outward[0][:2] == inward[-1][2:4]
+    assert outward[-1][2:4] == inward[0][:2]
+
+
+def test_rectangular_spiral_raster_reverses_between_layers(tmp_path) -> None:
+    tiff_paths = []
+    for index in range(2):
+        tiff_path = tmp_path / f"slice_{index:04d}.tif"
+        Image.new("L", (3, 3), 0).save(tiff_path)
+        tiff_paths.append(tiff_path)
+
+    zip_path = tmp_path / "slices.zip"
+    with zipfile.ZipFile(zip_path, mode="w") as archive:
+        for tiff_path in tiff_paths:
+            archive.write(tiff_path, arcname=tiff_path.name)
+
+    gcode_path = generate_snake_path_gcode(
+        zip_path,
+        shape_name="rectangular_spiral",
+        pressure=25,
+        valve=7,
+        port=3,
+        fil_width=1.0,
+        layer_height=1.0,
+        raster_pattern=RASTER_PATTERN_RECTANGULAR_SPIRAL,
+    )
+
+    moves = _moves_with_colors(gcode_path.read_text())
+    first_layer_change = next(
+        move for move in moves if move["end"][2] > move["start"][2]
+    )
+
+    assert first_layer_change["start"][:2] == first_layer_change["end"][:2]
+    end_x, end_y, end_z = moves[-1]["end"]
+    assert abs(end_x) < 1e-9
+    assert abs(end_y) < 1e-9
+    assert end_z == 1.0
+
+
+def test_circle_spiral_points_decrease_radius_to_center() -> None:
+    points = _circle_spiral_points(2.0, 3.0, outer_radius=4.0, pitch=1.0)
+    radii = [math.hypot(x - 2.0, y - 3.0) for x, y in points]
+
+    assert radii[0] == 4.0
+    assert radii[-1] == 0.0
+    assert all(
+        current <= previous + 1e-9
+        for previous, current in zip(radii, radii[1:])
+    )
+
+
+def test_circle_spiral_segments_can_reverse_center_to_edge() -> None:
+    path_img = np.full((5, 5), 255, dtype=np.uint8)
+    color_img = np.full((5, 5), 255, dtype=np.uint8)
+
+    inward = _circle_spiral_layer_segments(path_img, color_img, 1.0)
+    outward = _circle_spiral_layer_segments(
+        path_img,
+        color_img,
+        1.0,
+        reverse=True,
+    )
+
+    assert inward
+    assert outward
+    assert outward[0][:2] == inward[-1][2:4]
+    assert outward[-1][2:4] == inward[0][:2]
+
+
+def test_circle_spiral_raster_reverses_between_layers(tmp_path) -> None:
+    tiff_paths = []
+    for index in range(2):
+        tiff_path = tmp_path / f"slice_{index:04d}.tif"
+        Image.new("L", (5, 5), 0).save(tiff_path)
+        tiff_paths.append(tiff_path)
+
+    zip_path = tmp_path / "slices.zip"
+    with zipfile.ZipFile(zip_path, mode="w") as archive:
+        for tiff_path in tiff_paths:
+            archive.write(tiff_path, arcname=tiff_path.name)
+
+    gcode_path = generate_snake_path_gcode(
+        zip_path,
+        shape_name="circle_spiral",
+        pressure=25,
+        valve=7,
+        port=3,
+        fil_width=1.0,
+        layer_height=1.0,
+        raster_pattern=RASTER_PATTERN_CIRCLE_SPIRAL,
+    )
+
+    moves = _moves_with_colors(gcode_path.read_text())
+    first_layer_change = next(
+        move for move in moves if move["end"][2] > move["start"][2]
+    )
+
+    assert first_layer_change["start"][:2] == first_layer_change["end"][:2]
+    end_x, end_y, end_z = moves[-1]["end"]
+    assert abs(end_x) < 1e-9
+    assert abs(end_y) < 1e-9
+    assert end_z == 1.0
 
 
 def test_y_direction_raster_prints_each_layer_along_y_axis(tmp_path) -> None:
