@@ -55,8 +55,6 @@ SCALE_MODE_TARGET_DIMENSIONS = "Independent X/Y/Z"
 SCALE_MODE_UNIFORM_FACTOR = "Keep Proportions"
 TARGET_DIMENSION_KEYS = ("target_x", "target_y", "target_z")
 FRONT_CAMERA = (90, 80, None)
-NOZZLE_LAYOUT_GRID = "Grid Layout"
-NOZZLE_LAYOUT_PAIR_TABLE = "Custom Spacing"
 NOZZLE_LAYOUT_PRESETS = [
     "Custom",
     "One row",
@@ -68,8 +66,6 @@ NOZZLE_LAYOUT_PRESETS = [
     "2 x 5",
     "5 x 2",
 ]
-AUTO_ALIGN_X_RASTER_OFFSETS = (-3.2, -0.8)
-AUTO_ALIGN_Y_RASTER_OFFSETS = (-0.8, -3.2)
 APP_CSS = """
 .gradio-container {
     font-size: 90%;
@@ -1161,96 +1157,6 @@ PARALLEL_COLOR_CHOICES = [
 DEFAULT_PARALLEL_COLORS = ("#ff7f0e", "#1f77b4", "#2ca02c")
 
 
-def _resolve_nozzle_layout(
-    parts: list[dict],
-    same_spacing: bool | None,
-    part_gap_12_x: float | None,
-    part_gap_12_y: float | None,
-    part_gap_23_x: float | None,
-    part_gap_23_y: float | None,
-    *extra_pair_gaps: float | None,
-) -> tuple[dict[int, tuple[float, float]], list[dict]]:
-    offsets: dict[int, tuple[float, float]] = {}
-    spacings: list[dict] = []
-    if not parts:
-        return offsets, spacings
-
-    grouped: dict[int, list[dict]] = {}
-    for part in parts:
-        grouped.setdefault(_record_nozzle_number(part, int(part.get("idx", 1) or 1)), []).append(part)
-    ordered_nozzles = sorted(grouped)
-    offsets[ordered_nozzles[0]] = (0.0, 0.0)
-
-    def nozzle_bounds(nozzle: int) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
-        mins: list[tuple[float, float, float]] = []
-        maxs: list[tuple[float, float, float]] = []
-        for part in grouped[nozzle]:
-            part_min, part_max = part["parsed"]["bounds"]
-            mins.append(part_min)
-            maxs.append(part_max)
-        return (
-            tuple(min(values) for values in zip(*mins)),
-            tuple(max(values) for values in zip(*maxs)),
-        )
-
-    first_spacing = (float(part_gap_12_x or 0.0), float(part_gap_12_y or 0.0))
-    raw_pairs: list[tuple[float, float]] = [
-        first_spacing,
-        (float(part_gap_23_x or 0.0), float(part_gap_23_y or 0.0)),
-    ]
-    for index in range(0, len(extra_pair_gaps), 2):
-        raw_pairs.append((
-            float(extra_pair_gaps[index] or 0.0),
-            float(extra_pair_gaps[index + 1] or 0.0) if index + 1 < len(extra_pair_gaps) else 0.0,
-        ))
-    max_pair_count = max(0, len(ordered_nozzles) - 1)
-    while len(raw_pairs) < max_pair_count:
-        raw_pairs.append(first_spacing)
-    if same_spacing:
-        raw_pairs = [first_spacing for _ in raw_pairs]
-
-    pair_spacing = {
-        (ordered_nozzles[index], ordered_nozzles[index + 1]): raw_pairs[index]
-        for index in range(min(len(raw_pairs), max_pair_count))
-    }
-
-    def spacing_between(prev_idx: int, cur_idx: int) -> tuple[float, float]:
-        if (prev_idx, cur_idx) in pair_spacing:
-            return pair_spacing[(prev_idx, cur_idx)]
-        try:
-            start_pos = ordered_nozzles.index(prev_idx)
-            end_pos = ordered_nozzles.index(cur_idx)
-        except ValueError:
-            return 0.0, 0.0
-        if end_pos <= start_pos:
-            return 0.0, 0.0
-        total_x = 0.0
-        total_y = 0.0
-        for pair_pos in range(start_pos, end_pos):
-            pair = (ordered_nozzles[pair_pos], ordered_nozzles[pair_pos + 1])
-            step_x, step_y = pair_spacing.get(pair, first_spacing)
-            total_x += step_x
-            total_y += step_y
-        return total_x, total_y
-
-    for prev_idx, cur_idx in zip(ordered_nozzles, ordered_nozzles[1:]):
-        gap_x, y_step = spacing_between(prev_idx, cur_idx)
-        prev_offset_x, prev_offset_y = offsets[prev_idx]
-        (_, _, _), (prev_xmax, _prev_ymax, _) = nozzle_bounds(prev_idx)
-        (cur_xmin, _cur_ymin, _), (_, _, _) = nozzle_bounds(cur_idx)
-        dx = (prev_xmax + prev_offset_x + gap_x) - cur_xmin
-        dy = prev_offset_y + y_step
-        offsets[cur_idx] = (dx, dy)
-        spacings.append({
-            "from": prev_idx,
-            "to": cur_idx,
-            "dx": dx - prev_offset_x,
-            "dy": y_step,
-        })
-
-    return offsets, spacings
-
-
 def _group_parts_by_nozzle(parts: list[dict]) -> dict[int, list[dict]]:
     grouped: dict[int, list[dict]] = {}
     for part in parts:
@@ -1390,44 +1296,6 @@ def _resolve_nozzle_grid_layout(
     return offsets, spacings
 
 
-def _resolve_layout_from_spacing_controls(
-    parts: list[dict],
-    layout_mode: str | None,
-    columns: Any,
-    rows: Any,
-    column_spacing: Any,
-    row_spacing: Any,
-    use_grid_individual_spacing: bool | None,
-    grid_spacing_table: Any,
-    use_individual_spacing: bool,
-    spacing_table: Any,
-) -> tuple[dict[int, tuple[float, float]], list[dict]]:
-    if layout_mode != NOZZLE_LAYOUT_PAIR_TABLE:
-        return _resolve_nozzle_grid_layout(
-            parts,
-            columns,
-            rows,
-            column_spacing,
-            row_spacing,
-            use_grid_individual_spacing,
-            grid_spacing_table,
-        )
-    gap12x, gap12y, gap23x, gap23y, extra = _spacing_args_from_table(spacing_table, use_individual_spacing)
-    return _resolve_nozzle_layout(
-        parts,
-        _same_spacing_from_individual(use_individual_spacing),
-        gap12x,
-        gap12y,
-        gap23x,
-        gap23y,
-        *extra,
-    )
-
-
-def _same_spacing_from_individual(use_individual_spacing: bool | None) -> bool:
-    return not bool(use_individual_spacing)
-
-
 def _format_shape_dimensions(parts: list[dict]) -> list[str]:
     lines = ["**Shape dimensions from generated G-code:**"]
     for part in sorted(parts, key=lambda item: item["idx"]):
@@ -1492,6 +1360,7 @@ SHAPE_SETTINGS_HEADERS = [
     "Nozzle",
     "Port",
     "Color",
+    "Infill %",
     "Contour Tracing",
     "Delete",
 ]
@@ -1506,14 +1375,9 @@ SHAPE_SETTINGS_DATATYPES = [
     "number",
     "number",
     "str",
+    "number",
     "bool",
     "str",
-]
-SIMPLE_NOZZLE_SPACING_HEADERS = [
-    "Spacing Mode",
-    "Applies To",
-    "X edge spacing (mm)",
-    "Y nozzle spacing (mm)",
 ]
 ADVANCED_NOZZLE_SPACING_HEADERS = [
     "From Nozzle",
@@ -1521,7 +1385,6 @@ ADVANCED_NOZZLE_SPACING_HEADERS = [
     "X edge spacing (mm)",
     "Y nozzle spacing (mm)",
 ]
-NOZZLE_SPACING_HEADERS = SIMPLE_NOZZLE_SPACING_HEADERS
 
 
 def _normalise_rows(table: Any) -> list[list[Any]]:
@@ -1660,6 +1523,7 @@ def _records_from_files(files: Any, previous_records: list[dict] | None = None) 
             "nozzle": nozzle,
             "port": previous.get("port", 1),
             "color": previous.get("color", _default_color(index)),
+            "infill": previous.get("infill", 100.0),
             "contour_tracing": previous.get("contour_tracing", False),
             "layer_stack": previous.get("layer_stack"),
             "slice_params": previous.get("slice_params"),
@@ -1690,6 +1554,7 @@ def _shape_settings_rows(records: list[dict]) -> list[list[Any]]:
             _record_nozzle_number(record, int(record["idx"])),
             record.get("port", 1),
             record.get("color", _default_color(record["idx"])),
+            _coerce_float(record.get("infill", 100.0), 100.0),
             bool(record.get("contour_tracing", False)),
             "Delete",
         ]
@@ -1733,7 +1598,8 @@ def _apply_shape_settings(records: list[dict], settings_table: Any) -> list[dict
             nozzle_pos = 7 if has_nozzle_column else None
             port_pos = 8 if has_nozzle_column else 7
             color_pos = 9 if has_nozzle_column else 8
-            contour_pos = 10 if has_nozzle_column else 9
+            infill_pos = 10 if has_nozzle_column else 9
+            contour_pos = 11 if has_nozzle_column else 10
             copy["valve"] = _coerce_int(copy.get("valve", 4), 4)
             copy["nozzle"] = _coerce_int(
                 row[nozzle_pos] if nozzle_pos is not None else copy.get("nozzle", copy.get("idx", 1)),
@@ -1747,6 +1613,13 @@ def _apply_shape_settings(records: list[dict], settings_table: Any) -> list[dict
                 copy["nozzle"] = _record_nozzle_number(copy)
             if len(row) > color_pos and row[color_pos]:
                 copy["color"] = str(row[color_pos])
+            try:
+                copy["infill"] = max(
+                    0.0,
+                    min(100.0, float(row[infill_pos])),
+                )
+            except (IndexError, TypeError, ValueError):
+                copy["infill"] = _coerce_float(copy.get("infill", 100.0), 100.0)
             try:
                 copy["contour_tracing"] = _coerce_bool(row[contour_pos], bool(copy.get("contour_tracing", False)))
             except IndexError:
@@ -1821,38 +1694,6 @@ def _spacing_pairs_from_table(spacing_table: Any) -> list[tuple[float, float]]:
     return pairs
 
 
-def _spacing_table_update(records: list[dict], existing_table: Any | None = None, use_individual_spacing: bool | None = False) -> dict[str, Any]:
-    pairs = _spacing_pairs_from_table(existing_table)
-    first_pair = pairs[0] if pairs else (5.0, 0.0)
-
-    if not use_individual_spacing:
-        return gr.update(
-            headers=SIMPLE_NOZZLE_SPACING_HEADERS,
-            value=[["Same spacing", "All neighboring nozzles", first_pair[0], first_pair[1]]],
-            row_count=(1, "fixed"),
-            column_count=(len(SIMPLE_NOZZLE_SPACING_HEADERS), "fixed"),
-            label="Nozzle Spacing",
-        )
-
-    rows: list[list[Any]] = []
-    ordered_nozzles = _ordered_nozzle_numbers(records)
-    for index, (first, second) in enumerate(zip(ordered_nozzles, ordered_nozzles[1:])):
-        gap_x, gap_y = pairs[index] if index < len(pairs) else first_pair
-        rows.append([
-            _nozzle_spacing_label(first, records),
-            _nozzle_spacing_label(second, records),
-            gap_x,
-            gap_y,
-        ])
-    return gr.update(
-        headers=ADVANCED_NOZZLE_SPACING_HEADERS,
-        value=rows,
-        row_count=(len(rows), "fixed"),
-        column_count=(len(ADVANCED_NOZZLE_SPACING_HEADERS), "fixed"),
-        label="Advanced Nozzle Spacing",
-    )
-
-
 def _grid_spacing_rows(
     records: list[dict],
     columns: Any,
@@ -1904,8 +1745,6 @@ def _grid_spacing_table_update(
         value=spacing_rows,
         row_count=(len(spacing_rows), "fixed"),
         column_count=(len(ADVANCED_NOZZLE_SPACING_HEADERS), "fixed"),
-        label="Advanced Grid Spacing",
-        visible=bool(use_individual_grid_spacing),
     )
 
 
@@ -1932,14 +1771,73 @@ def _split_pair_was_created_together(records_by_nozzle: dict[int, list[dict]], f
     return False
 
 
+def _part_world_bounds(part: dict) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    """XY bounding box of a part's toolpath in the shape's own world frame.
+
+    Requires the `; PathOrigin` header the G-code generator writes; parts
+    generated before that header exists return None.
+    """
+    parsed = part.get("parsed") or {}
+    origin = parsed.get("path_origin")
+    if origin is None:
+        return None
+    (x_min, y_min, _z_min), (x_max, y_max, _z_max) = parsed["bounds"]
+    return (
+        (x_min + origin[0], y_min + origin[1]),
+        (x_max + origin[0], y_max + origin[1]),
+    )
+
+
+def _nozzle_world_bounds(
+    grouped: dict[int, list[dict]],
+) -> dict[int, tuple[tuple[float, float], tuple[float, float]]]:
+    world: dict[int, tuple[tuple[float, float], tuple[float, float]]] = {}
+    for nozzle, parts in grouped.items():
+        boxes = [_part_world_bounds(part) for part in parts]
+        if not boxes or any(box is None for box in boxes):
+            continue
+        world[nozzle] = (
+            (min(box[0][0] for box in boxes), min(box[0][1] for box in boxes)),
+            (max(box[1][0] for box in boxes), max(box[1][1] for box in boxes)),
+        )
+    return world
+
+
+def _split_grid_shape(records: list[dict]) -> tuple[int, int] | None:
+    """The split grid (columns, rows) when records hold exactly one split group."""
+    groups = {
+        record.get("split_group_id")
+        for record in records
+        if record.get("split_group_id")
+    }
+    if len(groups) != 1:
+        return None
+    group_id = next(iter(groups))
+    for record in records:
+        if record.get("split_group_id") == group_id:
+            columns = _coerce_int(record.get("split_columns"), 0)
+            rows = _coerce_int(record.get("split_rows"), 0)
+            if columns >= 1 and rows >= 1:
+                return columns, rows
+    return None
+
+
 def _auto_align_grid_spacing_rows(
     records: list[dict],
     columns: Any,
     rows: Any,
     column_spacing: Any,
     row_spacing: Any,
-    raster_pattern: str | None,
-) -> tuple[list[list[Any]], int, int, int]:
+) -> tuple[list[list[Any]], int, int, int, int]:
+    """Exact per-pair gaps that reassemble split pieces in the parallel view.
+
+    Every generated G-code file records its PathOrigin: the world position of
+    the relative toolpath's start. Anchoring each piece back into its world
+    frame turns the required pair gaps into the actual world-frame gaps
+    between the parts' toolpath bounding boxes — which automatically accounts
+    for the raster pattern, filament width, travel buffers, reference-stack
+    motion, and overlapping-layer splits. No hardcoded offsets.
+    """
     spacing_rows, column_count, row_count = _grid_spacing_rows(
         records,
         columns,
@@ -1947,18 +1845,42 @@ def _auto_align_grid_spacing_rows(
         column_spacing,
         row_spacing,
     )
-    auto_x_gap, auto_y_gap = _auto_align_split_offsets(raster_pattern)
+    parts, _messages = _parts_from_records(records)
+    world = _nozzle_world_bounds(_group_parts_by_nozzle(parts))
     records_by_nozzle = _records_by_nozzle(records)
     ordered_nozzles = _ordered_nozzle_numbers(records)
+
     aligned_count = 0
+    missing_count = 0
     for index, (first, second) in enumerate(zip(ordered_nozzles, ordered_nozzles[1:])):
         if not _split_pair_was_created_together(records_by_nozzle, first, second):
             continue
-        gap_x, gap_y = _grid_default_gap_for_pair(index, column_count, auto_x_gap, auto_y_gap)
-        spacing_rows[index][2] = gap_x
-        spacing_rows[index][3] = gap_y
+
+        second_column = (index + 1) % column_count
+        if second_column == 0:
+            # Row transition: `second` opens a new grid row. The layout places
+            # it relative to the previous row's first nozzle (x) and the
+            # previous row's lowest edge (y).
+            previous_row = ordered_nozzles[index + 1 - column_count : index + 1]
+            anchors = [second, *previous_row]
+        else:
+            row_first = ordered_nozzles[index + 1 - second_column]
+            anchors = [first, second, row_first]
+        if any(nozzle not in world for nozzle in anchors):
+            missing_count += 1
+            continue
+
+        (second_min_x, second_min_y), _second_max = world[second]
+        if second_column == 0:
+            gap_x = second_min_x - world[previous_row[0]][0][0]
+            gap_y = second_min_y - max(world[nozzle][1][1] for nozzle in previous_row)
+        else:
+            gap_x = second_min_x - world[first][1][0]
+            gap_y = second_min_y - world[row_first][0][1]
+        spacing_rows[index][2] = round(gap_x, 4)
+        spacing_rows[index][3] = round(gap_y, 4)
         aligned_count += 1
-    return spacing_rows, column_count, row_count, aligned_count
+    return spacing_rows, column_count, row_count, aligned_count, missing_count
 
 
 def apply_nozzle_grid_spacing(
@@ -1988,46 +1910,57 @@ def apply_nozzle_grid_spacing(
     )
 
 
-def _auto_align_split_offsets(raster_pattern: str | None) -> tuple[float, float]:
-    if raster_pattern == RASTER_PATTERN_Y_DIRECTION:
-        return AUTO_ALIGN_Y_RASTER_OFFSETS
-    return AUTO_ALIGN_X_RASTER_OFFSETS
-
-
-def auto_align_split_parts_for_raster(
+def auto_align_split_parts(
     records: list[dict] | None,
     columns: Any,
     rows: Any,
     column_spacing: Any,
     row_spacing: Any,
-    raster_pattern: str | None,
 ) -> tuple:
-    x_gap, y_gap = _auto_align_split_offsets(raster_pattern)
-    raster_label = raster_pattern or RASTER_PATTERN_SAME_DIRECTION
-    spacing_rows, column_count, row_count, aligned_count = _auto_align_grid_spacing_rows(
-        records or [],
-        columns,
-        rows,
-        column_spacing,
-        row_spacing,
-        raster_pattern,
-    )
+    records = records or []
+    grid_shape = _split_grid_shape(records)
+    if grid_shape is not None:
+        columns, rows = grid_shape
+    (
+        spacing_rows,
+        column_count,
+        row_count,
+        aligned_count,
+        missing_count,
+    ) = _auto_align_grid_spacing_rows(records, columns, rows, column_spacing, row_spacing)
+
     if aligned_count <= 0:
+        if missing_count > 0:
+            status = (
+                "Auto align needs the split pieces' generated G-code: press "
+                "Generate G-Code first (files generated before this feature "
+                "lack the PathOrigin header), then align again."
+            )
+        else:
+            status = "No split-sibling nozzle connections found. Auto align was not applied."
         return (
-            gr.update(value=NOZZLE_LAYOUT_GRID),
-            gr.update(visible=True),
-            gr.update(visible=False),
             gr.update(),
             gr.update(),
             gr.update(),
             gr.update(),
-            "No split-sibling nozzle connections found. Auto align was not applied.",
+            gr.update(),
+            gr.update(),
+            status,
         )
 
+    status = (
+        f"Auto aligned {aligned_count} split nozzle connection(s) from the generated "
+        f"G-code in a {column_count} x {row_count} grid. The exact per-connection "
+        "gaps are in the Advanced Grid Spacing table."
+    )
+    if missing_count:
+        status += (
+            f"  \n{missing_count} connection(s) skipped: regenerate G-code for those "
+            "shapes to add the PathOrigin header, then align again."
+        )
     return (
-        gr.update(value=NOZZLE_LAYOUT_GRID),
-        gr.update(visible=True),
-        gr.update(visible=False),
+        gr.update(value=column_count),
+        gr.update(value=row_count),
         gr.update(),
         gr.update(),
         gr.update(value=True),
@@ -2036,13 +1969,8 @@ def auto_align_split_parts_for_raster(
             value=spacing_rows,
             row_count=(len(spacing_rows), "fixed"),
             column_count=(len(ADVANCED_NOZZLE_SPACING_HEADERS), "fixed"),
-            label="Advanced Grid Spacing",
-            visible=True,
         ),
-        (
-            f"Auto aligned {aligned_count} split nozzle connection(s) for {raster_label} "
-            f"in a {column_count} x {row_count} grid: Column Gap X {x_gap:.2f} mm, Row Gap Y {y_gap:.2f} mm."
-        ),
+        status,
     )
 
 
@@ -2061,11 +1989,6 @@ def update_nozzle_grid_preset(
         left, right = preset.split(" x ", 1)
         return gr.update(value=max(1, _coerce_int(left, 1))), gr.update(value=max(1, _coerce_int(right, 1)))
     return gr.update(value=max(1, _coerce_int(columns, 1))), gr.update(value=max(1, _coerce_int(rows, 1)))
-
-
-def update_nozzle_spacing_mode(layout_mode: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
-    custom_selected = layout_mode == NOZZLE_LAYOUT_PAIR_TABLE
-    return gr.update(visible=not custom_selected), gr.update(visible=custom_selected)
 
 
 def update_lead_in_options_visibility(enabled: bool | None) -> dict[str, Any]:
@@ -2110,17 +2033,13 @@ def sync_uploaded_shapes(
     files: Any,
     records: list[dict] | None,
     settings_table: Any | None = None,
-    existing_spacing: Any | None = None,
-    use_individual_spacing: bool | None = False,
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
     next_records = _records_from_files(files, records)
     settings = _shape_settings_rows(next_records)
-    spacing = _spacing_table_update(next_records, existing_spacing, use_individual_spacing)
     return (
         next_records,
         settings,
-        spacing,
         _dropdown_update(next_records),
         _gcode_dropdown_update(next_records),
         _gcode_dropdown_update(next_records, include_upload=True),
@@ -2132,30 +2051,18 @@ def load_sample_shapes(
     files: Any,
     records: list[dict] | None,
     settings_table: Any | None = None,
-    existing_spacing: Any | None = None,
-    use_individual_spacing: bool | None = False,
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
     paths = [str(SAMPLE_STL_DIR / filename) for filename in SAMPLE_STL_FILENAMES if (SAMPLE_STL_DIR / filename).exists()]
     merged_paths = _append_file_paths(files, paths)
     return (
         gr.update(value=merged_paths),
-        *sync_uploaded_shapes(merged_paths, records, None, existing_spacing, use_individual_spacing),
+        *sync_uploaded_shapes(merged_paths, records, None),
     )
-
-
-def update_nozzle_spacing_table_mode(
-    records: list[dict] | None,
-    existing_spacing: Any | None,
-    use_individual_spacing: bool | None,
-) -> dict[str, Any]:
-    return _spacing_table_update(records or [], existing_spacing, use_individual_spacing)
 
 
 def _shape_delete_outputs(
     records: list[dict],
-    existing_spacing: Any | None,
-    use_individual_spacing: bool | None,
     last_delete_at: float | None,
     upload_update: Any | None = None,
 ) -> tuple:
@@ -2163,7 +2070,6 @@ def _shape_delete_outputs(
         upload_update if upload_update is not None else gr.update(),
         records,
         _shape_settings_rows(records),
-        _spacing_table_update(records, existing_spacing, use_individual_spacing),
         _dropdown_update(records),
         _gcode_dropdown_update(records),
         _gcode_dropdown_update(records, include_upload=True),
@@ -2175,8 +2081,6 @@ def _shape_delete_outputs(
 def delete_shape_from_settings(
     records: list[dict] | None,
     settings_table: Any | None,
-    existing_spacing: Any | None,
-    use_individual_spacing: bool | None,
     last_delete_at: float | None,
     evt: gr.SelectData,
 ) -> tuple:
@@ -2185,17 +2089,17 @@ def delete_shape_from_settings(
     selected = getattr(evt, "index", None)
     current_records = _apply_shape_settings(records or [], settings_table)
     if not isinstance(selected, (list, tuple)) or len(selected) < 2:
-        return _shape_delete_outputs(current_records, existing_spacing, use_individual_spacing, last_delete_at)
+        return _shape_delete_outputs(current_records, last_delete_at)
 
     try:
         row_index, column_index = int(selected[0]), int(selected[1])
     except (TypeError, ValueError):
-        return _shape_delete_outputs(current_records, existing_spacing, use_individual_spacing, last_delete_at)
+        return _shape_delete_outputs(current_records, last_delete_at)
     delete_column_index = len(SHAPE_SETTINGS_HEADERS) - 1
     if column_index != delete_column_index or row_index < 0 or row_index >= len(rows):
-        return _shape_delete_outputs(current_records, existing_spacing, use_individual_spacing, last_delete_at)
+        return _shape_delete_outputs(current_records, last_delete_at)
     if last_delete_at and now - float(last_delete_at) < DELETE_SHAPE_COOLDOWN_SECONDS:
-        return _shape_delete_outputs(current_records, existing_spacing, use_individual_spacing, last_delete_at)
+        return _shape_delete_outputs(current_records, last_delete_at)
 
     try:
         delete_idx = int(float(rows[row_index][0]))
@@ -2208,8 +2112,6 @@ def delete_shape_from_settings(
     upload_paths = [record.get("stl_path") for record in next_records if record.get("stl_path")]
     return _shape_delete_outputs(
         next_records,
-        existing_spacing,
-        use_individual_spacing,
         now,
         gr.update(value=upload_paths),
     )
@@ -2289,21 +2191,6 @@ def normalize_shape_dimensions_for_mode(
     return normalized, _shape_settings_rows(normalized)
 
 
-def normalize_shape_settings_and_spacing(
-    records: list[dict] | None,
-    settings_table: Any | None,
-    scale_mode: str | None,
-    existing_spacing: Any | None,
-    use_individual_spacing: bool | None,
-) -> tuple:
-    updated_records, updated_settings = normalize_shape_dimensions_for_mode(records, settings_table, scale_mode)
-    return (
-        updated_records,
-        updated_settings,
-        _spacing_table_update(updated_records, existing_spacing, use_individual_spacing),
-    )
-
-
 def show_selected_model(
     records: list[dict] | None,
     selected: str | None,
@@ -2370,6 +2257,7 @@ def generate_dynamic_layer_stacks(
     settings_table: Any,
     layer_height: float,
     scale_mode: str | None,
+    fil_width: float = 0.8,
     progress: gr.Progress = gr.Progress(),
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
@@ -2398,7 +2286,7 @@ def generate_dynamic_layer_stacks(
             )
         except Exception as exc:
             messages.append(f"Shape {record['idx']}: failed ({exc}).")
-    ref_layers = generate_dynamic_reference_stack(records)
+    ref_layers = generate_dynamic_reference_stack(records, fil_width)
     if ref_layers is not None:
         messages.append("Reference layers: updated automatically.")
     else:
@@ -2406,16 +2294,22 @@ def generate_dynamic_layer_stacks(
     return records, "\n".join(messages), ref_layers
 
 
-def generate_dynamic_reference_stack(records: list[dict] | None) -> LayerStack | None:
-    return build_reference_stack([record.get("layer_stack") for record in (records or [])])
+def generate_dynamic_reference_stack(
+    records: list[dict] | None,
+    fil_width: float = 0.8,
+) -> LayerStack | None:
+    # Snapping the alignment to the fil grid keeps split pieces' scan-grid
+    # phase intact under shared reference motion (exact one-fil seam pitch).
+    return build_reference_stack(
+        [record.get("layer_stack") for record in (records or [])],
+        grid=float(fil_width) if fil_width else None,
+    )
 
 
 def split_selected_shape_for_grid(
     records: list[dict] | None,
     selected: str | None,
     settings_table: Any | None,
-    existing_spacing: Any | None,
-    use_individual_spacing: bool | None,
     columns: float,
     rows: float,
     overlapping_layers: bool,
@@ -2429,7 +2323,6 @@ def split_selected_shape_for_grid(
         return (
             next_records,
             _shape_settings_rows(next_records),
-            _spacing_table_update(next_records, existing_spacing, use_individual_spacing),
             _dropdown_update(next_records, selected_value),
             [record.get("gcode_path") for record in next_records if record.get("gcode_path")],
             _gcode_dropdown_update(next_records),
@@ -2462,6 +2355,9 @@ def split_selected_shape_for_grid(
             rows=split_row_count,
             overlapping_layers=bool(overlapping_layers),
             overlap=float(fil_width) if overlapping_layers else 0.0,
+            # Whole-fil cells (last piece absorbs the remainder): keeps the
+            # required nozzle spacing uniform under shared reference motion.
+            grid=float(fil_width),
         )
     except Exception as exc:
         return _outputs(records, selected, f"Split failed: {exc}")
@@ -2571,9 +2467,13 @@ def generate_dynamic_gcode(
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
     messages: list[str] = []
-    if _ensure_records_sliced(records, layer_height, scale_mode, messages):
-        # Anything re-sliced invalidates the previous reference union.
-        ref_layers = generate_dynamic_reference_stack(records)
+    resliced = _ensure_records_sliced(records, layer_height, scale_mode, messages)
+    if use_reference_motion:
+        # Always rebuild with the CURRENT fil width: the reference stack's
+        # alignment snap grid must match the fil the G-code is generated with.
+        ref_layers = generate_dynamic_reference_stack(records, fil_width)
+    elif resliced:
+        ref_layers = generate_dynamic_reference_stack(records, fil_width)
     contour_sources = _contour_tracing_sources(records)
     if contour_sources:
         enabled = ", ".join(f"Shape {source.owner_idx}" for source in contour_sources)
@@ -2602,6 +2502,7 @@ def generate_dynamic_gcode(
                 raster_pattern=raster_pattern,
                 contour_sources=contour_sources,
                 active_contour_owner=int(record.get("idx", 0)),
+                infill=_coerce_float(record.get("infill", 100.0), 100.0) / 100.0,
                 lead_in_enabled=bool(lead_in_enabled),
                 lead_in_length=float(lead_in_length),
                 lead_in_clearance=float(lead_in_clearance),
@@ -2657,44 +2558,26 @@ def _parts_from_records(records: list[dict] | None) -> tuple[list[dict], list[st
     return parts, messages
 
 
-def _spacing_args_from_table(spacing_table: Any, use_individual_spacing: bool | None = False) -> tuple[float, float, float, float, list[float]]:
-    pairs = _spacing_pairs_from_table(spacing_table)
-    if not pairs:
-        pairs = [(5.0, 0.0)]
-    if not use_individual_spacing:
-        pairs = [pairs[0]]
-    while len(pairs) < 2:
-        pairs.append(pairs[0])
-    extra = [value for pair in pairs[2:] for value in pair]
-    return pairs[0][0], pairs[0][1], pairs[1][0], pairs[1][1], extra
-
-
 def render_dynamic_nozzle_spacing(
     records: list[dict] | None,
-    layout_mode: str | None,
     columns: Any,
     rows: Any,
     column_spacing: Any,
     row_spacing: Any,
     use_grid_individual_spacing: bool,
     grid_spacing_table: Any,
-    use_individual_spacing: bool,
-    spacing_table: Any,
 ) -> tuple[Any, str]:
     parts, _messages = _parts_from_records(records)
     if not parts:
         return None, "No shape G-code available. Generate G-code first."
-    offsets, spacings = _resolve_layout_from_spacing_controls(
+    offsets, spacings = _resolve_nozzle_grid_layout(
         parts,
-        layout_mode,
         columns,
         rows,
         column_spacing,
         row_spacing,
         use_grid_individual_spacing,
         grid_spacing_table,
-        use_individual_spacing,
-        spacing_table,
     )
     return build_nozzle_spacing_figure(parts, offsets, spacings), _format_nozzle_spacing_status(parts, offsets, spacings)
 
@@ -2765,32 +2648,26 @@ def render_dynamic_parallel(
     travel_opacity: float,
     filament_width: float,
     travel_width: float,
-    layout_mode: str | None,
     columns: Any,
     rows: Any,
     column_spacing: Any,
     row_spacing: Any,
     use_grid_individual_spacing: bool,
     grid_spacing_table: Any,
-    use_individual_spacing: bool,
-    spacing_table: Any,
     tube: bool = True,
 ) -> tuple[Any, str]:
     records = _apply_shape_settings(records or [], settings_table)
     parts, messages = _parts_from_records(records)
     if not parts:
         return None, "No shape G-code available. Generate G-code on the Generate G-Code tab first."
-    offsets, spacings = _resolve_layout_from_spacing_controls(
+    offsets, spacings = _resolve_nozzle_grid_layout(
         parts,
-        layout_mode,
         columns,
         rows,
         column_spacing,
         row_spacing,
         use_grid_individual_spacing,
         grid_spacing_table,
-        use_individual_spacing,
-        spacing_table,
     )
     figure = build_parallel_figure(
         parts,
@@ -2824,15 +2701,12 @@ def export_dynamic_parallel_gif(
     records: list[dict] | None,
     settings_table: Any,
     travel_opacity: float,
-    layout_mode: str | None,
     columns: Any,
     rows: Any,
     column_spacing: Any,
     row_spacing: Any,
     use_grid_individual_spacing: bool,
     grid_spacing_table: Any,
-    use_individual_spacing: bool,
-    spacing_table: Any,
     duration: float,
     fps: float,
     elev: float,
@@ -2843,17 +2717,14 @@ def export_dynamic_parallel_gif(
     parts, _messages = _parts_from_records(records)
     if not parts:
         return None
-    offsets, _spacings = _resolve_layout_from_spacing_controls(
+    offsets, _spacings = _resolve_nozzle_grid_layout(
         parts,
-        layout_mode,
         columns,
         rows,
         column_spacing,
         row_spacing,
         use_grid_individual_spacing,
         grid_spacing_table,
-        use_individual_spacing,
-        spacing_table,
     )
 
     def report(frame: int, total: int) -> None:
@@ -2986,12 +2857,7 @@ def build_dynamic_demo() -> gr.Blocks:
             gcode_text = gr.Code(label="Selected G-Code", language=None, lines=18, max_lines=18, interactive=False, elem_classes=["gcode-view"])
 
             with gr.Accordion("Nozzle Spacing", open=False, elem_classes=["settings-accordion"]):
-                nozzle_layout_mode = gr.Radio(
-                    label="Spacing Mode",
-                    choices=[NOZZLE_LAYOUT_GRID, NOZZLE_LAYOUT_PAIR_TABLE],
-                    value=NOZZLE_LAYOUT_GRID,
-                )
-                with gr.Group(visible=True) as nozzle_grid_group:
+                with gr.Group():
                     with gr.Row():
                         nozzle_grid_preset = gr.Dropdown(
                             label="Common Layout",
@@ -3005,27 +2871,20 @@ def build_dynamic_demo() -> gr.Blocks:
                         nozzle_grid_row_spacing = gr.Number(label="Row Gap (Y, mm)", value=0.0, step=0.1)
                     with gr.Row():
                         auto_align_split_parts_button = gr.Button("Auto Align Split Parts", variant="secondary", size="sm")
-                        nozzle_grid_use_individual_spacing = gr.Checkbox(label="Use Different Grid Connection Gaps", value=False)
+                        nozzle_grid_use_individual_spacing = gr.Checkbox(label="Advanced Grid Spacing", value=False)
+                    # Always visible: the "Advanced Grid Spacing" checkbox
+                    # controls whether these per-connection gaps are USED,
+                    # not whether the table shows. Toggling visibility from
+                    # events proved racy (the table wouldn't appear on the
+                    # first Auto Align click).
                     nozzle_grid_spacing_table = gr.Dataframe(
                         headers=ADVANCED_NOZZLE_SPACING_HEADERS,
                         value=[],
                         row_count=(0, "fixed"),
                         column_count=(len(ADVANCED_NOZZLE_SPACING_HEADERS), "fixed"),
                         interactive=True,
-                        label="Advanced Grid Spacing",
-                        visible=False,
+                        label="Advanced Grid Spacing (used when the checkbox is on)",
                         elem_id="nozzle-grid-spacing-table",
-                    )
-                with gr.Group(visible=False) as nozzle_custom_group:
-                    nozzle_use_individual_spacing = gr.Checkbox(label="Use Different Values for Each Nozzle Connection", value=False)
-                    nozzle_spacing_table = gr.Dataframe(
-                        headers=NOZZLE_SPACING_HEADERS,
-                        value=[["Same spacing", "All neighboring nozzles", 5.0, 0.0]],
-                        row_count=(1, "fixed"),
-                        column_count=(len(NOZZLE_SPACING_HEADERS), "fixed"),
-                        interactive=True,
-                        label="Custom Spacing",
-                        elem_id="nozzle-spacing-table",
                     )
                 nozzle_preview_button = gr.Button("Visualize Nozzle Spacing", variant="secondary", elem_id="visualize-nozzle-spacing-button")
                 with gr.Row():
@@ -3120,8 +2979,8 @@ def build_dynamic_demo() -> gr.Blocks:
             nozzle_grid_use_individual_spacing,
         ]
 
-        shape_sync_outputs = [shape_records, shape_settings, nozzle_spacing_table, selected_shape, gcode_text_source, gcode_source, gcode_downloads]
-        stl_upload.change(fn=sync_uploaded_shapes, inputs=[stl_upload, shape_records, shape_settings, nozzle_spacing_table, nozzle_use_individual_spacing], outputs=shape_sync_outputs).then(
+        shape_sync_outputs = [shape_records, shape_settings, selected_shape, gcode_text_source, gcode_source, gcode_downloads]
+        stl_upload.change(fn=sync_uploaded_shapes, inputs=[stl_upload, shape_records, shape_settings], outputs=shape_sync_outputs).then(
             fn=lambda records: _dropdown_update(records),
             inputs=[shape_records],
             outputs=[split_source],
@@ -3132,7 +2991,7 @@ def build_dynamic_demo() -> gr.Blocks:
             outputs=[nozzle_grid_spacing_table],
             queue=False,
         )
-        sync_uploads_button.click(fn=sync_uploaded_shapes, inputs=[stl_upload, shape_records, shape_settings, nozzle_spacing_table, nozzle_use_individual_spacing], outputs=shape_sync_outputs).then(
+        sync_uploads_button.click(fn=sync_uploaded_shapes, inputs=[stl_upload, shape_records, shape_settings], outputs=shape_sync_outputs).then(
             fn=lambda records: _dropdown_update(records),
             inputs=[shape_records],
             outputs=[split_source],
@@ -3143,7 +3002,7 @@ def build_dynamic_demo() -> gr.Blocks:
             outputs=[nozzle_grid_spacing_table],
             queue=False,
         )
-        load_samples_button.click(fn=load_sample_shapes, inputs=[stl_upload, shape_records, shape_settings, nozzle_spacing_table, nozzle_use_individual_spacing], outputs=[stl_upload, *shape_sync_outputs]).then(
+        load_samples_button.click(fn=load_sample_shapes, inputs=[stl_upload, shape_records, shape_settings], outputs=[stl_upload, *shape_sync_outputs]).then(
             fn=lambda records: _dropdown_update(records),
             inputs=[shape_records],
             outputs=[split_source],
@@ -3156,7 +3015,7 @@ def build_dynamic_demo() -> gr.Blocks:
         )
         shape_settings.select(
             fn=delete_shape_from_settings,
-            inputs=[shape_records, shape_settings, nozzle_spacing_table, nozzle_use_individual_spacing, last_shape_delete_at],
+            inputs=[shape_records, shape_settings, last_shape_delete_at],
             outputs=[stl_upload, *shape_sync_outputs, last_shape_delete_at],
         ).then(
             fn=lambda records: _dropdown_update(records),
@@ -3172,9 +3031,9 @@ def build_dynamic_demo() -> gr.Blocks:
 
         preview_inputs = [shape_records, selected_shape, shape_settings, model_opacity, scale_mode]
         shape_settings.change(
-            fn=normalize_shape_settings_and_spacing,
-            inputs=[shape_records, shape_settings, scale_mode, nozzle_spacing_table, nozzle_use_individual_spacing],
-            outputs=[shape_records, shape_settings, nozzle_spacing_table],
+            fn=normalize_shape_dimensions_for_mode,
+            inputs=[shape_records, shape_settings, scale_mode],
+            outputs=[shape_records, shape_settings],
             queue=False,
         ).then(
             fn=_grid_spacing_table_update,
@@ -3207,7 +3066,7 @@ def build_dynamic_demo() -> gr.Blocks:
 
         generate_button.click(
             fn=generate_dynamic_layer_stacks,
-            inputs=[shape_records, shape_settings, layer_height, scale_mode],
+            inputs=[shape_records, shape_settings, layer_height, scale_mode, fil_width],
             outputs=[shape_records, slicer_status, ref_layers],
         ).then(
             fn=lambda records: _dropdown_update(records),
@@ -3223,8 +3082,6 @@ def build_dynamic_demo() -> gr.Blocks:
                 shape_records,
                 split_source,
                 shape_settings,
-                nozzle_spacing_table,
-                nozzle_use_individual_spacing,
                 split_columns,
                 split_rows,
                 split_overlapping_layers,
@@ -3235,7 +3092,6 @@ def build_dynamic_demo() -> gr.Blocks:
             outputs=[
                 shape_records,
                 shape_settings,
-                nozzle_spacing_table,
                 selected_shape,
                 gcode_downloads,
                 gcode_text_source,
@@ -3245,7 +3101,7 @@ def build_dynamic_demo() -> gr.Blocks:
             ],
         ).then(
             fn=generate_dynamic_reference_stack,
-            inputs=[shape_records],
+            inputs=[shape_records, fil_width],
             outputs=[ref_layers],
         ).then(
             fn=_grid_spacing_table_update,
@@ -3286,26 +3142,18 @@ def build_dynamic_demo() -> gr.Blocks:
         )
         gcode_text_source.change(fn=load_selected_gcode_text, inputs=[shape_records, gcode_text_source], outputs=[gcode_text])
         refresh_gcode_text_button.click(fn=load_selected_gcode_text, inputs=[shape_records, gcode_text_source], outputs=[gcode_text])
-        nozzle_layout_mode.change(
-            fn=update_nozzle_spacing_mode,
-            inputs=[nozzle_layout_mode],
-            outputs=[nozzle_grid_group, nozzle_custom_group],
-            queue=False,
-        )
         auto_align_split_parts_button.click(
-            fn=auto_align_split_parts_for_raster,
+            fn=auto_align_split_parts,
             inputs=[
                 shape_records,
                 nozzle_grid_columns,
                 nozzle_grid_rows,
                 nozzle_grid_column_spacing,
                 nozzle_grid_row_spacing,
-                gcode_raster_pattern,
             ],
             outputs=[
-                nozzle_layout_mode,
-                nozzle_grid_group,
-                nozzle_custom_group,
+                nozzle_grid_columns,
+                nozzle_grid_rows,
                 nozzle_grid_column_spacing,
                 nozzle_grid_row_spacing,
                 nozzle_grid_use_individual_spacing,
@@ -3332,26 +3180,27 @@ def build_dynamic_demo() -> gr.Blocks:
             nozzle_grid_row_spacing,
             nozzle_grid_use_individual_spacing,
         ):
-            grid_spacing_control.change(
+            # .input (user edits only), NOT .change: Auto Align sets these
+            # controls programmatically and .change listeners would fire and
+            # rebuild the spacing table, clobbering the aligned gaps it just
+            # wrote. Flows that set them programmatically (preset dropdown,
+            # Auto Align) update the table explicitly themselves.
+            grid_spacing_control.input(
                 fn=_grid_spacing_table_update,
                 inputs=grid_spacing_refresh_inputs,
                 outputs=[nozzle_grid_spacing_table],
                 queue=False,
             )
-        nozzle_use_individual_spacing.change(fn=update_nozzle_spacing_table_mode, inputs=[shape_records, nozzle_spacing_table, nozzle_use_individual_spacing], outputs=[nozzle_spacing_table], queue=False)
         nozzle_preview_button.click(
             fn=render_dynamic_nozzle_spacing,
             inputs=[
                 shape_records,
-                nozzle_layout_mode,
                 nozzle_grid_columns,
                 nozzle_grid_rows,
                 nozzle_grid_column_spacing,
                 nozzle_grid_row_spacing,
                 nozzle_grid_use_individual_spacing,
                 nozzle_grid_spacing_table,
-                nozzle_use_individual_spacing,
-                nozzle_spacing_table,
             ],
             outputs=[nozzle_spacing_plot, nozzle_spacing_status],
         )
@@ -3398,15 +3247,12 @@ def build_dynamic_demo() -> gr.Blocks:
             pp_travel_opacity,
             pp_filament_width,
             pp_travel_width,
-            nozzle_layout_mode,
             nozzle_grid_columns,
             nozzle_grid_rows,
             nozzle_grid_column_spacing,
             nozzle_grid_row_spacing,
             nozzle_grid_use_individual_spacing,
             nozzle_grid_spacing_table,
-            nozzle_use_individual_spacing,
-            nozzle_spacing_table,
         ]
         parallel_outputs = [parallel_plot, parallel_status, parallel_mode, parallel_anim_controls, pp_width_row, pp_export_group]
         parallel_line_button.click(fn=render_dynamic_parallel_lines, inputs=parallel_render_inputs, outputs=parallel_outputs)
@@ -3419,15 +3265,12 @@ def build_dynamic_demo() -> gr.Blocks:
                 shape_records,
                 shape_settings,
                 pp_gif_travel_opacity,
-                nozzle_layout_mode,
                 nozzle_grid_columns,
                 nozzle_grid_rows,
                 nozzle_grid_column_spacing,
                 nozzle_grid_row_spacing,
                 nozzle_grid_use_individual_spacing,
                 nozzle_grid_spacing_table,
-                nozzle_use_individual_spacing,
-                nozzle_spacing_table,
                 pp_gif_duration,
                 pp_gif_fps,
                 pp_elev,

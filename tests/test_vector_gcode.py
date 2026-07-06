@@ -192,11 +192,13 @@ def test_gcode_header_writes_presets_before_initial_aux_commands(tmp_path) -> No
     ]
 
     assert lines[0] == "G91"
-    assert lines[1] == "{aux_command}WAGO_ValveCommands(7, 0)"
-    assert lines[2] == "serialPort3.write(eval(setpress(25)))"
-    assert lines[3] == "serialPort3.write(eval(togglepress()))"
-    assert lines[4].startswith("{aux_command}WAGO_ValveCommands(")
+    # World anchor of the relative toolpath (origin at sweep start (-1, 0.5)).
+    assert lines[1] == "; PathOrigin X-1.0 Y0.5"
+    assert lines[2] == "{aux_command}WAGO_ValveCommands(7, 0)"
+    assert lines[3] == "serialPort3.write(eval(setpress(25)))"
+    assert lines[4] == "serialPort3.write(eval(togglepress()))"
     assert lines[5].startswith("{aux_command}WAGO_ValveCommands(")
+    assert lines[6].startswith("{aux_command}WAGO_ValveCommands(")
 
 
 def test_gcode_lead_in_runs_once_before_first_layer(tmp_path) -> None:
@@ -515,6 +517,109 @@ def test_circle_spiral_raster_reverses_between_layers(tmp_path) -> None:
     assert end_z == 1.0
 
 
+def _total_length(moves: list[dict]) -> float:
+    return sum(math.dist(move["start"][:2], move["end"][:2]) for move in moves)
+
+
+def _print_length(moves: list[dict]) -> float:
+    return sum(
+        math.dist(move["start"][:2], move["end"][:2])
+        for move in moves
+        if move["color"] == 255
+    )
+
+
+def test_half_infill_skips_alternate_lines_but_keeps_the_same_path(tmp_path) -> None:
+    layer = box(0.0, 0.0, 4.0, 4.0)
+    stack = _stack(layer, layer)
+
+    def _generate(infill: float, label: str):
+        path = generate_vector_gcode(
+            stack,
+            shape_name=label,
+            pressure=25,
+            valve=7,
+            port=3,
+            fil_width=1.0,
+            layer_height=1.0,
+            infill=infill,
+            output_dir=tmp_path / label,
+        )
+        return _moves_with_colors(path.read_text())
+
+    full = _generate(1.0, "full")
+    half = _generate(0.5, "half")
+
+    # Identical motion: same final position and same total traversed length.
+    assert full[-1]["end"] == half[-1]["end"]
+    assert abs(_total_length(full) - _total_length(half)) < 1e-6
+
+    # Half the lines dispense: 2 of the 4 sweeps per layer print.
+    assert abs(_print_length(half) - _print_length(full) / 2) < 1e-6
+
+    # The printing sweeps sit on alternating scanlines (one fil apart x2).
+    half_print_rows = sorted({round(m["start"][1], 6) for m in half if m["color"] == 255 and m["start"][2] == 0.0})
+    assert len(half_print_rows) == 2
+    assert abs((half_print_rows[1] - half_print_rows[0]) - 2.0) < 1e-9
+
+
+def test_infill_selection_is_shared_across_reference_motion(tmp_path) -> None:
+    small = _stack(box(0.0, 0.0, 2.0, 2.0), name="small")
+    big = _stack(box(0.0, 0.0, 4.0, 4.0), name="big")
+    reference = build_reference_stack([small, big])
+
+    def _generate(stack: LayerStack, infill: float, label: str):
+        path = generate_vector_gcode(
+            stack,
+            shape_name=label,
+            pressure=25,
+            valve=7,
+            port=3,
+            fil_width=1.0,
+            motion=reference,
+            infill=infill,
+            output_dir=tmp_path / label,
+        )
+        return _moves_with_colors(path.read_text())
+
+    sparse = _generate(small, 0.5, "sparse")
+    dense = _generate(big, 1.0, "dense")
+
+    # Different infill per shape, one shared motion path.
+    assert sparse[-1]["end"] == dense[-1]["end"]
+    assert abs(_total_length(sparse) - _total_length(dense)) < 1e-6
+    assert 0 < _print_length(sparse) < _print_length(dense)
+
+
+def test_spiral_infill_skips_rings_and_keeps_the_path(tmp_path) -> None:
+    layer = box(0.0, 0.0, 6.0, 6.0)
+    stack = _stack(layer)
+
+    def _generate(pattern: str, infill: float, label: str):
+        path = generate_vector_gcode(
+            stack,
+            shape_name=label,
+            pressure=25,
+            valve=7,
+            port=3,
+            fil_width=1.0,
+            raster_pattern=pattern,
+            infill=infill,
+            output_dir=tmp_path / label,
+        )
+        return _moves_with_colors(path.read_text())
+
+    for pattern in (RASTER_PATTERN_RECTANGULAR_SPIRAL, RASTER_PATTERN_CIRCLE_SPIRAL):
+        full = _generate(pattern, 1.0, f"{pattern}-full".replace(" ", "_"))
+        half = _generate(pattern, 0.5, f"{pattern}-half".replace(" ", "_"))
+        # Identical path within the writer's micron-level delta rounding
+        # (segment split points differ, so the rounding accumulates
+        # differently by up to ~1 um over tens of thousands of moves).
+        assert math.dist(full[-1]["end"], half[-1]["end"]) < 1e-4, pattern
+        assert abs(_total_length(full) - _total_length(half)) < 1e-3, pattern
+        assert 0 < _print_length(half) < _print_length(full), pattern
+
+
 def test_layer_contour_loops_follow_polygon_rings() -> None:
     hollow = MultiPolygon(
         [
@@ -753,6 +858,92 @@ def test_reference_motion_shares_path_and_gates_valve_per_shape(tmp_path) -> Non
     assert _print_length(small_moves) < _print_length(big_moves) / 2 + 4.0
 
 
+def test_reference_motion_contours_share_path_and_gate_valve_per_shape(tmp_path) -> None:
+    small = _stack(box(0.0, 0.0, 2.0, 2.0), name="small")
+    big = _stack(box(0.0, 0.0, 4.0, 4.0), name="big")
+    reference = build_reference_stack([small, big])
+    assert reference is not None
+    contour_sources = [
+        ContourSource(owner_idx=1, stack=small),
+        ContourSource(owner_idx=2, stack=big),
+    ]
+
+    def _generate(stack: LayerStack, owner: int, label: str):
+        path = generate_vector_gcode(
+            stack,
+            shape_name=label,
+            pressure=25,
+            valve=7,
+            port=3,
+            fil_width=1.0,
+            motion=reference,
+            contour_sources=contour_sources,
+            active_contour_owner=owner,
+            output_dir=tmp_path / label,
+        )
+        return _moves_with_colors(path.read_text())
+
+    small_moves = _generate(small, 1, "small")
+    big_moves = _generate(big, 2, "big")
+
+    # The motion including EVERY shape's contour tour is identical: same final
+    # position and same total traversed length for both heads.
+    assert small_moves[-1]["end"] == big_moves[-1]["end"]
+
+    def _total_length(moves: list[dict]) -> float:
+        return sum(math.dist(move["start"][:2], move["end"][:2]) for move in moves)
+
+    assert abs(_total_length(small_moves) - _total_length(big_moves)) < 1e-6
+
+    # In the shared frame (origin at the motion sweep start (-2, -0.5); big is
+    # re-centred to (-1,-1)..(3,3), small stays (0,0)..(2,2)):
+    small_corners = {(2.0, 0.5), (4.0, 0.5), (4.0, 2.5), (2.0, 2.5)}
+    big_corners = {(1.0, -0.5), (5.0, -0.5), (5.0, 3.5), (1.0, 3.5)}
+
+    def _endpoints(moves: list[dict], color: int) -> set[tuple[float, float]]:
+        return {
+            (round(move["end"][0], 6), round(move["end"][1], 6))
+            for move in moves
+            if move["color"] == color
+        }
+
+    # Each shape PRINTS its own outline and TRAVELS the other shape's outline.
+    assert small_corners <= _endpoints(small_moves, 255)
+    assert big_corners <= _endpoints(small_moves, 0)
+    assert big_corners <= _endpoints(big_moves, 255)
+    assert small_corners <= _endpoints(big_moves, 0)
+
+
+def test_solo_contours_still_trace_only_own_shape(tmp_path) -> None:
+    small = _stack(box(0.0, 0.0, 2.0, 2.0), name="small")
+    big = _stack(box(0.0, 0.0, 4.0, 4.0), name="big")
+    contour_sources = [
+        ContourSource(owner_idx=1, stack=small),
+        ContourSource(owner_idx=2, stack=big),
+    ]
+
+    gcode_path = generate_vector_gcode(
+        small,
+        shape_name="solo",
+        pressure=25,
+        valve=7,
+        port=3,
+        fil_width=1.0,
+        contour_sources=contour_sources,
+        active_contour_owner=1,
+        output_dir=tmp_path,
+    )
+
+    moves = _moves_with_colors(gcode_path.read_text())
+    # Without reference motion the other shape's contour must NOT be traced:
+    # nothing ever moves outside the small shape's buffered footprint
+    # (origin at world (-1, 0.5), so relative x spans [0, 4], y [-0.5, 1.5];
+    # the big shape's contour would reach (5.0, 3.5)).
+    for move in moves:
+        assert -0.5 <= move["end"][0] <= 4.2
+        assert -1.0 <= move["end"][1] <= 2.0
+
+
 def test_build_reference_stack_unions_center_aligned_layers() -> None:
     first = _stack(box(0.0, 0.0, 2.0, 2.0), name="first")
     second = _stack(box(10.0, 10.0, 14.0, 14.0), name="second")
@@ -796,6 +987,76 @@ def test_split_layer_stack_grid_orders_rows_top_down() -> None:
     assert pieces[0].bounds == ((0.0, 2.0, 0.0), (2.0, 4.0, 1.0))
     assert pieces[3].bounds == ((2.0, 0.0, 0.0), (4.0, 2.0, 1.0))
     assert all(piece.layers[0].area == 4.0 for piece in pieces)
+
+
+def test_grid_split_pads_equal_whole_fil_cells() -> None:
+    # 20.0 / 4 = 5.0 mm cells, which is 6.25 fil widths — not representable.
+    # With `grid`, every cell rounds UP to 7 fils (5.6 mm) and the 2.4 mm
+    # leftover becomes blank margin split evenly outside the outer edges.
+    layer = box(0.0, 0.0, 20.0, 4.0)
+    stack = _stack(layer, name="wide")
+
+    pieces = split_layer_stack_grid(stack, columns=4, rows=1, grid=0.8)
+
+    widths = {round(piece.bounds[1][0] - piece.bounds[0][0], 6) for piece in pieces}
+    assert widths == {5.6}
+    # Padding is centred: 1.2 mm of blank space beyond each outer edge.
+    assert round(pieces[0].bounds[0][0], 6) == -1.2
+    assert round(pieces[-1].bounds[1][0], 6) == 21.2
+    # No material is lost or duplicated by the padded cells.
+    total_area = sum(piece.layers[0].area for piece in pieces)
+    assert abs(total_area - layer.area) < 1e-9
+
+
+def test_grid_split_reference_deltas_are_uniform() -> None:
+    from vector_toolpath import _centering_delta
+
+    layer = box(0.0, 0.0, 20.0, 4.0)
+    stack = _stack(layer, name="wide")
+    pieces = split_layer_stack_grid(stack, columns=4, rows=1, grid=0.8)
+    reference = build_reference_stack(pieces, grid=0.8)
+    assert reference is not None
+
+    deltas = [_centering_delta(piece, reference)[0] for piece in pieces]
+    diffs = {round(a - b, 6) for a, b in zip(deltas, deltas[1:])}
+    # Uniform spacing between every consecutive pair (one cell = 7 fils),
+    # so the physical nozzle offsets are the same for every connection.
+    assert diffs == {5.6}
+
+
+def test_split_overlap_seam_raster_distance_is_equal_on_both_sides() -> None:
+    from vector_toolpath import _axis_raster_segments
+
+    # 7.5 mm is deliberately not a multiple of the 1 mm fil width, so raster
+    # quantization leaves slack. The slack must be split evenly: both pieces'
+    # lines sit the same distance from the (shifted) cut on every layer.
+    layer = MultiPolygon([box(0.0, 0.0, 7.5, 4.0)])
+    stack = LayerStack(
+        layers=[layer, layer],
+        z_values=[0.5, 1.5],
+        bounds=((0.0, 0.0, 0.0), (7.5, 4.0, 2.0)),
+        layer_height=1.0,
+        name="seam",
+    )
+    left, right = split_layer_stack_grid(
+        stack, columns=2, rows=1, overlapping_layers=True, overlap=0.5
+    )
+
+    for layer_number in range(2):
+        left_columns = sorted(
+            {seg[0] for seg in _axis_raster_segments(
+                left.layers[layer_number], left.layers[layer_number], 1.0, "Y"
+            ) if seg[4] == 255}
+        )
+        right_columns = sorted(
+            {seg[0] for seg in _axis_raster_segments(
+                right.layers[layer_number], right.layers[layer_number], 1.0, "Y"
+            ) if seg[4] == 255}
+        )
+        seam = left.layers[layer_number].bounds[2]
+        left_distance = seam - left_columns[-1]
+        right_distance = right_columns[0] - seam
+        assert abs(left_distance - right_distance) < 1e-9
 
 
 def test_split_layer_stack_grid_overlap_alternates_between_layers() -> None:

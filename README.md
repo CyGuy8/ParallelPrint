@@ -47,11 +47,12 @@ Then open the local Gradio URL in your browser, upload STL files or load the bun
 - Slices each shape into per-layer vector outlines held in memory (no intermediate image files)
 - Automatically unions the sliced shapes into a combined reference layer set whenever shapes are sliced
 - Splits one sliced shape's geometry into an editable row/column grid for multi-nozzle printing of one large shape
-- Converts sliced layers into G-code files with pressure, valve, nozzle, and port settings per shape from the Shape Settings table
+- Converts sliced layers into G-code files with pressure, valve, nozzle, port, and infill % settings per shape from the Shape Settings table
+- **Infill %** per shape skips dispensing on evenly-distributed raster lines (rings/revolutions for spiral patterns) — at 50% every other line prints — while the motion path stays exactly the same, so parallel shapes with different infill still share one print path
 - Appends a shape outline contour after each enabled shape layer by tracing that layer's polygon boundary
 - Offers G-code generation options for raster pattern, **Use G1 for all moves** (no rapid travel command), and **Use combined reference outline for motion** (all shapes share one nozzle path; each dispenses only its own geometry)
 - Re-slices shapes automatically during G-code generation when their slices are missing or stale, so "upload, then Generate G-Code" works in one click
-- Calculates X/Y nozzle spacing from an editable adjacent-pair spacing table, then visualizes the resulting nozzle layout
+- Calculates X/Y nozzle spacing from a grid layout (columns/rows plus gaps), with an optional per-connection Advanced Grid Spacing table, then visualizes the resulting nozzle layout
 - Previews selected generated G-code inline
 - Visualizes generated or uploaded G-code tool paths, with the source selectable from any active generated shape or an uploaded file
 - Renders the tool path as a fast line plot or an animated 3D tube plot (play/pause, speed, scrub, frame-step, nozzle marker)
@@ -91,9 +92,10 @@ The **Multi-Nozzle Split** accordion on the **Shapes & Slicing** tab can split o
 - Generated files include pressure preset commands and WAGO valve commands based on the selected pressure, valve, and port; the nozzle number controls layout/spacing assignment.
 - Pressure increases by `0.1` psi per layer by default.
 - **Use G1 for all moves**: when enabled, every movement line is emitted as `G1` (no `G0` rapid travel); the WAGO valve still marks where material is dispensed. Applies to all shapes.
-- **Use combined reference outline for motion**: when enabled, every shape's *motion* is taken from the combined reference layer union while each shape's *valve/dispensing* comes from its own layer polygons — so parallel print heads share one synchronized nozzle path and each deposits only its own geometry. The reference union is rebuilt automatically when shapes are sliced.
+- **Use combined reference outline for motion**: when enabled, every shape's *motion* is taken from the combined reference layer union while each shape's *valve/dispensing* comes from its own layer polygons — so parallel print heads share one synchronized nozzle path and each deposits only its own geometry. The reference union is rebuilt automatically when shapes are sliced. Contour tracing stays synchronized too: every shape traces every traced shape's contour, opening its valve only on its own outline.
+- Every generated file starts with a `; PathOrigin X.. Y..` comment: the world position (in the shape's own frame) that the relative toolpath starts from. Tools use it to place parallel parts so split pieces reassemble.
 - **Raster Pattern**: `X-direction raster` sweeps every layer back-and-forth in X. `Y-direction raster` rasters every layer in Y. `Woodpile raster` alternates the raster axis by layer, switching between X-direction and Y-direction sweeps. `Rectangular Spiral raster` walks each layer from the outer layer bounds toward the center, then reverses from center to edge on the next layer. `Circle Spiral raster` uses a shrinking circular spiral from the layer bounds toward the center, then reverses outward on the next layer. Spiral motion covers the layer bounds; the valve opens only where the path is inside material.
-- **Auto Align Split Parts**: in Nozzle Spacing, fills Grid Layout gaps for split-piece alignment. X-direction raster uses X `-3.2` mm and Y `-0.8` mm; Y-direction raster switches those values.
+- **Auto Align Split Parts**: in Nozzle Spacing, computes exact per-connection grid gaps from the split pieces' generated G-code (`PathOrigin` anchors + toolpath bounds), sets the grid columns/rows from the split, and fills the Advanced Grid Spacing table. Works for every raster pattern, filament width, reference-motion setting, and overlapping-layer split. Requires the pieces' G-code to be generated first.
 - **Contour Tracing**: enabled per row in Shape Settings. The app traces the layer polygon's boundary rings (holes traced separately), travels from the layer raster end to the nearest contour point, prints the contour, then returns to the raster endpoint before the next layer.
 
 ### Print vs Travel Classification

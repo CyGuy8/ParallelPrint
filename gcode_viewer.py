@@ -21,6 +21,12 @@ _AXIS_RE = re.compile(r"([XYZxyz])\s*([-+]?(?:\d*\.\d+|\d+\.?)(?:e[-+]?\d+)?)")
 # Pneumatic valve toggle: WAGO_ValveCommands(<valve>, <0=close|1=open>). Some
 # generators emit every move as G1 and convey extrusion only through the valve.
 _VALVE_RE = re.compile(r"WAGO_ValveCommands\(\s*(\d+)\s*,\s*(\d+)\s*\)", re.IGNORECASE)
+# World anchor written by this app's generator: the absolute position, in the
+# shape's own coordinate frame, that the relative toolpath starts from.
+_PATH_ORIGIN_RE = re.compile(
+    r"^;\s*PathOrigin\s+X([-+]?[\d.]+(?:e[-+]?\d+)?)\s+Y([-+]?[\d.]+(?:e[-+]?\d+)?)",
+    re.MULTILINE,
+)
 
 
 def parse_gcode_path(gcode_text: str) -> dict:
@@ -143,6 +149,13 @@ def parse_gcode_path(gcode_text: str) -> dict:
             next_print_layer = z_to_layer[round(move["end"][2], 6)]
         move["layer"] = next_print_layer
 
+    origin_match = _PATH_ORIGIN_RE.search(gcode_text)
+    path_origin = (
+        (float(origin_match.group(1)), float(origin_match.group(2)))
+        if origin_match
+        else None
+    )
+
     return {
         "print_segments": print_segments,
         "travel_segments": travel_segments,
@@ -150,6 +163,7 @@ def parse_gcode_path(gcode_text: str) -> dict:
         "layer_count": len(print_z),
         "bounds": bounds,
         "point_count": len(all_x),
+        "path_origin": path_origin,
     }
 
 

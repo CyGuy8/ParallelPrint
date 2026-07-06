@@ -25,6 +25,15 @@ class LayerStack:
     `bounds` is the scaled mesh's axis-aligned bounding box. For grid-split
     pieces it is the piece's nominal cell box, which keeps reference-stack
     centring stable even when the clipped geometry shrinks.
+
+    `scan_frame` is the XY box the raster scan grid is anchored to. Grid-split
+    pieces inherit the parent shape's frame so all pieces raster on one
+    continuous line grid and seams keep an exact one-fil-width pitch.
+
+    `align_center`/`align_grid` are stamped by `build_reference_stack` on the
+    combined reference stack: the common centre shapes were aligned to, and
+    the grid the alignment deltas were snapped to — so later alignment of a
+    shape against the reference reproduces exactly the same translation.
     """
 
     layers: list[MultiPolygon]
@@ -32,6 +41,9 @@ class LayerStack:
     bounds: Bounds3D
     layer_height: float
     name: str = ""
+    scan_frame: tuple[float, float, float, float] | None = None
+    align_center: tuple[float, float] | None = None
+    align_grid: float | None = None
 
 
 def load_mesh(stl_path: str | Path) -> trimesh.Trimesh:

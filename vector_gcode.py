@@ -22,8 +22,10 @@ from vector_toolpath import (
     RASTER_PATTERN_WOODPILE,
     RASTER_PATTERN_Y_DIRECTION,
     ContourSource,
+    _centering_delta,
     _lead_in_moves,
     _normalize_raster_pattern,
+    _scan_anchor,
     align_stack_to,
     build_contour_layers,
     plan_layer_moves,
@@ -107,6 +109,7 @@ def write_gcode_file(
     increase_pressure_per_layer: float,
     pressure_ramp_enabled: bool,
     all_g1: bool,
+    path_origin: tuple[float, float] | None = None,
 ) -> None:
     off_color = 0
     com_port = f"serialPort{port}"
@@ -120,6 +123,13 @@ def write_gcode_file(
 
     with open(gcode_path, "w") as f:
         f.write("G91\n")
+        if path_origin is not None:
+            # World anchor of the relative toolpath: absolute position (in the
+            # shape's own coordinate frame) of the point the moves start from.
+            # Lets tools place parallel parts so split pieces reassemble.
+            f.write(
+                f"; PathOrigin X{_coord(path_origin[0])} Y{_coord(path_origin[1])}\n"
+            )
         f.write(_valve_cmd(valve, 0))
         for line in setpress_lines:
             f.write(f"{line}\n")
@@ -186,6 +196,7 @@ def generate_vector_gcode(
     motion: LayerStack | None = None,
     contour_sources: list[ContourSource] | None = None,
     active_contour_owner: int | None = None,
+    infill: float = 1.0,
     increase_pressure_per_layer: float = 0.1,
     pressure_ramp_enabled: bool = True,
     all_g1: bool = False,
@@ -229,7 +240,20 @@ def generate_vector_gcode(
         reference=contour_reference,
     )
 
-    gcode_list = plan_layer_moves(
+    # Anchor the raster scan grid to the motion stack's frame (a split
+    # piece's frame is its parent shape's bounds) so lines stack across
+    # layers and stay on one continuous grid across split pieces.
+    frame_stack = motion if motion is not None else shape
+    if frame_stack.scan_frame is not None:
+        frame_x_min, frame_y_min, frame_x_max, frame_y_max = frame_stack.scan_frame
+    else:
+        (frame_x_min, frame_y_min, _fz), (frame_x_max, frame_y_max, _fz2) = frame_stack.bounds
+    scan_anchors = (
+        _scan_anchor(frame_x_min, frame_x_max, fil_width),
+        _scan_anchor(frame_y_min, frame_y_max, fil_width),
+    )
+
+    gcode_list, toolpath_origin = plan_layer_moves(
         motion_layers,
         valve_layers,
         fil_width,
@@ -237,7 +261,19 @@ def generate_vector_gcode(
         raster_pattern,
         contour_layers,
         active_contour_owner,
+        shared_motion=motion is not None,
+        scan_anchors=scan_anchors,
+        infill_fraction=max(0.0, min(1.0, float(infill))),
     )
+
+    # World anchor: the toolpath origin expressed in the shape's own frame.
+    # With reference motion the geometry was translated by the centering
+    # delta, so subtract it to get back to the shape's coordinates.
+    if motion is not None:
+        delta_x, delta_y = _centering_delta(shape, motion)
+    else:
+        delta_x = delta_y = 0.0
+    path_origin = (toolpath_origin[0] - delta_x, toolpath_origin[1] - delta_y)
 
     lead_in = _lead_in_moves(
         lead_in_enabled,
@@ -267,5 +303,6 @@ def generate_vector_gcode(
         increase_pressure_per_layer=float(increase_pressure_per_layer),
         pressure_ramp_enabled=bool(pressure_ramp_enabled),
         all_g1=bool(all_g1),
+        path_origin=path_origin,
     )
     return gcode_path

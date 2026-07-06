@@ -227,12 +227,15 @@ def _classify_polyline(
     points: list[tuple[float, float]],
     valve: MultiPolygon,
     eps: float = EPS,
+    keep_point=None,
 ) -> list[Seg]:
     """Split a motion polyline at valve-boundary crossings and color the pieces.
 
     Preserves path order (a whole-polyline shapely intersection would not).
     Pieces on the boundary count as printing (`covers`), matching the raster
-    convention that boundary-grazing sweeps dispense.
+    convention that boundary-grazing sweeps dispense. `keep_point(x, y)` can
+    additionally veto dispensing for a piece (evaluated at its midpoint) —
+    used for partial infill; the motion is unaffected.
     """
     segments: list[Seg] = []
     has_valve = valve is not None and not valve.is_empty
@@ -270,7 +273,10 @@ def _classify_polyline(
             if (t1 - t0) * seg_len <= eps:
                 continue
             mid_x, mid_y = _point_along((t0 + t1) / 2.0, x0, y0, x1, y1)
-            color = 255 if valve.covers(Point(mid_x, mid_y)) else 0
+            dispensing = valve.covers(Point(mid_x, mid_y))
+            if dispensing and keep_point is not None:
+                dispensing = keep_point(mid_x, mid_y)
+            color = 255 if dispensing else 0
             start = _point_along(t0, x0, y0, x1, y1)
             end = _point_along(t1, x0, y0, x1, y1)
             _append_colored_segment(segments, *start, *end, color)
@@ -278,18 +284,68 @@ def _classify_polyline(
     return segments
 
 
-def _scan_coords(lo: float, hi: float, fil_width: float) -> list[float]:
-    """Scanline positions at half-fil_width offsets; always at least one line."""
-    if hi - lo < fil_width:
-        return [(lo + hi) / 2.0]
+def _infill_line_keep(fraction: float):
+    """Line-selection gate for partial infill; None means print every line.
 
-    coords: list[float] = []
-    value = lo + fil_width / 2.0
-    limit = hi - fil_width / 2.0 + 1e-9
-    while value <= limit:
-        coords.append(value)
-        value += fil_width
-    return coords
+    Uses a Bresenham-style distribution so kept lines spread evenly: line k
+    dispenses iff floor((k+1)*f) > floor(k*f). At f=0.5 every other line
+    prints; at f=1 all do; at f=0 none. `k` is a global grid index, so the
+    same lines are selected across layers, across split pieces sharing a
+    parent frame, and across shapes sharing reference motion — the motion
+    path itself is never affected.
+    """
+    if fraction >= 1.0:
+        return None
+    fraction = max(0.0, float(fraction))
+
+    def keep(line_index: int) -> bool:
+        return math.floor((line_index + 1) * fraction) - math.floor(line_index * fraction) >= 1
+
+    return keep
+
+
+def _scan_anchor(lo: float, hi: float, fil_width: float) -> float:
+    """First scanline position of the centred grid spanning [lo, hi].
+
+    The grid is centred: when the extent is not an exact multiple of
+    fil_width, the leftover slack is split evenly between both edges.
+    """
+    extent = hi - lo
+    if extent < fil_width:
+        return (lo + hi) / 2.0
+    count = int(math.floor(extent / fil_width + 1e-9))
+    slack = max(0.0, extent - count * fil_width)
+    return lo + slack / 2.0 + fil_width / 2.0
+
+
+def _scan_coords(
+    lo: float,
+    hi: float,
+    fil_width: float,
+    anchor: float | None = None,
+) -> list[float]:
+    """Scanline positions in [lo, hi], fil_width apart; at least one line.
+
+    Without `anchor` the set is centred in [lo, hi] (always at least one
+    line). With `anchor` the lines lie on the global grid
+    {anchor + k*fil_width}: grid-split pieces anchored to their parent's
+    frame then raster on one continuous line grid, so the assembled seams
+    keep an exact one-fil-width pitch instead of drifting by each piece's own
+    quantization slack. The interval is half-open at `hi` so a line exactly
+    on a cut belongs to exactly one piece, and a sliver too thin to contain a
+    grid line gets none — the neighbouring grid line (at most one fil away)
+    covers it with filament width.
+    """
+    if anchor is None:
+        anchor = _scan_anchor(lo, hi, fil_width)
+        if hi - lo < fil_width:
+            return [anchor]
+        count = int(math.floor((hi - lo) / fil_width + 1e-9))
+        return [anchor + index * fil_width for index in range(count)]
+
+    k_lo = math.ceil((lo - anchor) / fil_width - 1e-9)
+    k_hi = math.floor((hi - anchor) / fil_width - 1e-9)
+    return [anchor + k * fil_width for k in range(int(k_lo), int(k_hi) + 1)]
 
 
 def _axis_raster_segments(
@@ -299,13 +355,18 @@ def _axis_raster_segments(
     axis: str,
     reverse_order: bool = False,
     start_forward: bool = True,
+    scan_anchor: float | None = None,
+    infill_keep=None,
 ) -> list[Seg]:
     """Snake raster of `motion`, dispensing only inside `valve`.
 
     Axis "X" sweeps along X with rows stacked in Y; axis "Y" sweeps along Y
     with columns stacked in X. Each sweep spans from the first to the last
     motion chord (crossing interior gaps valve-off) and gets a fil_width
-    valve-settle travel buffer before and after.
+    valve-settle travel buffer before and after. `scan_anchor` pins the
+    scanlines to a global grid (see `_scan_coords`). `infill_keep(k)` gates
+    dispensing per grid line for partial infill: skipped lines are still
+    swept, just with the valve closed, so the motion never changes.
     """
     if motion is None or motion.is_empty:
         return []
@@ -316,9 +377,15 @@ def _axis_raster_segments(
     else:
         scan_lo, scan_hi = min_y, max_y
 
-    coords = _scan_coords(scan_lo, scan_hi, fil_width)
+    coords = _scan_coords(scan_lo, scan_hi, fil_width, anchor=scan_anchor)
     if reverse_order:
         coords = coords[::-1]
+
+    # Grid index base: orientation-independent, and shared across pieces when
+    # anchored to a common frame, so infill line selection lines up at seams.
+    index_base = scan_anchor if scan_anchor is not None else _scan_anchor(
+        scan_lo, scan_hi, fil_width
+    )
 
     segments: list[Seg] = []
     sweep_number = 0
@@ -329,12 +396,17 @@ def _axis_raster_segments(
 
         sweep_lo = motion_runs[0][0]
         sweep_hi = motion_runs[-1][1]
-        valve_runs = []
-        for lo, hi in _chord_runs(valve, axis, coord):
-            lo = max(lo, sweep_lo)
-            hi = min(hi, sweep_hi)
-            if hi - lo > EPS:
-                valve_runs.append((lo, hi))
+        if infill_keep is not None and not infill_keep(
+            int(round((coord - index_base) / fil_width))
+        ):
+            valve_runs: list[tuple[float, float]] = []
+        else:
+            valve_runs = []
+            for lo, hi in _chord_runs(valve, axis, coord):
+                lo = max(lo, sweep_lo)
+                hi = min(hi, sweep_hi)
+                if hi - lo > EPS:
+                    valve_runs.append((lo, hi))
 
         def emit(a: float, b: float, color: int) -> None:
             if axis == "Y":
@@ -387,9 +459,13 @@ def _oriented_axis_raster_segments(
     current_x: float,
     current_y: float,
     prefer_default: bool = False,
+    scan_anchor: float | None = None,
+    infill_keep=None,
 ) -> list[Seg]:
     """Pick the raster orientation whose start is nearest the current position."""
-    default_segments = _axis_raster_segments(motion, valve, fil_width, axis)
+    default_segments = _axis_raster_segments(
+        motion, valve, fil_width, axis, scan_anchor=scan_anchor, infill_keep=infill_keep
+    )
     if prefer_default or not default_segments:
         return default_segments
 
@@ -403,6 +479,8 @@ def _oriented_axis_raster_segments(
                 axis,
                 reverse_order=reverse_order,
                 start_forward=start_forward,
+                scan_anchor=scan_anchor,
+                infill_keep=infill_keep,
             )
             if segments and segments not in candidates:
                 candidates.append(segments)
@@ -691,6 +769,29 @@ def _last_print_reference(output_list: list[dict]) -> tuple[float, float, float,
     return last_x, last_y, last_dx, last_dy
 
 
+def _last_motion_reference(output_list: list[dict]) -> tuple[float, float, float, float]:
+    """Endpoint and direction of the last XY move, regardless of valve state.
+
+    Used instead of `_last_print_reference` when shapes share a reference
+    motion path: anchoring contours off the valve state would give every
+    shape a different contour tour, breaking the shared path.
+    """
+    x = y = 0.0
+    last_x = last_y = 0.0
+    last_dx = last_dy = 0.0
+    for move in output_list:
+        dx = float(move.get("X", 0.0))
+        dy = float(move.get("Y", 0.0))
+        x += dx
+        y += dy
+        if "Z" not in move and (dx != 0.0 or dy != 0.0):
+            last_x = x
+            last_y = y
+            last_dx = dx
+            last_dy = dy
+    return last_x, last_y, last_dx, last_dy
+
+
 def _rewind_trailing_travel(
     output_list: list[dict],
     current_x: float,
@@ -763,39 +864,55 @@ def _append_layer_contours(
     active_owner_idx: int | None,
     origin_x: float = 0.0,
     origin_y: float = 0.0,
+    shared_motion: bool = False,
 ) -> tuple[float, float]:
     # `origin_x/origin_y` is the world position of the move list's start:
     # _last_print_reference sums relative moves from zero, so its result must
     # be shifted back into the world frame the contours live in.
+    #
+    # With `shared_motion` (reference-stack printing) every shape must trace
+    # EVERY source's contours in the same order so all parallel heads follow
+    # one identical path; the valve opens only on the active owner's contours.
+    # Anchoring then uses the last motion move instead of the last print, and
+    # the trailing-travel rewind is skipped — both depend on how the raster
+    # moves were split at valve boundaries, which differs per shape and would
+    # desynchronise the shared path.
     if layer_number >= len(contour_layers):
         return current_x, current_y
 
     active_sources = [
         source
         for source in contour_layers[layer_number]
-        if source.get("owner_idx") == active_owner_idx
+        if (shared_motion or source.get("owner_idx") == active_owner_idx)
         and any(len(contour) >= 2 for contour in source.get("contours", []))
     ]
     if not active_sources:
         return current_x, current_y
 
-    current_x, current_y = _rewind_trailing_travel(
-        output_list,
-        current_x,
-        current_y,
-    )
+    if not shared_motion:
+        current_x, current_y = _rewind_trailing_travel(
+            output_list,
+            current_x,
+            current_y,
+        )
 
     use_infill_reference = True
 
     for source in active_sources:
-        color = 255
+        if shared_motion and source.get("owner_idx") != active_owner_idx:
+            color = 0
+        else:
+            color = 255
         for contour in source.get("contours", []):
             if len(contour) < 2:
                 continue
             if use_infill_reference:
-                nearest_x, nearest_y, approach_dx, approach_dy = _last_print_reference(
-                    output_list
+                reference = (
+                    _last_motion_reference(output_list)
+                    if shared_motion
+                    else _last_print_reference(output_list)
                 )
+                nearest_x, nearest_y, approach_dx, approach_dy = reference
                 nearest_x += origin_x
                 nearest_y += origin_y
             else:
@@ -882,9 +999,25 @@ def plan_layer_moves(
     raster_pattern: str,
     contour_layers: list[list[dict]] | None = None,
     active_contour_owner: int | None = None,
-) -> list[dict]:
-    """Assemble per-layer segments into a relative move list for all patterns."""
+    shared_motion: bool = False,
+    scan_anchors: tuple[float, float] | None = None,
+    infill_fraction: float = 1.0,
+) -> tuple[list[dict], tuple[float, float]]:
+    """Assemble per-layer segments into a relative move list for all patterns.
+
+    `scan_anchors` = (x_anchor, y_anchor) pins the axis rasters' scanlines to
+    a global grid so lines stack across layers and across split pieces.
+
+    `infill_fraction` < 1 skips dispensing on evenly-distributed lines (grid
+    lines for axis rasters, rings/revolutions for spirals) while the motion
+    path stays exactly the same as at 100% infill.
+
+    Returns the move list and the toolpath origin — the world position the
+    relative moves start from (the first segment start of the first non-empty
+    layer). Callers need it to map relative G-code back into world space.
+    """
     raster_pattern = _normalize_raster_pattern(raster_pattern)
+    infill_keep = _infill_line_keep(infill_fraction)
     gcode_list: list[dict] = []
     current_x = 0.0
     current_y = 0.0
@@ -902,16 +1035,58 @@ def plan_layer_moves(
                 fil_width,
                 reverse=layer_number % 2 == 1,
             )
-            segments = _classify_polyline(points, valve)
+            keep_point = None
+            if infill_keep is not None:
+                # A spiral "line" is one revolution: revolution k lies at
+                # radius outer - k*fil from the bbox-circumscribed circle.
+                min_x, min_y, max_x, max_y = motion.bounds
+                center_x = (min_x + max_x) / 2.0
+                center_y = (min_y + max_y) / 2.0
+                outer_radius = max(
+                    math.hypot(cx - center_x, cy - center_y)
+                    for cx, cy in (
+                        (min_x, min_y),
+                        (max_x, min_y),
+                        (max_x, max_y),
+                        (min_x, max_y),
+                    )
+                )
+
+                def keep_point(x: float, y: float) -> bool:
+                    radius = math.hypot(x - center_x, y - center_y)
+                    return infill_keep(
+                        max(0, int(round((outer_radius - radius) / fil_width)))
+                    )
+
+            segments = _classify_polyline(points, valve, keep_point=keep_point)
         elif raster_pattern == RASTER_PATTERN_RECTANGULAR_SPIRAL:
             points = _rectangular_spiral_polyline(
                 motion.bounds,
                 fil_width,
                 reverse=layer_number % 2 == 1,
             )
-            segments = _classify_polyline(points, valve)
+            keep_point = None
+            if infill_keep is not None:
+                # A spiral "line" is one ring: ring k sits k*fil inside the
+                # half-fil-inset bounding box the spiral walks.
+                min_x, min_y, max_x, max_y = motion.bounds
+                half = fil_width / 2.0
+                left, right = min_x + half, max_x - half
+                bottom, top = min_y + half, max_y - half
+
+                def keep_point(x: float, y: float) -> bool:
+                    inset = min(x - left, right - x, y - bottom, top - y)
+                    return infill_keep(max(0, int(round(inset / fil_width))))
+
+            segments = _classify_polyline(points, valve, keep_point=keep_point)
         else:
             raster_axis = _raster_axis_for_pattern(raster_pattern, layer_number)
+            if scan_anchors is None:
+                axis_anchor = None
+            else:
+                # Axis "X" sweeps along X with rows stacked in Y, so its
+                # scanlines use the Y anchor (and vice versa).
+                axis_anchor = scan_anchors[0] if raster_axis == "Y" else scan_anchors[1]
             segments = _oriented_axis_raster_segments(
                 motion,
                 valve,
@@ -920,6 +1095,8 @@ def plan_layer_moves(
                 current_x,
                 current_y,
                 prefer_default=not raster_origin_initialized,
+                scan_anchor=axis_anchor,
+                infill_keep=infill_keep,
             )
 
         if not segments:
@@ -935,6 +1112,7 @@ def plan_layer_moves(
                 active_contour_owner,
                 origin_x,
                 origin_y,
+                shared_motion,
             )
             current_x, current_y = _append_relative_move(
                 gcode_list,
@@ -1009,6 +1187,7 @@ def plan_layer_moves(
             active_contour_owner,
             origin_x,
             origin_y,
+            shared_motion,
         )
         current_x, current_y = _append_relative_move(
             gcode_list,
@@ -1019,7 +1198,7 @@ def plan_layer_moves(
             0,
         )
 
-    return gcode_list
+    return gcode_list, (origin_x, origin_y)
 
 
 def _stack_center(stack: LayerStack) -> tuple[float, float]:
@@ -1027,10 +1206,58 @@ def _stack_center(stack: LayerStack) -> tuple[float, float]:
     return ((x_min + x_max) / 2.0, (y_min + y_max) / 2.0)
 
 
+def _snap_to_grid(value: float, grid: float | None) -> float:
+    if not grid or grid <= 0.0:
+        return value
+    # Half-up, not Python's banker's rounding: values that differ by exact
+    # grid multiples must snap to results that differ by the same multiples
+    # (banker's rounds exact halves toward even, breaking that translation
+    # invariance and with it uniform split-piece spacing).
+    return math.floor(value / grid + 0.5 + 1e-9) * grid
+
+
 def _centering_delta(stack: LayerStack, reference: LayerStack) -> tuple[float, float]:
-    reference_x, reference_y = _stack_center(reference)
+    """Translation that aligns `stack` into `reference`'s shared frame.
+
+    Uses the alignment target and snap grid stamped on the reference by
+    `build_reference_stack`, so re-deriving the delta later reproduces the
+    exact translation the reference was built with. Snapping the delta to the
+    fil grid keeps every shape's world scan-grid phase intact, so split
+    pieces printed with shared reference motion still tile at an exact
+    one-fil-width line pitch.
+
+    Split siblings (stacks sharing the reference's scan frame) are aligned by
+    their cell corner within that frame instead of their centre: with cells
+    sized in whole grid multiples the deltas — and with them the required
+    nozzle spacing — come out uniform across all pieces, whereas snapping the
+    centres would wobble by up to one fil where the last cell's width (and so
+    its centre phase) differs.
+    """
+    grid = reference.align_grid
+    if (
+        grid
+        and stack.scan_frame is not None
+        and stack.scan_frame == reference.scan_frame
+    ):
+        (stack_min_x, stack_min_y, _sz), _stack_max = (
+            stack.bounds[0],
+            stack.bounds[1],
+        )
+        frame_min_x, frame_min_y = stack.scan_frame[0], stack.scan_frame[1]
+        return (
+            _snap_to_grid(frame_min_x - stack_min_x, grid),
+            _snap_to_grid(frame_min_y - stack_min_y, grid),
+        )
+
+    if reference.align_center is not None:
+        reference_x, reference_y = reference.align_center
+    else:
+        reference_x, reference_y = _stack_center(reference)
     center_x, center_y = _stack_center(stack)
-    return reference_x - center_x, reference_y - center_y
+    return (
+        _snap_to_grid(reference_x - center_x, grid),
+        _snap_to_grid(reference_y - center_y, grid),
+    )
 
 
 def align_stack_to(
@@ -1053,12 +1280,21 @@ def align_stack_to(
     return layers
 
 
-def build_reference_stack(stacks: list[LayerStack | None]) -> LayerStack | None:
+def build_reference_stack(
+    stacks: list[LayerStack | None],
+    grid: float | None = None,
+) -> LayerStack | None:
     """Union all shapes into one shared motion stack, bbox-centres aligned.
 
     Vector analog of the old centered "black wins" TIFF merge: every stack is
     translated so its XY bbox centre lands on the first stack's centre, then
     each layer is the union of the translated layers.
+
+    `grid` (the fil width) snaps each translation to grid multiples so every
+    shape's world scan-grid phase survives the alignment — required for split
+    pieces to keep an exact one-fil line pitch under shared reference motion.
+    The alignment target and grid are stamped on the result so later
+    `_centering_delta` calls reproduce the exact same translations.
     """
     valid = [stack for stack in stacks if stack is not None and stack.layers]
     if not valid:
@@ -1066,15 +1302,22 @@ def build_reference_stack(stacks: list[LayerStack | None]) -> LayerStack | None:
 
     n_layers = max(len(stack.layers) for stack in valid)
     reference_x, reference_y = _stack_center(valid[0])
+    target = LayerStack(
+        layers=[],
+        z_values=[],
+        bounds=((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+        layer_height=valid[0].layer_height,
+        scan_frame=valid[0].scan_frame,
+        align_center=(reference_x, reference_y),
+        align_grid=grid,
+    )
 
     layer_parts: list[list[MultiPolygon]] = [[] for _ in range(n_layers)]
     x_min = y_min = z_min = math.inf
     x_max = y_max = z_max = -math.inf
 
     for stack in valid:
-        center_x, center_y = _stack_center(stack)
-        delta_x = reference_x - center_x
-        delta_y = reference_y - center_y
+        delta_x, delta_y = _centering_delta(stack, target)
 
         (sx_min, sy_min, sz_min), (sx_max, sy_max, sz_max) = stack.bounds
         x_min = min(x_min, sx_min + delta_x)
@@ -1103,26 +1346,54 @@ def build_reference_stack(stacks: list[LayerStack | None]) -> LayerStack | None:
                 break
         z_values.append(z_value)
 
+    # The first stack's delta is zero (snap(0) == 0), so its scan frame is
+    # already in the shared frame and anchors the reference's scan grid.
     return LayerStack(
         layers=layers,
         z_values=z_values,
         bounds=((x_min, y_min, z_min), (x_max, y_max, z_max)),
         layer_height=valid[0].layer_height,
         name="reference",
+        scan_frame=valid[0].scan_frame,
+        align_center=(reference_x, reference_y),
+        align_grid=grid,
     )
 
 
-def _split_boundaries(
+def _base_split_edges(
     lo: float,
     hi: float,
     count: int,
+    grid: float | None = None,
+) -> list[float]:
+    """Cell edges for one axis: equal cells, padded to whole grid multiples.
+
+    With `grid` (the fil width), every cell gets the SAME width — the extent
+    divided by `count`, rounded UP to a whole number of grid units — and the
+    leftover becomes blank margin split evenly outside the shape's outer
+    edges. This is the vector analog of the old pixel splitter's padded
+    canvas: identical piece sizes, so the required nozzle spacing is one cell
+    everywhere, including under shared reference motion.
+    """
+    extent = hi - lo
+    if grid and grid > 0.0 and count > 1 and extent > 0.0:
+        units = max(1, math.ceil(extent / (count * grid) - 1e-9))
+        cell = units * grid
+        pad = cell * count - extent
+        start = lo - pad / 2.0
+        return [start + index * cell for index in range(count + 1)]
+    return [lo + index * extent / count for index in range(count + 1)]
+
+
+def _shifted_split_edges(
+    edges: list[float],
     layer_index: int,
     overlap: float,
 ) -> list[float]:
-    """Cell boundaries for one axis; interior ones alternate by ±overlap per layer."""
-    edges = [lo + index * (hi - lo) / count for index in range(count + 1)]
+    """Per-layer cell edges; interior ones alternate by ±overlap per layer."""
+    count = len(edges) - 1
     if overlap <= 0.0 or count <= 1:
-        return edges
+        return list(edges)
 
     adjusted = list(edges)
     for boundary_index in range(1, count):
@@ -1144,13 +1415,16 @@ def split_layer_stack_grid(
     rows: int,
     overlapping_layers: bool = False,
     overlap: float = 0.0,
+    grid: float | None = None,
 ) -> list[LayerStack]:
     """Split a sliced shape into a rows x columns grid of piece stacks.
 
     Pieces are returned row-major with row 1 the top strip (max-Y side),
     matching the legacy image-grid ordering. With `overlapping_layers`, the
     interior cut lines alternate by ±overlap between layers so neighbouring
-    pieces interlock. Piece `bounds` are the nominal (un-shifted) cell boxes.
+    pieces interlock. `grid` (the fil width) sizes the cells in whole grid
+    multiples (see `_base_split_edges`). Piece `bounds` are the nominal
+    (un-shifted) cell boxes.
     """
     columns = max(1, int(columns))
     rows = max(1, int(rows))
@@ -1159,16 +1433,21 @@ def split_layer_stack_grid(
     overlap_x = overlap if (overlapping_layers and columns > 1) else 0.0
     overlap_y = overlap if (overlapping_layers and rows > 1) else 0.0
 
-    base_x_edges = _split_boundaries(x_min, x_max, columns, 0, 0.0)
-    base_y_edges = _split_boundaries(y_min, y_max, rows, 0, 0.0)
+    base_x_edges = _base_split_edges(x_min, x_max, columns, grid)
+    base_y_edges = _base_split_edges(y_min, y_max, rows, grid)
     layer_x_edges = [
-        _split_boundaries(x_min, x_max, columns, index, overlap_x)
+        _shifted_split_edges(base_x_edges, index, overlap_x)
         for index in range(len(stack.layers))
     ]
     layer_y_edges = [
-        _split_boundaries(y_min, y_max, rows, index, overlap_y)
+        _shifted_split_edges(base_y_edges, index, overlap_y)
         for index in range(len(stack.layers))
     ]
+
+    # Pieces inherit the parent's scan frame so they all raster on ONE
+    # continuous line grid: the assembled seams then keep an exact
+    # one-fil-width pitch instead of each piece re-centring its own lines.
+    scan_frame = stack.scan_frame or (x_min, y_min, x_max, y_max)
 
     base_name = stack.name or "shape"
     pieces: list[LayerStack] = []
@@ -1203,6 +1482,7 @@ def split_layer_stack_grid(
                     ),
                     layer_height=stack.layer_height,
                     name=f"{base_name}_r{row_index:02d}_c{col_index:02d}",
+                    scan_frame=scan_frame,
                 )
             )
 
