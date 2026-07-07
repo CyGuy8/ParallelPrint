@@ -17,6 +17,7 @@ from stl_slicer import LayerStack
 from vector_toolpath import (
     RASTER_PATTERN_CHOICES,
     RASTER_PATTERN_CIRCLE_SPIRAL,
+    RASTER_PATTERN_DIAGONAL_WOODPILE,
     RASTER_PATTERN_RECTANGULAR_SPIRAL,
     RASTER_PATTERN_SAME_DIRECTION,
     RASTER_PATTERN_WOODPILE,
@@ -25,7 +26,6 @@ from vector_toolpath import (
     _centering_delta,
     _lead_in_moves,
     _normalize_raster_pattern,
-    _scan_anchor,
     align_stack_to,
     build_contour_layers,
     plan_layer_moves,
@@ -34,6 +34,7 @@ from vector_toolpath import (
 __all__ = [
     "RASTER_PATTERN_CHOICES",
     "RASTER_PATTERN_CIRCLE_SPIRAL",
+    "RASTER_PATTERN_DIAGONAL_WOODPILE",
     "RASTER_PATTERN_RECTANGULAR_SPIRAL",
     "RASTER_PATTERN_SAME_DIRECTION",
     "RASTER_PATTERN_WOODPILE",
@@ -240,18 +241,16 @@ def generate_vector_gcode(
         reference=contour_reference,
     )
 
-    # Anchor the raster scan grid to the motion stack's frame (a split
-    # piece's frame is its parent shape's bounds) so lines stack across
-    # layers and stay on one continuous grid across split pieces.
+    # Anchor the raster scan grid (and the diagonal-raster pivot) to the
+    # motion stack's frame (a split piece's frame is its parent shape's
+    # bounds) so lines stack across layers and stay on one continuous grid
+    # across split pieces.
     frame_stack = motion if motion is not None else shape
     if frame_stack.scan_frame is not None:
-        frame_x_min, frame_y_min, frame_x_max, frame_y_max = frame_stack.scan_frame
+        scan_frame = frame_stack.scan_frame
     else:
         (frame_x_min, frame_y_min, _fz), (frame_x_max, frame_y_max, _fz2) = frame_stack.bounds
-    scan_anchors = (
-        _scan_anchor(frame_x_min, frame_x_max, fil_width),
-        _scan_anchor(frame_y_min, frame_y_max, fil_width),
-    )
+        scan_frame = (frame_x_min, frame_y_min, frame_x_max, frame_y_max)
 
     gcode_list, toolpath_origin = plan_layer_moves(
         motion_layers,
@@ -262,7 +261,7 @@ def generate_vector_gcode(
         contour_layers,
         active_contour_owner,
         shared_motion=motion is not None,
-        scan_anchors=scan_anchors,
+        scan_frame=scan_frame,
         infill_fraction=max(0.0, min(1.0, float(infill))),
     )
 

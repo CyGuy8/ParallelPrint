@@ -13,10 +13,10 @@ import math
 from dataclasses import dataclass
 
 from shapely import prepare
-from shapely.affinity import translate
-from shapely.geometry import LineString, MultiPolygon, Point, box
+from shapely.affinity import rotate, translate
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, box
 from shapely.geometry.polygon import orient
-from shapely.ops import unary_union
+from shapely.ops import linemerge, unary_union
 
 from stl_slicer import LayerStack, _as_multipolygon
 
@@ -25,13 +25,15 @@ EPS = 1e-6
 
 RASTER_PATTERN_SAME_DIRECTION = "X-direction raster"
 RASTER_PATTERN_Y_DIRECTION = "Y-direction raster"
-RASTER_PATTERN_WOODPILE = "Woodpile raster"
+RASTER_PATTERN_WOODPILE = "90° Woodpile raster"
+RASTER_PATTERN_DIAGONAL_WOODPILE = "45° Woodpile raster"
 RASTER_PATTERN_RECTANGULAR_SPIRAL = "Rectangular Spiral raster"
 RASTER_PATTERN_CIRCLE_SPIRAL = "Circle Spiral raster"
 RASTER_PATTERN_CHOICES = (
     RASTER_PATTERN_SAME_DIRECTION,
     RASTER_PATTERN_Y_DIRECTION,
     RASTER_PATTERN_WOODPILE,
+    RASTER_PATTERN_DIAGONAL_WOODPILE,
     RASTER_PATTERN_RECTANGULAR_SPIRAL,
     RASTER_PATTERN_CIRCLE_SPIRAL,
 )
@@ -56,7 +58,23 @@ def _raster_axis_for_pattern(pattern: str, layer_number: int) -> str:
         return "Y"
     if pattern == RASTER_PATTERN_WOODPILE and layer_number % 2 == 1:
         return "Y"
+    if pattern == RASTER_PATTERN_DIAGONAL_WOODPILE and layer_number % 4 == 2:
+        return "Y"
     return "X"
+
+
+def _diagonal_layer_angle(layer_number: int) -> float | None:
+    """Diagonal-woodpile raster angle for a layer; None for the axis layers.
+
+    The pattern cycles 0, 45, 90, 135 degrees: axis layers (0/90) go through
+    the regular X/Y raster; only the odd layers need the rotated raster.
+    """
+    phase = layer_number % 4
+    if phase == 1:
+        return 45.0
+    if phase == 3:
+        return 135.0
+    return None
 
 
 def _iter_linestrings(geometry: object):
@@ -496,6 +514,76 @@ def _oriented_axis_raster_segments(
     )
 
 
+def _rotated_raster_segments(
+    motion: MultiPolygon,
+    valve: MultiPolygon,
+    fil_width: float,
+    angle_degrees: float,
+    current_x: float,
+    current_y: float,
+    prefer_default: bool,
+    frame: tuple[float, float, float, float],
+    infill_keep=None,
+) -> list[Seg]:
+    """Snake raster at an arbitrary angle, reusing the axis raster machinery.
+
+    Rotates motion/valve by -angle about the scan frame's centre, rasters
+    with the standard X-axis sweep (snake, buffers, valve gating, scan grid,
+    infill selection all identical), then rotates the segments back. The
+    pivot and the rotated scan anchor both derive from the shared frame, so
+    split pieces and reference-motion shapes keep one continuous diagonal
+    line grid across seams.
+    """
+    if motion is None or motion.is_empty:
+        return []
+
+    pivot_x = (frame[0] + frame[2]) / 2.0
+    pivot_y = (frame[1] + frame[3]) / 2.0
+    pivot = (pivot_x, pivot_y)
+
+    rotated_motion = _as_multipolygon(rotate(motion, -angle_degrees, origin=pivot))
+    if valve is motion:
+        rotated_valve = rotated_motion
+    elif valve is None or valve.is_empty:
+        rotated_valve = MultiPolygon()
+    else:
+        rotated_valve = _as_multipolygon(rotate(valve, -angle_degrees, origin=pivot))
+
+    rotated_frame_bounds = rotate(box(*frame), -angle_degrees, origin=pivot).bounds
+    anchor = _scan_anchor(rotated_frame_bounds[1], rotated_frame_bounds[3], fil_width)
+
+    theta = math.radians(-angle_degrees)
+    cos_f, sin_f = math.cos(theta), math.sin(theta)
+    rotated_current_x = pivot_x + (current_x - pivot_x) * cos_f - (current_y - pivot_y) * sin_f
+    rotated_current_y = pivot_y + (current_x - pivot_x) * sin_f + (current_y - pivot_y) * cos_f
+
+    segments = _oriented_axis_raster_segments(
+        rotated_motion,
+        rotated_valve,
+        fil_width,
+        "X",
+        rotated_current_x,
+        rotated_current_y,
+        prefer_default=prefer_default,
+        scan_anchor=anchor,
+        infill_keep=infill_keep,
+    )
+
+    theta_back = math.radians(angle_degrees)
+    cos_b, sin_b = math.cos(theta_back), math.sin(theta_back)
+
+    def back(x: float, y: float) -> tuple[float, float]:
+        return (
+            pivot_x + (x - pivot_x) * cos_b - (y - pivot_y) * sin_b,
+            pivot_y + (x - pivot_x) * sin_b + (y - pivot_y) * cos_b,
+        )
+
+    return [
+        (*back(x0, y0), *back(x1, y1), color)
+        for x0, y0, x1, y1, color in segments
+    ]
+
+
 def _extend_polyline_ends(
     points: list[tuple[float, float]],
     length: float,
@@ -835,6 +923,29 @@ def build_contour_layers(
             continue
 
         if reference is not None:
+            delta_x, delta_y = _centering_delta(stack, reference)
+        else:
+            delta_x = delta_y = 0.0
+
+        if stack.contour_paths is not None:
+            # Split pieces carry seam-free contour paths computed from the
+            # parent shape's outline; use them directly.
+            for layer_number in range(min(n_layers, len(stack.contour_paths))):
+                contours = [
+                    [(x + delta_x, y + delta_y) for x, y in path]
+                    for path in stack.contour_paths[layer_number]
+                    if len(path) >= 2
+                ]
+                if contours:
+                    contour_layers[layer_number].append(
+                        {
+                            "owner_idx": source.owner_idx,
+                            "contours": contours,
+                        }
+                    )
+            continue
+
+        if reference is not None:
             layers = align_stack_to(stack, reference, n_layers)
         else:
             layers = stack.layers
@@ -918,15 +1029,28 @@ def _append_layer_contours(
             else:
                 nearest_x, nearest_y = current_x, current_y
                 approach_dx, approach_dy = 0.0, 0.0
-            contour = _rotate_closed_contour_to_nearest_border(
-                contour,
-                nearest_x,
-                nearest_y,
-                approach_dx,
-                approach_dy,
-            )
-            if contour[0] != contour[-1]:
-                contour = [*contour, contour[0]]
+            is_closed = len(contour) >= 4 and contour[0] == contour[-1]
+            if is_closed:
+                contour = _rotate_closed_contour_to_nearest_border(
+                    contour,
+                    nearest_x,
+                    nearest_y,
+                    approach_dx,
+                    approach_dy,
+                )
+                if contour[0] != contour[-1]:
+                    contour = [*contour, contour[0]]
+            else:
+                # Open arc (a split piece's seam-free outline): approach the
+                # nearer end and print to the other. Never close the loop —
+                # the closing chord would run along the cut seam this path
+                # deliberately excludes.
+                if _point_distance_sq(
+                    nearest_x, nearest_y, contour[-1][0], contour[-1][1]
+                ) < _point_distance_sq(
+                    nearest_x, nearest_y, contour[0][0], contour[0][1]
+                ):
+                    contour = list(reversed(contour))
             start_x, start_y = contour[0]
             use_infill_reference = False
             current_x, current_y = _append_relative_move(
@@ -1000,13 +1124,14 @@ def plan_layer_moves(
     contour_layers: list[list[dict]] | None = None,
     active_contour_owner: int | None = None,
     shared_motion: bool = False,
-    scan_anchors: tuple[float, float] | None = None,
+    scan_frame: tuple[float, float, float, float] | None = None,
     infill_fraction: float = 1.0,
 ) -> tuple[list[dict], tuple[float, float]]:
     """Assemble per-layer segments into a relative move list for all patterns.
 
-    `scan_anchors` = (x_anchor, y_anchor) pins the axis rasters' scanlines to
-    a global grid so lines stack across layers and across split pieces.
+    `scan_frame` (an XY box) pins the rasters' scanlines to a global grid so
+    lines stack across layers and across split pieces, and provides the
+    rotation pivot for diagonal layers.
 
     `infill_fraction` < 1 skips dispensing on evenly-distributed lines (grid
     lines for axis rasters, rings/revolutions for spirals) while the motion
@@ -1018,6 +1143,11 @@ def plan_layer_moves(
     """
     raster_pattern = _normalize_raster_pattern(raster_pattern)
     infill_keep = _infill_line_keep(infill_fraction)
+    if scan_frame is not None:
+        anchor_x = _scan_anchor(scan_frame[0], scan_frame[2], fil_width)
+        anchor_y = _scan_anchor(scan_frame[1], scan_frame[3], fil_width)
+    else:
+        anchor_x = anchor_y = None
     gcode_list: list[dict] = []
     current_x = 0.0
     current_y = 0.0
@@ -1079,14 +1209,28 @@ def plan_layer_moves(
                     return infill_keep(max(0, int(round(inset / fil_width))))
 
             segments = _classify_polyline(points, valve, keep_point=keep_point)
+        elif (
+            raster_pattern == RASTER_PATTERN_DIAGONAL_WOODPILE
+            and _diagonal_layer_angle(layer_number) is not None
+        ):
+            angle = _diagonal_layer_angle(layer_number)
+            frame = scan_frame if scan_frame is not None else motion.bounds
+            segments = _rotated_raster_segments(
+                motion,
+                valve,
+                fil_width,
+                angle,
+                current_x,
+                current_y,
+                prefer_default=not raster_origin_initialized,
+                frame=frame,
+                infill_keep=infill_keep,
+            )
         else:
             raster_axis = _raster_axis_for_pattern(raster_pattern, layer_number)
-            if scan_anchors is None:
-                axis_anchor = None
-            else:
-                # Axis "X" sweeps along X with rows stacked in Y, so its
-                # scanlines use the Y anchor (and vice versa).
-                axis_anchor = scan_anchors[0] if raster_axis == "Y" else scan_anchors[1]
+            # Axis "X" sweeps along X with rows stacked in Y, so its
+            # scanlines use the Y anchor (and vice versa).
+            axis_anchor = anchor_x if raster_axis == "Y" else anchor_y
             segments = _oriented_axis_raster_segments(
                 motion,
                 valve,
@@ -1409,6 +1553,44 @@ def _shifted_split_edges(
     return adjusted
 
 
+def _clip_contour_paths(
+    source_lines: object,
+    cell: object,
+) -> list[list[tuple[float, float]]]:
+    """Contour polylines of a split piece: the parent outline inside the cell.
+
+    Clipping the PARENT's boundary linework (instead of taking the piece
+    polygon's own boundary) excludes the cut seams between sibling pieces —
+    only the true outer surface remains. Results are merged into maximal
+    polylines and ordered/oriented deterministically so pieces sharing
+    reference motion trace them identically.
+    """
+    clipped = source_lines.intersection(cell)
+    pieces = list(_iter_linestrings(clipped))
+    if not pieces:
+        return []
+    merged = linemerge(MultiLineString(pieces)) if len(pieces) > 1 else pieces[0]
+
+    paths: list[list[tuple[float, float]]] = []
+    for line in _iter_linestrings(merged):
+        coords = [(float(x), float(y)) for x, y in line.coords]
+        if len(coords) < 2 or LineString(coords).length <= EPS:
+            continue
+        # Normalize open-path orientation (closed rings keep first == last).
+        if coords[0] != coords[-1] and coords[-1] < coords[0]:
+            coords.reverse()
+        paths.append(coords)
+
+    paths.sort(
+        key=lambda path: (
+            min(point[1] for point in path),
+            min(point[0] for point in path),
+            -len(path),
+        )
+    )
+    return paths
+
+
 def split_layer_stack_grid(
     stack: LayerStack,
     columns: int,
@@ -1458,9 +1640,11 @@ def split_layer_stack_grid(
             x_cell = col_index - 1
 
             layers: list[MultiPolygon] = []
+            contour_paths: list[list[list[tuple[float, float]]]] = []
             for layer_number, layer in enumerate(stack.layers):
                 if layer is None or layer.is_empty:
                     layers.append(MultiPolygon())
+                    contour_paths.append([])
                     continue
                 x_edges = layer_x_edges[layer_number]
                 y_edges = layer_y_edges[layer_number]
@@ -1471,6 +1655,22 @@ def split_layer_stack_grid(
                     y_edges[y_cell + 1],
                 )
                 layers.append(_as_multipolygon(layer.intersection(cell)))
+
+                # Contours come from the parent's outline (or, when
+                # re-splitting a piece, its already-seam-free paths) so the
+                # cut lines between siblings are never traced.
+                if stack.contour_paths is not None:
+                    parent_paths = (
+                        stack.contour_paths[layer_number]
+                        if layer_number < len(stack.contour_paths)
+                        else []
+                    )
+                    source_lines = MultiLineString(
+                        [path for path in parent_paths if len(path) >= 2]
+                    )
+                else:
+                    source_lines = layer.boundary
+                contour_paths.append(_clip_contour_paths(source_lines, cell))
 
             pieces.append(
                 LayerStack(
@@ -1483,6 +1683,7 @@ def split_layer_stack_grid(
                     layer_height=stack.layer_height,
                     name=f"{base_name}_r{row_index:02d}_c{col_index:02d}",
                     scan_frame=scan_frame,
+                    contour_paths=contour_paths,
                 )
             )
 

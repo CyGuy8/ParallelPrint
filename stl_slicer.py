@@ -44,6 +44,12 @@ class LayerStack:
     scan_frame: tuple[float, float, float, float] | None = None
     align_center: tuple[float, float] | None = None
     align_grid: float | None = None
+    # Grid-split pieces: per-layer contour polylines from the PARENT shape's
+    # boundary clipped to this piece's cell — cut seams between sibling
+    # pieces are excluded, so contour tracing only outlines the true outer
+    # surface. None means "derive contours from the layer polygons" (whole
+    # shapes). Paths may be open arcs; closed rings keep first == last.
+    contour_paths: list[list[list[tuple[float, float]]]] | None = None
 
 
 def load_mesh(stl_path: str | Path) -> trimesh.Trimesh:

@@ -416,6 +416,76 @@ def test_y_direction_raster_prints_each_layer_along_y_axis(tmp_path) -> None:
     assert first_layer_change["start"][:2] == first_layer_change["end"][:2]
 
 
+def test_diagonal_woodpile_rotates_45_degrees_per_layer(tmp_path) -> None:
+    from vector_toolpath import RASTER_PATTERN_DIAGONAL_WOODPILE
+
+    layer = box(0.0, 0.0, 8.0, 8.0)
+    gcode_path = generate_vector_gcode(
+        _stack(layer, layer, layer, layer),
+        shape_name="diagonal",
+        pressure=25,
+        valve=7,
+        port=3,
+        fil_width=1.0,
+        layer_height=1.0,
+        raster_pattern=RASTER_PATTERN_DIAGONAL_WOODPILE,
+        output_dir=tmp_path,
+    )
+
+    moves = _moves_with_colors(gcode_path.read_text())
+    directions_by_layer: dict[float, set[float]] = {}
+    intercepts_45: set[float] = set()
+    for move in moves:
+        if move["color"] != 255:
+            continue
+        z = round(move["start"][2], 6)
+        dx = move["end"][0] - move["start"][0]
+        dy = move["end"][1] - move["start"][1]
+        angle = round(math.degrees(math.atan2(dy, dx)) % 180.0, 1)
+        directions_by_layer.setdefault(z, set()).add(angle)
+        if z == 1.0:
+            intercepts_45.add(
+                round((move["start"][1] - move["start"][0]) / math.sqrt(2), 5)
+            )
+
+    # The raster angle cycles 0 -> 45 -> 90 -> 135 across layers.
+    assert directions_by_layer == {
+        0.0: {0.0},
+        1.0: {45.0},
+        2.0: {90.0},
+        3.0: {135.0},
+    }
+    # Diagonal lines keep an exact one-fil perpendicular pitch.
+    ordered = sorted(intercepts_45)
+    assert len(ordered) > 3
+    assert {round(b - a, 4) for a, b in zip(ordered, ordered[1:])} == {1.0}
+
+
+def test_diagonal_woodpile_shares_reference_motion(tmp_path) -> None:
+    from vector_toolpath import RASTER_PATTERN_DIAGONAL_WOODPILE
+
+    big = _stack(*([box(0.0, 0.0, 8.0, 8.0)] * 4), name="big")
+    small = _stack(*([box(2.0, 2.0, 6.0, 6.0)] * 4), name="small")
+    reference = build_reference_stack([big, small], grid=1.0)
+
+    totals = []
+    for stack, label in ((big, "dbig"), (small, "dsmall")):
+        gcode_path = generate_vector_gcode(
+            stack,
+            shape_name=label,
+            pressure=25,
+            valve=7,
+            port=3,
+            fil_width=1.0,
+            motion=reference,
+            raster_pattern=RASTER_PATTERN_DIAGONAL_WOODPILE,
+            output_dir=tmp_path / label,
+        )
+        totals.append(_total_length(_moves_with_colors(gcode_path.read_text())))
+
+    assert abs(totals[0] - totals[1]) < 1e-2
+
+
 def test_raster_crosses_interior_holes_with_valve_off(tmp_path) -> None:
     hollow = Polygon(
         box(0.0, 0.0, 6.0, 6.0).exterior.coords,
@@ -1057,6 +1127,93 @@ def test_split_overlap_seam_raster_distance_is_equal_on_both_sides() -> None:
         left_distance = seam - left_columns[-1]
         right_distance = right_columns[0] - seam
         assert abs(left_distance - right_distance) < 1e-9
+
+
+def test_split_contour_paths_exclude_the_cut_seams() -> None:
+    layer = MultiPolygon([box(0.0, 0.0, 9.0, 4.0)])
+    stack = _stack(layer, name="bar")
+
+    left, middle, right = split_layer_stack_grid(stack, columns=3, rows=1, grid=1.0)
+
+    # Middle piece: only the parent's top and bottom edges, as open arcs —
+    # no vertical paths along the cuts at x=3 and x=6.
+    assert middle.contour_paths[0] == [
+        [(3.0, 0.0), (6.0, 0.0)],
+        [(3.0, 4.0), (6.0, 4.0)],
+    ]
+    # Edge pieces get one open C-shaped path around their outer three sides.
+    (left_path,) = left.contour_paths[0]
+    assert left_path[0] != left_path[-1]
+    assert all(abs(x - 3.0) > 1e-9 or y in (0.0, 4.0) for x, y in left_path)
+
+    # A fully interior piece has no contour at all.
+    grid = split_layer_stack_grid(
+        _stack(MultiPolygon([box(0.0, 0.0, 9.0, 9.0)]), name="sq"),
+        columns=3,
+        rows=3,
+        grid=1.0,
+    )
+    assert grid[4].contour_paths[0] == []
+
+    # A hole entirely inside one piece stays a closed ring.
+    hollow = MultiPolygon(
+        [
+            Polygon(
+                box(0.0, 0.0, 9.0, 4.0).exterior.coords,
+                [list(box(1.0, 1.0, 2.0, 2.0).exterior.coords)],
+            )
+        ]
+    )
+    hole_left, _hm, _hr = split_layer_stack_grid(
+        _stack(hollow, name="hollow"), columns=3, rows=1, grid=1.0
+    )
+    closed_paths = [p for p in hole_left.contour_paths[0] if p[0] == p[-1]]
+    assert len(closed_paths) == 1
+
+
+def test_split_contour_gcode_never_traces_the_cuts(tmp_path) -> None:
+    layer = MultiPolygon([box(0.0, 0.0, 9.0, 4.0)])
+    stack = _stack(layer, layer, name="bar")
+    pieces = split_layer_stack_grid(stack, columns=3, rows=1, grid=1.0)
+    reference = build_reference_stack(pieces, grid=1.0)
+    sources = [
+        ContourSource(owner_idx=index + 1, stack=piece)
+        for index, piece in enumerate(pieces)
+    ]
+
+    all_moves = []
+    for index, piece in enumerate(pieces):
+        gcode_path = generate_vector_gcode(
+            piece,
+            shape_name=f"seam{index}",
+            pressure=25,
+            valve=4 + index,
+            port=3,
+            fil_width=1.0,
+            motion=reference,
+            contour_sources=sources,
+            active_contour_owner=index + 1,
+            output_dir=tmp_path / f"seam{index}",
+        )
+        all_moves.append(_moves_with_colors(gcode_path.read_text()))
+
+    # All heads still share one motion path, contours included.
+    totals = {round(_total_length(moves), 4) for moves in all_moves}
+    assert len(totals) == 1
+    assert len({moves[-1]["end"] for moves in all_moves}) == 1
+
+    # The middle piece's contour arcs are horizontal: with the horizontal
+    # X-raster infill, it must emit NO vertical print move at all (a vertical
+    # print could only be a traced cut seam).
+    middle = all_moves[1]
+    vertical_prints = [
+        move
+        for move in middle
+        if move["color"] == 255
+        and abs(move["end"][0] - move["start"][0]) < 1e-9
+        and abs(move["end"][1] - move["start"][1]) > 1e-9
+    ]
+    assert vertical_prints == []
 
 
 def test_split_layer_stack_grid_overlap_alternates_between_layers() -> None:
