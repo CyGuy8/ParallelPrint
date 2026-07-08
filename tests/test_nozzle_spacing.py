@@ -164,6 +164,40 @@ def test_shape_settings_round_trip_infill_column() -> None:
     assert _apply_shape_settings(records, rows)[0]["infill"] == 0.0
 
 
+def test_shape_settings_color_column_uses_palette_names() -> None:
+    records = [
+        {
+            "idx": 1,
+            "name": "circle",
+            "stl_path": "circle.stl",
+            "target_x": 10.0,
+            "target_y": 11.0,
+            "target_z": 12.0,
+            "pressure": 25.0,
+            "valve": 4,
+            "nozzle": 1,
+            "port": 1,
+            "color": "#ff7f0e",
+            "contour_tracing": False,
+        }
+    ]
+
+    rows = _shape_settings_rows(records)
+    color_pos = SHAPE_SETTINGS_HEADERS.index("Color")
+    # Stored hex displays as its friendly name.
+    assert rows[0][color_pos] == "Orange"
+
+    # Typing a palette name (any case) stores the matching hex.
+    rows[0][color_pos] = "red"
+    assert _apply_shape_settings(records, rows)[0]["color"] == "#d62728"
+
+    # Raw hex still works; unknown text keeps the previous color.
+    rows[0][color_pos] = "#123456"
+    assert _apply_shape_settings(records, rows)[0]["color"] == "#123456"
+    rows[0][color_pos] = "not-a-color"
+    assert _apply_shape_settings(records, rows)[0]["color"] == "#ff7f0e"
+
+
 def test_lead_in_assembly_extension_covers_the_split_extent() -> None:
     from shapely.geometry import MultiPolygon, box
 

@@ -1157,6 +1157,32 @@ PARALLEL_COLOR_CHOICES = [
     ("Teal", "#17becf"), ("Black", "#000000"),
 ]
 DEFAULT_PARALLEL_COLORS = ("#ff7f0e", "#1f77b4", "#2ca02c")
+SHAPE_COLOR_NAMES = [name for name, _hex in PARALLEL_COLOR_CHOICES]
+_COLOR_NAME_BY_HEX = {hex_value.lower(): name for name, hex_value in PARALLEL_COLOR_CHOICES}
+_COLOR_HEX_BY_NAME = {name.lower(): hex_value for name, hex_value in PARALLEL_COLOR_CHOICES}
+
+
+def _color_display(value: str | None) -> str:
+    """Palette name for a stored color; unknown values show as-is."""
+    text = str(value or "").strip()
+    return _COLOR_NAME_BY_HEX.get(text.lower(), text)
+
+
+def _color_from_cell(cell, fallback: str) -> str:
+    """Parse a Color cell: palette name (case-insensitive) or a hex value.
+
+    Anything unrecognized keeps the previous color, so a typo never breaks
+    the visualization.
+    """
+    text = str(cell or "").strip()
+    if not text:
+        return fallback
+    hex_value = _COLOR_HEX_BY_NAME.get(text.lower())
+    if hex_value:
+        return hex_value
+    if text.startswith("#") and len(text) in (4, 7):
+        return text
+    return fallback
 
 
 def _group_parts_by_nozzle(parts: list[dict]) -> dict[int, list[dict]]:
@@ -1558,7 +1584,7 @@ def _shape_settings_rows(records: list[dict]) -> list[list[Any]]:
             record.get("valve", 4),
             _record_nozzle_number(record, int(record["idx"])),
             record.get("port", 1),
-            record.get("color", _default_color(record["idx"])),
+            _color_display(record.get("color", _default_color(record["idx"]))),
             _coerce_float(record.get("infill", 100.0), 100.0),
             bool(record.get("contour_tracing", False)),
             bool(record.get("lead_in", False)),
@@ -1617,8 +1643,10 @@ def _apply_shape_settings(records: list[dict], settings_table: Any) -> list[dict
             )
             if copy["nozzle"] <= 0:
                 copy["nozzle"] = _record_nozzle_number(copy)
-            if len(row) > color_pos and row[color_pos]:
-                copy["color"] = str(row[color_pos])
+            copy["color"] = _color_from_cell(
+                row[color_pos] if len(row) > color_pos else None,
+                str(copy.get("color") or _default_color(int(copy.get("idx", 1) or 1))),
+            )
             try:
                 copy["infill"] = max(
                     0.0,
@@ -2806,6 +2834,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 """
                 # Shapes & Slicing
                 Upload any number of STL files, edit per-shape dimensions and print settings in the table, then slice each shape into per-layer outlines.
+                Color accepts: Orange, Blue, Green, Red, Purple, Pink, Teal, Black.
                 """
             )
             with gr.Row():
