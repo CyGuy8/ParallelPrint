@@ -219,23 +219,134 @@ def test_gcode_lead_in_runs_once_before_first_layer(tmp_path) -> None:
 
     moves = _moves_with_colors(gcode_path.read_text())
 
-    assert moves[:7] == [
+    assert moves[:9] == [
         {"start": (0.0, 0.0, 0.0), "end": (-7.0, 0.0, 0.0), "color": 0},
         {"start": (-7.0, 0.0, 0.0), "end": (-4.0, 0.0, 0.0), "color": 255},
         {"start": (-4.0, 0.0, 0.0), "end": (-4.0, 0.5, 0.0), "color": 0},
         {"start": (-4.0, 0.5, 0.0), "end": (-7.0, 0.5, 0.0), "color": 255},
         {"start": (-7.0, 0.5, 0.0), "end": (-7.0, 1.0, 0.0), "color": 0},
         {"start": (-7.0, 1.0, 0.0), "end": (-4.0, 1.0, 0.0), "color": 255},
-        {"start": (-4.0, 1.0, 0.0), "end": (0.0, 0.0, 0.0), "color": 0},
+        # Return route: exit the patch one spacing to the outside, travel
+        # home through the clearance lane, then step onto the start point —
+        # never dragging the primed nozzle back across the purge lines.
+        {"start": (-4.0, 1.0, 0.0), "end": (-4.0, -0.5, 0.0), "color": 0},
+        {"start": (-4.0, -0.5, 0.0), "end": (0.0, -0.5, 0.0), "color": 0},
+        {"start": (0.0, -0.5, 0.0), "end": (0.0, 0.0, 0.0), "color": 0},
     ]
-    assert all(move["end"][2] == 0.0 for move in moves[:7])
+    assert all(move["end"][2] == 0.0 for move in moves[:9])
 
     first_z_index = next(index for index, move in enumerate(moves) if move["end"][2] > 0.0)
-    assert first_z_index > 7
+    assert first_z_index > 9
     assert not any(
         move["start"][0] < -3.0 or move["end"][0] < -3.0
         for move in moves[first_z_index:]
     )
+
+
+def test_gcode_lead_in_direction_points_the_purge_patch(tmp_path) -> None:
+    from vector_toolpath import LEAD_IN_DIRECTION_UP
+
+    gcode_path = generate_vector_gcode(
+        _stack(box(0.0, 0.0, 0.5, 0.5)),
+        shape_name="lead_in_up",
+        pressure=25,
+        valve=7,
+        port=3,
+        fil_width=0.5,
+        lead_in_enabled=True,
+        lead_in_length=3.0,
+        lead_in_clearance=4.0,
+        lead_in_lines=2,
+        lead_in_direction=LEAD_IN_DIRECTION_UP,
+        output_dir=tmp_path,
+    )
+
+    moves = _moves_with_colors(gcode_path.read_text())
+    # Patch is ABOVE the start: first travel goes +7 in Y, purge strokes are
+    # vertical and sit in y in [4, 7]; only the half-fil-wide return lane
+    # dips to the negative lateral side.
+    assert moves[0]["end"] == (0.0, 7.0, 0.0)
+    lead_prints = [m for m in moves[:6] if m["color"] == 255]
+    assert lead_prints
+    assert all(abs(m["end"][0] - m["start"][0]) < 1e-9 for m in lead_prints)
+    assert all(
+        3.9 <= min(m["start"][1], m["end"][1]) and max(m["start"][1], m["end"][1]) <= 7.1
+        for m in lead_prints
+    )
+    assert all(m["end"][0] >= -0.5 - 1e-9 for m in moves[:9])
+
+
+def test_lead_in_opt_out_travels_shared_patch_but_skips_it_solo(tmp_path) -> None:
+    small = _stack(box(0.0, 0.0, 2.0, 2.0), name="small")
+    big = _stack(box(0.0, 0.0, 4.0, 4.0), name="big")
+    reference = build_reference_stack([small, big])
+
+    def _generate(stack: LayerStack, dispense: bool, motion, label: str):
+        path = generate_vector_gcode(
+            stack,
+            shape_name=label,
+            pressure=25,
+            valve=7,
+            port=3,
+            fil_width=1.0,
+            motion=motion,
+            lead_in_enabled=True,
+            lead_in_length=3.0,
+            lead_in_clearance=4.0,
+            lead_in_lines=3,
+            lead_in_dispense=dispense,
+            output_dir=tmp_path / label,
+        )
+        return _moves_with_colors(path.read_text())
+
+    # Shared motion: the opted-out head traverses the identical patch with
+    # the valve shut; totals and endpoints match the dispensing head exactly.
+    priming = _generate(big, True, reference, "priming")
+    passive = _generate(small, False, reference, "passive")
+    assert priming[-1]["end"] == passive[-1]["end"]
+    assert abs(_total_length(priming) - _total_length(passive)) < 1e-6
+    assert any(m["color"] == 255 for m in priming[:6])
+    assert all(m["color"] == 0 for m in passive[:9])
+
+    # Solo (no shared motion): the opted-out shape skips the lead-in
+    # entirely — its first move is the raster approach, not the purge travel.
+    solo = _generate(small, False, None, "solo")
+    with_lead = _generate(small, True, None, "with_lead")
+    assert len(solo) < len(with_lead)
+    assert solo[0]["end"] != (-7.0, 0.0, 0.0)
+    assert with_lead[0]["end"] == (-7.0, 0.0, 0.0)
+
+
+def test_gcode_lead_in_return_never_crosses_the_purge_lines(tmp_path) -> None:
+    for lines in (1, 2, 3, 4):
+        gcode_path = generate_vector_gcode(
+            _stack(box(0.0, 0.0, 0.5, 0.5)),
+            shape_name=f"lead_return_{lines}",
+            pressure=25,
+            valve=7,
+            port=3,
+            fil_width=0.5,
+            lead_in_enabled=True,
+            lead_in_length=3.0,
+            lead_in_clearance=4.0,
+            lead_in_lines=lines,
+            output_dir=tmp_path / str(lines),
+        )
+        moves = _moves_with_colors(gcode_path.read_text())
+        lead_end = next(i for i, m in enumerate(moves) if m["end"] == (0.0, 0.0, 0.0))
+        prints = [m for m in moves[: lead_end + 1] if m["color"] == 255]
+        travels = [m for m in moves[: lead_end + 1] if m["color"] == 0]
+        # No travel move's interior crosses a printed purge line: every
+        # printed line sits on a lane y = k*0.5, and travels only run along
+        # x = const (lane changes at line ends) or at y = -0.5 / y <= 0.
+        for travel in travels[1:]:
+            y0, y1 = travel["start"][1], travel["end"][1]
+            x0, x1 = travel["start"][0], travel["end"][0]
+            if abs(y1 - y0) < 1e-9 and abs(x1 - x0) > 1e-9:
+                # Horizontal travel: must be outside the printed lanes.
+                assert y0 < -1e-9 or not any(
+                    abs(p["start"][1] - y0) < 1e-9 for p in prints
+                ), (lines, travel)
 
 
 def test_gcode_pressure_ramp_can_be_disabled(tmp_path) -> None:
@@ -559,6 +670,56 @@ def test_circle_spiral_points_decrease_radius_to_center() -> None:
         current <= previous + 1e-9
         for previous, current in zip(radii, radii[1:])
     )
+
+
+def test_circle_spiral_steps_radius_by_whole_pitches() -> None:
+    # Each revolution is a true circle at a constant radius; the radius drops
+    # by exactly one pitch in a single radial jump between revolutions.
+    points = _circle_spiral_points(2.0, 3.0, outer_radius=4.0, pitch=0.8)
+    radii = [math.hypot(x - 2.0, y - 3.0) for x, y in points]
+
+    distinct = sorted({round(radius, 6) for radius in radii})
+    assert distinct == [0.0, 0.8, 1.6, 2.4, 3.2, 4.0]
+
+    ring_transitions = sum(
+        1
+        for previous, current in zip(radii, radii[1:])
+        if abs(current - previous) > 1e-9
+    )
+    assert ring_transitions == 5
+
+
+def test_circle_spiral_ring_steps_travel_with_valve_shut(tmp_path) -> None:
+    from gcode_viewer import parse_gcode_path
+    from vector_toolpath import RASTER_PATTERN_CIRCLE_SPIRAL
+
+    layer = box(0.0, 0.0, 10.0, 10.0)
+    gcode_path = generate_vector_gcode(
+        _stack(layer, layer),
+        shape_name="ring_steps",
+        pressure=25,
+        valve=7,
+        port=3,
+        fil_width=0.8,
+        layer_height=1.0,
+        raster_pattern=RASTER_PATTERN_CIRCLE_SPIRAL,
+        output_dir=tmp_path,
+    )
+
+    parsed = parse_gcode_path(gcode_path.read_text())
+    origin_x, origin_y = parsed["path_origin"]
+    center_x = center_y = 5.0
+
+    # Print moves stay on a constant-radius ring (within chord flattening);
+    # the inward steps between rings — including pieces clipped by the
+    # material boundary at the edges — are always valve-off travel.
+    worst = 0.0
+    for segment in parsed["print_segments"]:
+        for a, b in zip(segment, segment[1:]):
+            radius_a = math.hypot(a[0] + origin_x - center_x, a[1] + origin_y - center_y)
+            radius_b = math.hypot(b[0] + origin_x - center_x, b[1] + origin_y - center_y)
+            worst = max(worst, abs(radius_b - radius_a))
+    assert worst < 0.11
 
 
 def test_circle_spiral_raster_reverses_between_layers(tmp_path) -> None:

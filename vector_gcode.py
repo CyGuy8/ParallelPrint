@@ -15,6 +15,8 @@ from textwrap import wrap
 
 from stl_slicer import LayerStack
 from vector_toolpath import (
+    LEAD_IN_DIRECTION_CHOICES,
+    LEAD_IN_DIRECTION_LEFT,
     RASTER_PATTERN_CHOICES,
     RASTER_PATTERN_CIRCLE_SPIRAL,
     RASTER_PATTERN_DIAGONAL_WOODPILE,
@@ -32,6 +34,8 @@ from vector_toolpath import (
 )
 
 __all__ = [
+    "LEAD_IN_DIRECTION_CHOICES",
+    "LEAD_IN_DIRECTION_LEFT",
     "RASTER_PATTERN_CHOICES",
     "RASTER_PATTERN_CIRCLE_SPIRAL",
     "RASTER_PATTERN_DIAGONAL_WOODPILE",
@@ -205,6 +209,8 @@ def generate_vector_gcode(
     lead_in_length: float = 5.0,
     lead_in_clearance: float = 5.0,
     lead_in_lines: int = 3,
+    lead_in_direction: str = LEAD_IN_DIRECTION_LEFT,
+    lead_in_dispense: bool = True,
     output_dir: str | Path | None = None,
 ) -> Path:
     """Generate G-code for one sliced shape.
@@ -274,14 +280,18 @@ def generate_vector_gcode(
         delta_x = delta_y = 0.0
     path_origin = (toolpath_origin[0] - delta_x, toolpath_origin[1] - delta_y)
 
+    # A shape that opts out of the lead-in still TRAVELS the purge patch when
+    # motion is shared (all heads must move identically) but keeps its valve
+    # shut; printing solo, it skips the lead-in moves entirely.
     lead_in = _lead_in_moves(
-        lead_in_enabled,
+        lead_in_enabled and (lead_in_dispense or motion is not None),
         lead_in_length,
         lead_in_clearance,
         lead_in_lines,
         fil_width,
-        255,
+        255 if lead_in_dispense else 0,
         0,
+        direction=lead_in_direction,
     )
     if lead_in:
         gcode_list = [*lead_in, *gcode_list]

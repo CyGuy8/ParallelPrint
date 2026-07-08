@@ -111,18 +111,24 @@ def test_shape_settings_round_trip_contour_tracing_column() -> None:
 
     rows = _shape_settings_rows(records)
     assert SHAPE_SETTINGS_HEADERS[6:9] == ["Valve", "Nozzle", "Port"]
-    assert SHAPE_SETTINGS_HEADERS[-2:] == ["Contour Tracing", "Delete"]
+    assert SHAPE_SETTINGS_HEADERS[-3:] == ["Contour Tracing", "Lead In", "Delete"]
+    contour_pos = SHAPE_SETTINGS_HEADERS.index("Contour Tracing")
+    lead_in_pos = SHAPE_SETTINGS_HEADERS.index("Lead In")
     assert rows[0][6:9] == [4, 1, 1]
-    assert rows[0][-2:] == [False, "Delete"]
+    assert rows[0][contour_pos] is False
+    assert rows[0][lead_in_pos] is False  # lead-in is opt-in per shape
+    assert rows[0][-1] == "Delete"
 
     rows[0][7] = 3
     rows[0][8] = 2
-    rows[0][-2] = True
+    rows[0][contour_pos] = True
+    rows[0][lead_in_pos] = True
     updated = _apply_shape_settings(records, rows)
 
     assert updated[0]["nozzle"] == 3
     assert updated[0]["port"] == 2
     assert updated[0]["contour_tracing"] is True
+    assert updated[0]["lead_in"] is True
 
 
 def test_shape_settings_round_trip_infill_column() -> None:
@@ -156,6 +162,45 @@ def test_shape_settings_round_trip_infill_column() -> None:
     assert _apply_shape_settings(records, rows)[0]["infill"] == 100.0
     rows[0][infill_pos] = -10
     assert _apply_shape_settings(records, rows)[0]["infill"] == 0.0
+
+
+def test_lead_in_assembly_extension_covers_the_split_extent() -> None:
+    from shapely.geometry import MultiPolygon, box
+
+    from app import _lead_in_assembly_extension
+    from stl_slicer import LayerStack
+    from vector_toolpath import split_layer_stack_grid
+
+    layer = MultiPolygon([box(0.0, 0.0, 9.0, 4.0)])
+    stack = LayerStack(
+        layers=[layer],
+        z_values=[0.5],
+        bounds=((0.0, 0.0, 0.0), (9.0, 4.0, 1.0)),
+        layer_height=1.0,
+        name="bar",
+    )
+    pieces = split_layer_stack_grid(stack, 3, 1, grid=1.0)
+    records = [
+        {
+            "idx": index + 1,
+            "layer_stack": piece,
+            "split_group_id": "g",
+            "split_columns": 3,
+            "split_rows": 1,
+        }
+        for index, piece in enumerate(pieces)
+    ]
+
+    # Purging along the split axis must clear (count-1) cells; there is only
+    # one row, so the perpendicular directions need no extension.
+    cell_width = pieces[0].bounds[1][0] - pieces[0].bounds[0][0]
+    assert _lead_in_assembly_extension(records, "Left") == cell_width * 2
+    assert _lead_in_assembly_extension(records, "Right") == cell_width * 2
+    assert _lead_in_assembly_extension(records, "Up") == 0.0
+    assert _lead_in_assembly_extension(records, "Down") == 0.0
+
+    # Whole (unsplit) shapes never extend.
+    assert _lead_in_assembly_extension([{"idx": 1}], "Left") == 0.0
 
 
 def test_contour_tracing_sources_use_sliced_layer_stacks() -> None:

@@ -37,6 +37,8 @@ from stl_slicer import (
 )
 from vector_gcode import generate_vector_gcode
 from vector_toolpath import (
+    LEAD_IN_DIRECTION_CHOICES,
+    LEAD_IN_DIRECTION_LEFT,
     RASTER_PATTERN_CHOICES,
     RASTER_PATTERN_SAME_DIRECTION,
     RASTER_PATTERN_Y_DIRECTION,
@@ -1362,6 +1364,7 @@ SHAPE_SETTINGS_HEADERS = [
     "Color",
     "Infill %",
     "Contour Tracing",
+    "Lead In",
     "Delete",
 ]
 SHAPE_SETTINGS_DATATYPES = [
@@ -1376,6 +1379,7 @@ SHAPE_SETTINGS_DATATYPES = [
     "number",
     "str",
     "number",
+    "bool",
     "bool",
     "str",
 ]
@@ -1525,6 +1529,7 @@ def _records_from_files(files: Any, previous_records: list[dict] | None = None) 
             "color": previous.get("color", _default_color(index)),
             "infill": previous.get("infill", 100.0),
             "contour_tracing": previous.get("contour_tracing", False),
+            "lead_in": previous.get("lead_in", False),
             "layer_stack": previous.get("layer_stack"),
             "slice_params": previous.get("slice_params"),
             "gcode_path": previous.get("gcode_path"),
@@ -1556,6 +1561,7 @@ def _shape_settings_rows(records: list[dict]) -> list[list[Any]]:
             record.get("color", _default_color(record["idx"])),
             _coerce_float(record.get("infill", 100.0), 100.0),
             bool(record.get("contour_tracing", False)),
+            bool(record.get("lead_in", False)),
             "Delete",
         ]
         for record in records
@@ -1624,6 +1630,11 @@ def _apply_shape_settings(records: list[dict], settings_table: Any) -> list[dict
                 copy["contour_tracing"] = _coerce_bool(row[contour_pos], bool(copy.get("contour_tracing", False)))
             except IndexError:
                 copy["contour_tracing"] = bool(copy.get("contour_tracing", False))
+            lead_in_pos = contour_pos + 1
+            try:
+                copy["lead_in"] = _coerce_bool(row[lead_in_pos], bool(copy.get("lead_in", False)))
+            except IndexError:
+                copy["lead_in"] = bool(copy.get("lead_in", False))
         updated.append(copy)
     return updated
 
@@ -1989,10 +2000,6 @@ def update_nozzle_grid_preset(
         left, right = preset.split(" x ", 1)
         return gr.update(value=max(1, _coerce_int(left, 1))), gr.update(value=max(1, _coerce_int(right, 1)))
     return gr.update(value=max(1, _coerce_int(columns, 1))), gr.update(value=max(1, _coerce_int(rows, 1)))
-
-
-def update_lead_in_options_visibility(enabled: bool | None) -> dict[str, Any]:
-    return gr.update(visible=bool(enabled))
 
 
 def _dropdown_update(records: list[dict], selected: str | None = None) -> dict[str, Any]:
@@ -2449,6 +2456,35 @@ def _ensure_records_sliced(
     return resliced
 
 
+def _lead_in_assembly_extension(records: list[dict], direction: str | None) -> float:
+    """Extra lead-in clearance so split pieces purge clear of the assembly.
+
+    Under shared reference motion every head executes the same lead-in
+    offset, so head k's purge patch lands one cell over from head k-1's -
+    right on a sibling's print area - unless the clearance exceeds the
+    assembly's remaining extent along the purge axis. The split cells are
+    equal sized, so that extent is (count - 1) * cell for the deepest piece.
+    Returned as one batch-wide value (the max over all split pieces) so
+    every shape's lead-in stays identical and the shared motion stays in
+    sync.
+    """
+    axis = 0 if (direction or LEAD_IN_DIRECTION_LEFT) in ("Left", "Right") else 1
+    extension = 0.0
+    for record in records:
+        if not record.get("split_group_id"):
+            continue
+        stack = record.get("layer_stack")
+        if stack is None:
+            continue
+        (min_x, min_y, _z_min), (max_x, max_y, _z_max) = stack.bounds
+        cell = (max_x - min_x) if axis == 0 else (max_y - min_y)
+        count = _coerce_int(
+            record.get("split_columns" if axis == 0 else "split_rows"), 1
+        )
+        extension = max(extension, cell * max(0, count - 1))
+    return extension
+
+
 def generate_dynamic_gcode(
     records: list[dict] | None,
     settings_table: Any,
@@ -2456,10 +2492,10 @@ def generate_dynamic_gcode(
     use_reference_motion: bool,
     raster_pattern: str | None,
     pressure_ramp_enabled: bool,
-    lead_in_enabled: bool,
     lead_in_length: float,
     lead_in_clearance: float,
     lead_in_lines: float,
+    lead_in_direction: str | None,
     ref_layers: LayerStack | None,
     layer_height: float,
     fil_width: float,
@@ -2478,6 +2514,19 @@ def generate_dynamic_gcode(
     if contour_sources:
         enabled = ", ".join(f"Shape {source.owner_idx}" for source in contour_sources)
         messages.append(f"Contour tracing enabled for {enabled}.")
+    # Lead-in is driven entirely by the per-shape "Lead In" column: the
+    # purge motion exists whenever any shape dispenses it (all heads must
+    # share the motion), and each shape's own flag gates its valve.
+    lead_in_enabled = any(record.get("lead_in") for record in records)
+    effective_lead_in_clearance = float(lead_in_clearance or 0.0)
+    if lead_in_enabled:
+        lead_in_extension = _lead_in_assembly_extension(records, lead_in_direction)
+        if lead_in_extension > 0.0:
+            effective_lead_in_clearance += lead_in_extension
+            messages.append(
+                f"Lead-in clearance extended by {lead_in_extension:.1f} mm so every "
+                "nozzle's purge patch lands clear of the split assembly."
+            )
     for record in records:
         stack = record.get("layer_stack")
         if stack is None or not getattr(stack, "layers", None):
@@ -2505,8 +2554,10 @@ def generate_dynamic_gcode(
                 infill=_coerce_float(record.get("infill", 100.0), 100.0) / 100.0,
                 lead_in_enabled=bool(lead_in_enabled),
                 lead_in_length=float(lead_in_length),
-                lead_in_clearance=float(lead_in_clearance),
+                lead_in_clearance=effective_lead_in_clearance,
                 lead_in_lines=max(1, _coerce_int(lead_in_lines, 3)),
+                lead_in_direction=lead_in_direction or LEAD_IN_DIRECTION_LEFT,
+                lead_in_dispense=bool(record.get("lead_in", True)),
             )
             record["gcode_path"] = str(gcode_path)
             messages.append(f"Shape {record['idx']}: wrote `{gcode_path.name}`.")
@@ -2842,12 +2893,18 @@ def build_dynamic_demo() -> gr.Blocks:
                 value=RASTER_PATTERN_SAME_DIRECTION,
                 allow_custom_value=False,
             )
-            gcode_lead_in_enabled = gr.Checkbox(label="Lead In", value=False)
-            with gr.Group(visible=False) as gcode_lead_in_options_group:
+            with gr.Accordion("Lead In Options", open=False, elem_classes=["settings-accordion"]):
+                gr.Markdown("Applies to shapes with **Lead In** checked in the Shape Settings table.")
                 with gr.Row():
                     gcode_lead_in_length = gr.Number(label="Lead In Length (mm)", value=5.0, minimum=0.1, step=0.1)
                     gcode_lead_in_clearance = gr.Number(label="Lead In Clearance (mm)", value=5.0, minimum=0.0, step=0.1)
                     gcode_lead_in_lines = gr.Number(label="Lead In Raster Lines", value=3, minimum=1, step=1)
+                    gcode_lead_in_direction = gr.Dropdown(
+                        label="Lead In Direction",
+                        choices=list(LEAD_IN_DIRECTION_CHOICES),
+                        value=LEAD_IN_DIRECTION_LEFT,
+                        allow_custom_value=False,
+                    )
             gcode_button = gr.Button("Generate G-Code", variant="primary")
             gcode_downloads = gr.File(label="Download G-Code Files", file_count="multiple", interactive=False, elem_classes=["gcode-download"])
             gcode_status = gr.Markdown("")
@@ -3119,10 +3176,10 @@ def build_dynamic_demo() -> gr.Blocks:
                 gcode_use_ref_motion,
                 gcode_raster_pattern,
                 gcode_pressure_ramp_enabled,
-                gcode_lead_in_enabled,
                 gcode_lead_in_length,
                 gcode_lead_in_clearance,
                 gcode_lead_in_lines,
+                gcode_lead_in_direction,
                 ref_layers,
                 layer_height,
                 fil_width,
@@ -3133,12 +3190,6 @@ def build_dynamic_demo() -> gr.Blocks:
             fn=load_selected_gcode_text,
             inputs=[shape_records, gcode_text_source],
             outputs=[gcode_text],
-        )
-        gcode_lead_in_enabled.change(
-            fn=update_lead_in_options_visibility,
-            inputs=[gcode_lead_in_enabled],
-            outputs=[gcode_lead_in_options_group],
-            queue=False,
         )
         gcode_text_source.change(fn=load_selected_gcode_text, inputs=[shape_records, gcode_text_source], outputs=[gcode_text])
         refresh_gcode_text_button.click(fn=load_selected_gcode_text, inputs=[shape_records, gcode_text_source], outputs=[gcode_text])

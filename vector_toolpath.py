@@ -246,6 +246,7 @@ def _classify_polyline(
     valve: MultiPolygon,
     eps: float = EPS,
     keep_point=None,
+    keep_segment=None,
 ) -> list[Seg]:
     """Split a motion polyline at valve-boundary crossings and color the pieces.
 
@@ -253,7 +254,10 @@ def _classify_polyline(
     Pieces on the boundary count as printing (`covers`), matching the raster
     convention that boundary-grazing sweeps dispense. `keep_point(x, y)` can
     additionally veto dispensing for a piece (evaluated at its midpoint) —
-    used for partial infill; the motion is unaffected.
+    used for partial infill. `keep_segment(x0, y0, x1, y1)` vetoes a whole
+    source segment BEFORE it is split, so a vetoed transition move stays
+    valve-off even where the material boundary cuts through it. The motion
+    is unaffected by either gate.
     """
     segments: list[Seg] = []
     has_valve = valve is not None and not valve.is_empty
@@ -268,7 +272,9 @@ def _classify_polyline(
         if seg_len <= eps:
             continue
 
-        if not has_valve:
+        if not has_valve or (
+            keep_segment is not None and not keep_segment(x0, y0, x1, y1)
+        ):
             _append_colored_segment(segments, x0, y0, x1, y1, 0)
             continue
 
@@ -670,28 +676,35 @@ def _circle_spiral_points(
     outer_radius: float,
     pitch: float,
 ) -> list[tuple[float, float]]:
+    """Concentric-ring "spiral": full circles stepping inward by one pitch.
+
+    Each revolution stays at a CONSTANT radius (so the printed walls are true
+    smooth circles) and the radius then drops by exactly one pitch in a short
+    radial jump before the next revolution, ending at the centre. Ring k thus
+    sits exactly at radius outer - k*pitch, which is also what the partial
+    infill revolution index assumes.
+    """
     if outer_radius <= 0.0:
         return [(center_x, center_y)]
 
     pitch = max(float(pitch), 1e-9)
-    sample_spacing = pitch
-    theta_max = (outer_radius / pitch) * 2.0 * math.pi
-    theta = 0.0
-    points = [(center_x + outer_radius, center_y)]
-
-    while theta < theta_max:
-        radius = max(outer_radius - (pitch * theta / (2.0 * math.pi)), 0.0)
-        d_theta = min(math.pi / 10.0, sample_spacing / max(radius, pitch))
-        theta = min(theta + d_theta, theta_max)
-        radius = max(outer_radius - (pitch * theta / (2.0 * math.pi)), 0.0)
-        points.append(
-            (
-                center_x + (radius * math.cos(theta)),
-                center_y + (radius * math.sin(theta)),
+    points: list[tuple[float, float]] = []
+    radius = outer_radius
+    while radius > 1e-9:
+        # Sample roughly one pitch of arc length per step, at least 20/ring.
+        d_theta = min(math.pi / 10.0, pitch / max(radius, pitch))
+        steps = max(8, int(math.ceil((2.0 * math.pi) / d_theta)))
+        for index in range(steps + 1):
+            theta = (2.0 * math.pi) * index / steps
+            points.append(
+                (
+                    center_x + (radius * math.cos(theta)),
+                    center_y + (radius * math.sin(theta)),
+                )
             )
-        )
+        radius -= pitch
 
-    if points[-1] != (center_x, center_y):
+    if not points or points[-1] != (center_x, center_y):
         points.append((center_x, center_y))
     return points
 
@@ -1074,6 +1087,31 @@ def _append_layer_contours(
     return current_x, current_y
 
 
+LEAD_IN_DIRECTION_LEFT = "Left"
+LEAD_IN_DIRECTION_RIGHT = "Right"
+LEAD_IN_DIRECTION_UP = "Up"
+LEAD_IN_DIRECTION_DOWN = "Down"
+LEAD_IN_DIRECTION_CHOICES = (
+    LEAD_IN_DIRECTION_LEFT,
+    LEAD_IN_DIRECTION_RIGHT,
+    LEAD_IN_DIRECTION_UP,
+    LEAD_IN_DIRECTION_DOWN,
+)
+# Away-from-the-part axis and the lateral line-stepping axis per direction.
+_LEAD_IN_AXES = {
+    LEAD_IN_DIRECTION_LEFT: ((-1.0, 0.0), (0.0, 1.0)),
+    LEAD_IN_DIRECTION_RIGHT: ((1.0, 0.0), (0.0, 1.0)),
+    LEAD_IN_DIRECTION_UP: ((0.0, 1.0), (1.0, 0.0)),
+    LEAD_IN_DIRECTION_DOWN: ((0.0, -1.0), (1.0, 0.0)),
+}
+
+
+def _normalize_lead_in_direction(direction: str | None) -> str:
+    if direction in _LEAD_IN_AXES:
+        return direction
+    return LEAD_IN_DIRECTION_LEFT
+
+
 def _lead_in_moves(
     enabled: bool,
     length: float,
@@ -1082,7 +1120,17 @@ def _lead_in_moves(
     line_spacing: float,
     print_color: int,
     off_color: int,
+    direction: str | None = LEAD_IN_DIRECTION_LEFT,
 ) -> list[dict]:
+    """Purge patch printed before layer 1, in the chosen direction.
+
+    The patch sits `clearance` away from the toolpath start along the purge
+    direction and snakes `line_count` strokes of `length`, stepping one
+    `line_spacing` laterally between strokes. The return route exits the
+    patch one lateral step to the OUTSIDE and comes home through virgin
+    ground, so the freshly primed nozzle never drags back across the wet
+    purge lines.
+    """
     if not enabled:
         return []
     lead_length = max(0.0, float(length))
@@ -1091,27 +1139,43 @@ def _lead_in_moves(
     lead_clearance = max(0.0, float(clearance))
     pass_count = max(1, int(line_count))
     spacing = max(0.0, float(line_spacing))
+    away, lateral = _LEAD_IN_AXES[_normalize_lead_in_direction(direction)]
 
     moves: list[dict] = []
-    current_x = 0.0
-    current_y = 0.0
+    # Patch-local frame: `a` runs along the away axis, `v` along the lateral.
+    current_a = 0.0
+    current_v = 0.0
 
-    def append_move(dx: float, dy: float, color: int) -> None:
-        nonlocal current_x, current_y
-        if dx == 0.0 and dy == 0.0:
+    def append_move(delta_a: float, delta_v: float, color: int) -> None:
+        nonlocal current_a, current_v
+        if delta_a == 0.0 and delta_v == 0.0:
             return
-        moves.append({"X": dx, "Y": dy, "Color": color})
-        current_x += dx
-        current_y += dy
+        moves.append(
+            {
+                "X": delta_a * away[0] + delta_v * lateral[0],
+                "Y": delta_a * away[1] + delta_v * lateral[1],
+                "Color": color,
+            }
+        )
+        current_a += delta_a
+        current_v += delta_v
 
-    append_move(-(lead_clearance + lead_length), 0.0, off_color)
-    direction = 1.0
+    append_move(lead_clearance + lead_length, 0.0, off_color)
+    stroke = -1.0  # first stroke prints back toward the part
     for pass_index in range(pass_count):
-        append_move(direction * lead_length, 0.0, print_color)
-        direction *= -1.0
+        append_move(stroke * lead_length, 0.0, print_color)
+        stroke *= -1.0
         if pass_index < pass_count - 1:
             append_move(0.0, spacing, off_color)
-    append_move(-current_x, -current_y, off_color)
+
+    # Return: step one spacing outside the patch laterally, travel home
+    # through the clearance lane, then step back onto the start point.
+    if spacing > 0.0:
+        append_move(0.0, -(current_v + spacing), off_color)
+        append_move(-current_a, 0.0, off_color)
+        append_move(0.0, -current_v, off_color)
+    else:
+        append_move(-current_a, -current_v, off_color)
     return moves
 
 
@@ -1165,30 +1229,36 @@ def plan_layer_moves(
                 fil_width,
                 reverse=layer_number % 2 == 1,
             )
-            keep_point = None
-            if infill_keep is not None:
-                # A spiral "line" is one revolution: revolution k lies at
-                # radius outer - k*fil from the bbox-circumscribed circle.
-                min_x, min_y, max_x, max_y = motion.bounds
-                center_x = (min_x + max_x) / 2.0
-                center_y = (min_y + max_y) / 2.0
-                outer_radius = max(
-                    math.hypot(cx - center_x, cy - center_y)
-                    for cx, cy in (
-                        (min_x, min_y),
-                        (max_x, min_y),
-                        (max_x, max_y),
-                        (min_x, max_y),
-                    )
+            # Rings sit exactly at radius outer - k*fil. Dispense only ON a
+            # ring: the radial step between revolutions (and the final dive
+            # to the centre) travels with the valve shut — otherwise every
+            # step would extrude a radial seam, worst on the outer wall.
+            # Vetoing whole source segments by their radial change also kills
+            # the step pieces the material boundary would otherwise split off.
+            min_x, min_y, max_x, max_y = motion.bounds
+            center_x = (min_x + max_x) / 2.0
+            center_y = (min_y + max_y) / 2.0
+            outer_radius = max(
+                math.hypot(cx - center_x, cy - center_y)
+                for cx, cy in (
+                    (min_x, min_y),
+                    (max_x, min_y),
+                    (max_x, max_y),
+                    (min_x, max_y),
                 )
+            )
 
-                def keep_point(x: float, y: float) -> bool:
-                    radius = math.hypot(x - center_x, y - center_y)
-                    return infill_keep(
-                        max(0, int(round((outer_radius - radius) / fil_width)))
-                    )
+            def keep_segment(x0: float, y0: float, x1: float, y1: float) -> bool:
+                radius_0 = math.hypot(x0 - center_x, y0 - center_y)
+                radius_1 = math.hypot(x1 - center_x, y1 - center_y)
+                if abs(radius_1 - radius_0) > fil_width * 0.25:
+                    return False  # radial step between rings: travel only
+                if infill_keep is None:
+                    return True
+                ring = round((outer_radius - (radius_0 + radius_1) / 2.0) / fil_width)
+                return infill_keep(max(0, int(ring)))
 
-            segments = _classify_polyline(points, valve, keep_point=keep_point)
+            segments = _classify_polyline(points, valve, keep_segment=keep_segment)
         elif raster_pattern == RASTER_PATTERN_RECTANGULAR_SPIRAL:
             points = _rectangular_spiral_polyline(
                 motion.bounds,
