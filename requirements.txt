@@ -149,6 +149,8 @@ pyyaml==6.0.3
     #   huggingface-hub
 rich==14.3.3
     # via typer
+rtree==1.4.1
+    # via stl-to-gcode
 safehttpx==0.1.7
     # via gradio
 scipy==1.17.1

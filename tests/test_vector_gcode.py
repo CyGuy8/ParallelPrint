@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 
-from shapely.geometry import MultiPolygon, Polygon, box
+from shapely.geometry import MultiPolygon, Point, Polygon, box
 
 from stl_slicer import LayerStack
 from vector_gcode import generate_vector_gcode
@@ -13,7 +13,8 @@ from vector_toolpath import (
     RASTER_PATTERN_Y_DIRECTION,
     ContourSource,
     _append_layer_contours,
-    _circle_spiral_points,
+    _circle_ring_radii,
+    _circle_rings_polyline,
     _layer_contour_loops,
     _rectangular_spiral_polyline,
     build_reference_stack,
@@ -660,33 +661,106 @@ def test_rectangular_spiral_raster_reverses_between_layers(tmp_path) -> None:
     assert end_z == 1.0
 
 
-def test_circle_spiral_points_decrease_radius_to_center() -> None:
-    points = _circle_spiral_points(2.0, 3.0, outer_radius=4.0, pitch=1.0)
-    radii = [math.hypot(x - 2.0, y - 3.0) for x, y in points]
+def test_circle_ring_radii_hug_the_wall_then_fill_from_a_global_grid() -> None:
+    # The outermost revolution follows the material edge (max distance minus
+    # half a bead); the fill rings inside it sit on the (j + 1/2) * fil grid
+    # shared by every layer, so interior rings stack instead of aliasing.
+    disc = MultiPolygon([Point(2.0, 3.0).buffer(4.2, quad_segs=64)])
+    radii, walls = _circle_ring_radii(disc, 2.0, 3.0, 0.8)
 
-    assert radii[0] == 4.0
-    assert radii[-1] == 0.0
-    assert all(
-        current <= previous + 1e-9
-        for previous, current in zip(radii, radii[1:])
+    assert radii == sorted(radii, reverse=True)
+    assert walls == (radii[0],)
+    assert abs(radii[0] - (4.2 - 0.4)) < 1e-2  # wall hugs the material edge
+    for radius in radii[1:]:
+        ring = radius / 0.8 - 0.5
+        assert abs(ring - round(ring)) < 1e-9  # fill stays on the global grid
+        assert radius <= radii[0] - 0.4 + 1e-9  # no overlap with the wall bead
+    assert min(radii) == 0.4  # material at the centre keeps the innermost ring
+
+
+def test_circle_ring_radii_skip_rings_outside_the_material() -> None:
+    # An annulus gets an outer wall, an inner wall hugging the hole, and fill
+    # rings only where circles can cross material.
+    annulus = MultiPolygon(
+        [
+            Point(0.0, 0.0)
+            .buffer(6.0, quad_segs=64)
+            .difference(Point(0.0, 0.0).buffer(3.0, quad_segs=64))
+        ]
     )
+    radii, walls = _circle_ring_radii(annulus, 0.0, 0.0, 0.8)
+
+    assert radii
+    assert len(walls) == 2
+    assert abs(max(walls) - (6.0 - 0.4)) < 1e-2  # outer wall at the edge
+    assert abs(min(walls) - (3.0 + 0.4)) < 1e-2  # inner wall at the hole
+    assert min(radii) >= 3.0 - 1e-2
+    assert max(radii) <= 6.0 + 1e-9
 
 
-def test_circle_spiral_steps_radius_by_whole_pitches() -> None:
+def test_circle_rings_polyline_steps_radius_by_whole_pitches() -> None:
     # Each revolution is a true circle at a constant radius; the radius drops
     # by exactly one pitch in a single radial jump between revolutions.
-    points = _circle_spiral_points(2.0, 3.0, outer_radius=4.0, pitch=0.8)
+    ring_radii = [3.6, 2.8, 2.0, 1.2, 0.4]
+    points = _circle_rings_polyline(2.0, 3.0, ring_radii, 0.8)
     radii = [math.hypot(x - 2.0, y - 3.0) for x, y in points]
 
     distinct = sorted({round(radius, 6) for radius in radii})
-    assert distinct == [0.0, 0.8, 1.6, 2.4, 3.2, 4.0]
+    assert distinct == [0.4, 1.2, 2.0, 2.8, 3.6]
 
     ring_transitions = sum(
         1
         for previous, current in zip(radii, radii[1:])
         if abs(current - previous) > 1e-9
     )
-    assert ring_transitions == 5
+    assert ring_transitions == 4
+
+
+def test_circle_spiral_dome_has_no_travel_rings_and_monotone_radii(tmp_path) -> None:
+    # A dome (shrinking discs): motion must stay near each layer's material
+    # instead of sweeping the full frame, and the outermost printed radius
+    # must never grow with height.
+    from gcode_viewer import parse_gcode_path
+
+    center = (5.0, 5.0)
+    layer_radii = [5.0, 4.3, 3.4, 2.2]
+    layers = [Point(*center).buffer(r, quad_segs=64) for r in layer_radii]
+    gcode_path = generate_vector_gcode(
+        _stack(*layers),
+        shape_name="dome",
+        pressure=25,
+        valve=7,
+        port=3,
+        fil_width=0.8,
+        layer_height=1.0,
+        raster_pattern=RASTER_PATTERN_CIRCLE_SPIRAL,
+        output_dir=tmp_path,
+    )
+
+    parsed = parse_gcode_path(gcode_path.read_text())
+    origin_x, origin_y = parsed["path_origin"]
+
+    def layer_of(z: float) -> int:
+        return max(0, min(len(layer_radii) - 1, int(round(z))))
+
+    motion_max = [0.0] * len(layer_radii)
+    print_max = [0.0] * len(layer_radii)
+    for kind in ("print_segments", "travel_segments"):
+        for segment in parsed[kind]:
+            for x, y, z in segment:
+                radius = math.hypot(x + origin_x - center[0], y + origin_y - center[1])
+                index = layer_of(z)
+                motion_max[index] = max(motion_max[index], radius)
+                if kind == "print_segments":
+                    print_max[index] = max(print_max[index], radius)
+
+    for index, layer_radius in enumerate(layer_radii):
+        # No motion meaningfully beyond this layer's own material edge.
+        assert motion_max[index] <= layer_radius + 0.8, (index, motion_max[index])
+        assert print_max[index] <= layer_radius + 1e-6
+    # Outermost printed ring shrinks (or holds) as the dome narrows.
+    for lower, upper in zip(print_max, print_max[1:]):
+        assert upper <= lower + 1e-9
 
 
 def test_circle_spiral_ring_steps_travel_with_valve_shut(tmp_path) -> None:
@@ -1400,3 +1474,148 @@ def test_split_layer_stack_grid_overlap_alternates_between_layers() -> None:
     # Nominal bounds stay the un-shifted cells.
     assert left.bounds == ((0.0, 0.0, 0.0), (2.0, 2.0, 2.0))
     assert right.bounds == ((2.0, 0.0, 0.0), (4.0, 2.0, 2.0))
+
+
+def test_group_frame_reference_keeps_modeled_positions(tmp_path) -> None:
+    # Multi-material group (shapes sharing a nozzle): parts carry one shared
+    # align_frame, so they are NOT centered individually — each keeps its
+    # modeled position relative to the others, and a part that has no
+    # material on the lower layers just travels there (empty valve layers).
+    from gcode_viewer import parse_gcode_path
+
+    lower = _stack(box(0.0, 0.0, 4.0, 4.0), box(0.0, 0.0, 4.0, 4.0), name="lower")
+    # `upper` sits 6 mm to the right and only exists on layer 1.
+    upper = _stack(None, box(6.0, 0.0, 10.0, 4.0), name="upper")
+    group_frame = (0.0, 0.0, 10.0, 4.0)
+    lower.align_frame = group_frame
+    upper.align_frame = group_frame
+    # A regular shape (own nozzle, no frame) modeled far away prints in the
+    # same job: it gets centered onto the reference like always.
+    solo = _stack(box(100.0, 100.0, 104.0, 104.0), box(100.0, 100.0, 104.0, 104.0), name="solo")
+    reference = build_reference_stack([lower, upper, solo], grid=1.0)
+
+    # The group holding the first stack anchors the reference (no
+    # translation); solo lands centered on the frame centre (5, 2): x 3..7.
+    assert reference.layers[0].bounds == (0.0, 0.0, 7.0, 4.0)
+    assert reference.layers[1].bounds == (0.0, 0.0, 10.0, 4.0)
+    # Layer 0 = lower box (0..4) union solo centered to (3..7): 16+16-4 overlap.
+    assert abs(reference.layers[0].area - 28.0) < 1e-6
+
+    def _world_motion_polyline(text: str) -> list[tuple[float, float, float]]:
+        # Ordered nozzle path in world coordinates, simplified so points that
+        # only mark valve changes (collinear, same direction) drop out.
+        origin_line = next(line for line in text.splitlines() if "PathOrigin" in line)
+        tokens = origin_line.split()
+        origin_x, origin_y = float(tokens[-2][1:]), float(tokens[-1][1:])
+        moves = _moves_with_colors(text)
+        points = [moves[0]["start"]] + [move["end"] for move in moves]
+        world = [(x + origin_x, y + origin_y, z) for x, y, z in points]
+        simplified = [world[0]]
+        for point in world[1:]:
+            if len(simplified) >= 2:
+                ax, ay, az = simplified[-2]
+                bx, by, bz = simplified[-1]
+                d1 = (bx - ax, by - ay, bz - az)
+                d2 = (point[0] - bx, point[1] - by, point[2] - bz)
+                cross = (
+                    d1[1] * d2[2] - d1[2] * d2[1],
+                    d1[2] * d2[0] - d1[0] * d2[2],
+                    d1[0] * d2[1] - d1[1] * d2[0],
+                )
+                same_dir = all(abs(c) < 1e-9 for c in cross) and (
+                    d1[0] * d2[0] + d1[1] * d2[1] + d1[2] * d2[2] >= 0
+                )
+                if same_dir:
+                    simplified[-1] = point
+                    continue
+            simplified.append(point)
+        return [(round(x, 6), round(y, 6), round(z, 6)) for x, y, z in simplified]
+
+    prints: dict[str, list] = {}
+    motions: dict[str, list] = {}
+    for stack in (lower, upper):
+        gcode_path = generate_vector_gcode(
+            stack,
+            shape_name=stack.name,
+            pressure=25,
+            valve=7,
+            port=3,
+            fil_width=1.0,
+            layer_height=1.0,
+            motion=reference,
+            output_dir=tmp_path,
+        )
+        text = gcode_path.read_text()
+        parsed = parse_gcode_path(text)
+        origin_x, origin_y = parsed["path_origin"]
+        prints[stack.name] = [
+            [(x + origin_x, y + origin_y, z) for x, y, z in segment]
+            for segment in parsed["print_segments"]
+        ]
+        motions[stack.name] = _world_motion_polyline(text)
+
+    # Shared motion: both heads trace exactly the same world path.
+    assert motions["lower"] == motions["upper"]
+
+    # `upper` never dispenses on layer 0 and prints only inside x 6..10.
+    for segment in prints["upper"]:
+        for x, y, z in segment:
+            assert z > 0.5
+            assert 6.0 - 1e-6 <= x <= 10.0 + 1e-6
+    # `lower` prints only inside x 0..4 (its modeled position, not recentered).
+    for segment in prints["lower"]:
+        for x, y, z in segment:
+            assert 0.0 - 1e-6 <= x <= 4.0 + 1e-6
+
+
+def test_group_contour_paths_exclude_material_interfaces() -> None:
+    from vector_toolpath import group_contour_paths
+
+    # Two materials abutting at x=4 assemble into one 8x4 shape: the shared
+    # edge is an internal interface, so each member contours only its three
+    # outer sides.
+    left = _stack(box(0.0, 0.0, 4.0, 4.0), name="left")
+    right = _stack(box(4.0, 0.0, 8.0, 4.0), name="right")
+    paths = group_contour_paths(left, [right], tolerance=0.4)
+
+    assert len(paths) == 1
+    total = sum(
+        math.dist(a, b)
+        for path in paths[0]
+        for a, b in zip(path, path[1:])
+    )
+    # 3 outer sides of the 4x4 box; boundary within tolerance (0.4) of the
+    # sibling also counts as interface, so the top/bottom edges stop 0.4
+    # short of the seam: 12 - 2*0.4. The seam edge itself is gone entirely.
+    assert abs(total - 11.2) < 1e-6
+    for path in paths[0]:
+        for x, _y in path:
+            assert x <= 3.6 + 1e-9  # nothing at or past the seam
+
+    # A fit-tolerance gap smaller than the tolerance still counts as an
+    # interface; a distant shape does not.
+    gapped = _stack(box(4.2, 0.0, 8.0, 4.0), name="gapped")
+    paths_gapped = group_contour_paths(left, [gapped], tolerance=0.4)
+    total_gapped = sum(
+        math.dist(a, b)
+        for path in paths_gapped[0]
+        for a, b in zip(path, path[1:])
+    )
+    # Seam edge excluded; top/bottom trimmed where within 0.4 of the sibling
+    # (which starts at 4.2): 12 - 2*0.2.
+    assert abs(total_gapped - 11.6) < 1e-6
+
+    far = _stack(box(9.0, 0.0, 12.0, 4.0), name="far")
+    paths_far = group_contour_paths(left, [far], tolerance=0.4)
+    total_far = sum(
+        math.dist(a, b)
+        for path in paths_far[0]
+        for a, b in zip(path, path[1:])
+    )
+    assert abs(total_far - 16.0) < 1e-6  # full ring: nothing nearby
+
+    # A material fully embedded in the assembly has no outer surface at all.
+    core = _stack(box(1.0, 1.0, 3.0, 3.0), name="core")
+    shell_layer = box(0.0, 0.0, 4.0, 4.0).difference(box(1.0, 1.0, 3.0, 3.0))
+    shell = _stack(shell_layer, name="shell")
+    assert group_contour_paths(core, [shell], tolerance=0.4) == [[]]

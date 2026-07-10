@@ -670,27 +670,87 @@ def _rectangular_spiral_polyline(
     return _extend_polyline_ends(points, half)
 
 
-def _circle_spiral_points(
+def _circle_ring_radii(
+    motion: MultiPolygon,
     center_x: float,
     center_y: float,
-    outer_radius: float,
+    fil_width: float,
+) -> tuple[list[float], tuple[float, ...]]:
+    """Ring radii for one layer, outermost first: perimeter walls + grid fill.
+
+    The outermost revolution is a PERIMETER WALL hugging the layer's material
+    edge (its farthest boundary distance minus half a bead), so the printed
+    silhouette follows the shape smoothly instead of staircasing by whole
+    grid steps. If the layer has a central hole, a matching inner wall hugs
+    the hole edge. The fill between the walls comes from a global grid —
+    ring j at (j + 1/2) * fil_width from the frame centre, the same grid on
+    every layer (and every split sibling) so interior rings stack vertically.
+    Grid rings that would overlap a wall bead, or whose circle cannot cross
+    the layer's material at all, are skipped instead of traveled.
+
+    Returns (radii outermost-first, wall radii). Walls always dispense even
+    under partial infill, like contour tracing.
+    """
+    if motion is None or motion.is_empty:
+        return [], ()
+
+    max_dist = 0.0
+    for polygon in motion.geoms:
+        for ring in (polygon.exterior, *polygon.interiors):
+            for x, y in ring.coords:
+                max_dist = max(max_dist, math.hypot(x - center_x, y - center_y))
+    if max_dist <= 0.0:
+        return [], ()
+    min_dist = float(motion.distance(Point(center_x, center_y)))
+
+    pitch = max(float(fil_width), 1e-9)
+    half = pitch / 2.0
+
+    outer_wall = max_dist - half
+    if outer_wall <= EPS:
+        # Material thinner than one bead (e.g. the dome cap): one tiny ring
+        # through the middle of it so the layer still gets motion.
+        radius = max(max_dist / 2.0, EPS)
+        return [radius], (radius,)
+
+    walls = [outer_wall]
+    inner_wall: float | None = None
+    if min_dist > pitch / 4.0:
+        candidate = min_dist + half
+        if candidate <= outer_wall - half:
+            inner_wall = candidate
+            walls.append(candidate)
+
+    grid_hi = outer_wall - half
+    grid_lo = (inner_wall + half) if inner_wall is not None else max(min_dist - half, 0.0)
+    j_hi = int(math.floor(grid_hi / pitch - 0.5 + 1e-9))
+    j_lo = max(0, int(math.ceil(grid_lo / pitch - 0.5 - 1e-9)))
+
+    radii = [outer_wall]
+    if j_hi >= j_lo:
+        radii.extend((j + 0.5) * pitch for j in range(j_hi, j_lo - 1, -1))
+    if inner_wall is not None:
+        radii.append(inner_wall)
+    return radii, tuple(walls)
+
+
+def _circle_rings_polyline(
+    center_x: float,
+    center_y: float,
+    radii: list[float],
     pitch: float,
 ) -> list[tuple[float, float]]:
-    """Concentric-ring "spiral": full circles stepping inward by one pitch.
+    """Concentric-ring "spiral": one full circle per radius, in list order.
 
     Each revolution stays at a CONSTANT radius (so the printed walls are true
-    smooth circles) and the radius then drops by exactly one pitch in a short
-    radial jump before the next revolution, ending at the centre. Ring k thus
-    sits exactly at radius outer - k*pitch, which is also what the partial
-    infill revolution index assumes.
+    smooth circles); consecutive rings are joined by a radial jump at theta 0,
+    which the caller classifies as valve-off travel.
     """
-    if outer_radius <= 0.0:
-        return [(center_x, center_y)]
-
     pitch = max(float(pitch), 1e-9)
     points: list[tuple[float, float]] = []
-    radius = outer_radius
-    while radius > 1e-9:
+    for radius in radii:
+        if radius <= 0.0:
+            continue
         # Sample roughly one pitch of arc length per step, at least 20/ring.
         d_theta = min(math.pi / 10.0, pitch / max(radius, pitch))
         steps = max(8, int(math.ceil((2.0 * math.pi) / d_theta)))
@@ -702,34 +762,6 @@ def _circle_spiral_points(
                     center_y + (radius * math.sin(theta)),
                 )
             )
-        radius -= pitch
-
-    if not points or points[-1] != (center_x, center_y):
-        points.append((center_x, center_y))
-    return points
-
-
-def _circle_spiral_polyline(
-    bounds: tuple[float, float, float, float],
-    fil_width: float,
-    reverse: bool = False,
-) -> list[tuple[float, float]]:
-    min_x, min_y, max_x, max_y = bounds
-    center_x = (min_x + max_x) / 2.0
-    center_y = (min_y + max_y) / 2.0
-    outer_radius = max(
-        math.hypot(corner_x - center_x, corner_y - center_y)
-        for corner_x, corner_y in (
-            (min_x, min_y),
-            (max_x, min_y),
-            (max_x, max_y),
-            (min_x, max_y),
-        )
-    )
-
-    points = _circle_spiral_points(center_x, center_y, outer_radius, fil_width)
-    if reverse:
-        points.reverse()
     return points
 
 
@@ -1224,38 +1256,35 @@ def plan_layer_moves(
         if motion is None or motion.is_empty:
             segments: list[Seg] = []
         elif raster_pattern == RASTER_PATTERN_CIRCLE_SPIRAL:
-            points = _circle_spiral_polyline(
-                motion.bounds,
-                fil_width,
-                reverse=layer_number % 2 == 1,
-            )
-            # Rings sit exactly at radius outer - k*fil. Dispense only ON a
-            # ring: the radial step between revolutions (and the final dive
-            # to the centre) travels with the valve shut — otherwise every
-            # step would extrude a radial seam, worst on the outer wall.
-            # Vetoing whole source segments by their radial change also kills
-            # the step pieces the material boundary would otherwise split off.
-            min_x, min_y, max_x, max_y = motion.bounds
-            center_x = (min_x + max_x) / 2.0
-            center_y = (min_y + max_y) / 2.0
-            outer_radius = max(
-                math.hypot(cx - center_x, cy - center_y)
-                for cx, cy in (
-                    (min_x, min_y),
-                    (max_x, min_y),
-                    (max_x, max_y),
-                    (min_x, max_y),
-                )
-            )
+            # Rings live on one global radii grid anchored at the frame
+            # centre (ring j at (j + 1/2) * fil): every layer draws from the
+            # same radii, so walls stack across layers instead of aliasing,
+            # and rings that never touch this layer's material are skipped
+            # instead of swept as full travel circles.
+            frame = scan_frame if scan_frame is not None else motion.bounds
+            center_x = (frame[0] + frame[2]) / 2.0
+            center_y = (frame[1] + frame[3]) / 2.0
+            radii, wall_radii = _circle_ring_radii(motion, center_x, center_y, fil_width)
+            points = _circle_rings_polyline(center_x, center_y, radii, fil_width)
+            if layer_number % 2 == 1:
+                points.reverse()
 
+            # Dispense only ON a ring: the radial jump between revolutions
+            # travels with the valve shut — otherwise every jump would
+            # extrude a radial seam, worst on the outer wall. Vetoing whole
+            # source segments by their radial change also kills the step
+            # pieces the material boundary would otherwise split off.
             def keep_segment(x0: float, y0: float, x1: float, y1: float) -> bool:
                 radius_0 = math.hypot(x0 - center_x, y0 - center_y)
                 radius_1 = math.hypot(x1 - center_x, y1 - center_y)
                 if abs(radius_1 - radius_0) > fil_width * 0.25:
-                    return False  # radial step between rings: travel only
+                    return False  # radial jump between rings: travel only
                 if infill_keep is None:
                     return True
-                ring = round((outer_radius - (radius_0 + radius_1) / 2.0) / fil_width)
+                radius_mid = (radius_0 + radius_1) / 2.0
+                if any(abs(radius_mid - wall) <= fil_width * 0.25 for wall in wall_radii):
+                    return True  # perimeter walls always print, like contours
+                ring = round(radius_mid / fil_width - 0.5)
                 return infill_keep(max(0, int(ring)))
 
             segments = _classify_polyline(points, valve, keep_segment=keep_segment)
@@ -1420,6 +1449,17 @@ def _stack_center(stack: LayerStack) -> tuple[float, float]:
     return ((x_min + x_max) / 2.0, (y_min + y_max) / 2.0)
 
 
+def _alignment_center(stack: LayerStack) -> tuple[float, float]:
+    """The point a stack is centred by: its multi-material group frame's
+    centre when it belongs to a group, else its own bbox centre. Group
+    members share one frame, so they all get the same delta and keep their
+    modelled positions relative to each other."""
+    if stack.align_frame is not None:
+        x_min, y_min, x_max, y_max = stack.align_frame
+        return ((x_min + x_max) / 2.0, (y_min + y_max) / 2.0)
+    return _stack_center(stack)
+
+
 def _snap_to_grid(value: float, grid: float | None) -> float:
     if not grid or grid <= 0.0:
         return value
@@ -1446,6 +1486,11 @@ def _centering_delta(stack: LayerStack, reference: LayerStack) -> tuple[float, f
     nozzle spacing — come out uniform across all pieces, whereas snapping the
     centres would wobble by up to one fil where the last cell's width (and so
     its centre phase) differs.
+
+    Multi-material group members (stacks carrying a shared `align_frame`)
+    are aligned by the group frame's centre instead of their own bbox
+    centre: every member gets the same delta, so the group moves as one
+    rigid unit and parts keep their modelled relative positions.
     """
     grid = reference.align_grid
     if (
@@ -1467,7 +1512,7 @@ def _centering_delta(stack: LayerStack, reference: LayerStack) -> tuple[float, f
         reference_x, reference_y = reference.align_center
     else:
         reference_x, reference_y = _stack_center(reference)
-    center_x, center_y = _stack_center(stack)
+    center_x, center_y = _alignment_center(stack)
     return (
         _snap_to_grid(reference_x - center_x, grid),
         _snap_to_grid(reference_y - center_y, grid),
@@ -1498,11 +1543,18 @@ def build_reference_stack(
     stacks: list[LayerStack | None],
     grid: float | None = None,
 ) -> LayerStack | None:
-    """Union all shapes into one shared motion stack, bbox-centres aligned.
+    """Union all shapes into one shared motion stack, alignment-centres aligned.
 
     Vector analog of the old centered "black wins" TIFF merge: every stack is
-    translated so its XY bbox centre lands on the first stack's centre, then
-    each layer is the union of the translated layers.
+    translated so its alignment centre (its own XY bbox centre, or its
+    multi-material group frame's centre — see `_alignment_center`) lands on
+    the first stack's alignment centre, then each layer is the union of the
+    translated layers. Multi-material group members share one frame, so the
+    group translates as a rigid unit and its parts keep their modelled
+    relative positions; the group holding the first stack does not move at
+    all. Group members should be sliced on one common Z grid so layer indices
+    line up; a part that starts higher simply contributes nothing to the
+    lower layers.
 
     `grid` (the fil width) snaps each translation to grid multiples so every
     shape's world scan-grid phase survives the alignment — required for split
@@ -1515,7 +1567,7 @@ def build_reference_stack(
         return None
 
     n_layers = max(len(stack.layers) for stack in valid)
-    reference_x, reference_y = _stack_center(valid[0])
+    reference_x, reference_y = _alignment_center(valid[0])
     target = LayerStack(
         layers=[],
         z_values=[],
@@ -1623,20 +1675,11 @@ def _shifted_split_edges(
     return adjusted
 
 
-def _clip_contour_paths(
-    source_lines: object,
-    cell: object,
-) -> list[list[tuple[float, float]]]:
-    """Contour polylines of a split piece: the parent outline inside the cell.
-
-    Clipping the PARENT's boundary linework (instead of taking the piece
-    polygon's own boundary) excludes the cut seams between sibling pieces —
-    only the true outer surface remains. Results are merged into maximal
-    polylines and ordered/oriented deterministically so pieces sharing
-    reference motion trace them identically.
-    """
-    clipped = source_lines.intersection(cell)
-    pieces = list(_iter_linestrings(clipped))
+def _linework_to_paths(geometry: object) -> list[list[tuple[float, float]]]:
+    """Merge linework into maximal polylines, ordered/oriented
+    deterministically so shapes sharing reference motion trace them
+    identically. Open paths allowed; closed rings keep first == last."""
+    pieces = list(_iter_linestrings(geometry))
     if not pieces:
         return []
     merged = linemerge(MultiLineString(pieces)) if len(pieces) > 1 else pieces[0]
@@ -1661,6 +1704,53 @@ def _clip_contour_paths(
     return paths
 
 
+def _clip_contour_paths(
+    source_lines: object,
+    cell: object,
+) -> list[list[tuple[float, float]]]:
+    """Contour polylines of a split piece: the parent outline inside the cell.
+
+    Clipping the PARENT's boundary linework (instead of taking the piece
+    polygon's own boundary) excludes the cut seams between sibling pieces —
+    only the true outer surface remains.
+    """
+    return _linework_to_paths(source_lines.intersection(cell))
+
+
+def group_contour_paths(
+    member: LayerStack,
+    siblings: list[LayerStack],
+    tolerance: float,
+) -> list[list[list[tuple[float, float]]]]:
+    """Per-layer seam-free contour polylines for one multi-material member.
+
+    Parts sharing a nozzle assemble into ONE shape, so where a member's
+    boundary meets a sibling material — or comes within `tolerance` of it
+    (fit gaps between materials) — that edge is an internal interface, not a
+    printable surface. Only the member boundary on the assembly's true
+    outside is kept; a member fully embedded in the assembly gets no
+    contours at all. Members should share one Z grid so layer indices align.
+    """
+    tolerance = max(float(tolerance), EPS)
+    contour_paths: list[list[list[tuple[float, float]]]] = []
+    for layer_number, layer in enumerate(member.layers):
+        if layer is None or layer.is_empty:
+            contour_paths.append([])
+            continue
+        sibling_parts = [
+            sibling.layers[layer_number]
+            for sibling in siblings
+            if layer_number < len(sibling.layers)
+            and sibling.layers[layer_number] is not None
+            and not sibling.layers[layer_number].is_empty
+        ]
+        boundary = layer.boundary
+        if sibling_parts:
+            boundary = boundary.difference(unary_union(sibling_parts).buffer(tolerance))
+        contour_paths.append(_linework_to_paths(boundary))
+    return contour_paths
+
+
 def split_layer_stack_grid(
     stack: LayerStack,
     columns: int,
@@ -1668,6 +1758,7 @@ def split_layer_stack_grid(
     overlapping_layers: bool = False,
     overlap: float = 0.0,
     grid: float | None = None,
+    frame: tuple[float, float, float, float] | None = None,
 ) -> list[LayerStack]:
     """Split a sliced shape into a rows x columns grid of piece stacks.
 
@@ -1677,10 +1768,17 @@ def split_layer_stack_grid(
     pieces interlock. `grid` (the fil width) sizes the cells in whole grid
     multiples (see `_base_split_edges`). Piece `bounds` are the nominal
     (un-shifted) cell boxes.
+
+    `frame` overrides the XY box the cell grid is computed over. Splitting
+    every member of a multi-material group with the group's combined bounds
+    as the frame clips all materials by the SAME cells (and one shared scan
+    frame), so cell-mates assemble exactly.
     """
     columns = max(1, int(columns))
     rows = max(1, int(rows))
     (x_min, y_min, z_min), (x_max, y_max, z_max) = stack.bounds
+    if frame is not None:
+        x_min, y_min, x_max, y_max = (float(value) for value in frame)
 
     overlap_x = overlap if (overlapping_layers and columns > 1) else 0.0
     overlap_y = overlap if (overlapping_layers and rows > 1) else 0.0

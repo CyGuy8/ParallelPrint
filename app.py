@@ -30,6 +30,7 @@ from gcode_viewer import (
 )
 from stl_slicer import (
     LayerStack,
+    calculate_z_levels,
     load_mesh,
     scale_factors_for_target_extents,
     scale_mesh,
@@ -44,6 +45,7 @@ from vector_toolpath import (
     RASTER_PATTERN_Y_DIRECTION,
     ContourSource,
     build_reference_stack,
+    group_contour_paths,
     split_layer_stack_grid,
 )
 
@@ -69,6 +71,56 @@ NOZZLE_LAYOUT_PRESETS = [
     "5 x 2",
 ]
 APP_CSS = """
+.pp-visually-hidden {
+    position: absolute !important;
+    width: 1px !important;
+    height: 1px !important;
+    min-width: 0 !important;
+    min-height: 0 !important;
+    padding: 0 !important;
+    margin: -1px !important;
+    border: 0 !important;
+    overflow: hidden !important;
+    clip-path: inset(50%);
+}
+.pp-color-cell {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 170px;
+}
+.pp-color-current {
+    display: inline-block;
+    min-width: 46px;
+    padding: 1px 5px;
+    border: 1px solid rgba(0, 0, 0, 0.25);
+    border-radius: 4px;
+    font-size: 0.75em;
+    text-align: center;
+    white-space: nowrap;
+}
+.pp-swatches {
+    display: inline-flex;
+    gap: 3px;
+    align-items: center;
+}
+.pp-swatch {
+    display: inline-block;
+    width: 13px;
+    height: 13px;
+    border: 1px solid rgba(0, 0, 0, 0.35);
+    border-radius: 3px;
+    cursor: pointer;
+    box-sizing: border-box;
+}
+.pp-swatch:hover {
+    transform: scale(1.3);
+}
+.pp-swatch.pp-current {
+    outline: 2px solid var(--color-accent, #f97316);
+    outline-offset: 1px;
+}
+
 .gradio-container {
     font-size: 90%;
     padding-top: 0.5rem !important;
@@ -319,6 +371,39 @@ APP_CSS = """
 APP_HEAD = """
 <script>
 (function () {
+    function relayColorChoice(rowIdx, hex) {
+        var sink = document.querySelector('#pp-color-sink textarea, #pp-color-sink input');
+        var apply = document.querySelector('#pp-color-apply button, button#pp-color-apply, #pp-color-apply');
+        if (!sink || !apply) return;
+        sink.value = rowIdx + '|' + hex;
+        sink.dispatchEvent(new Event('input', { bubbles: true }));
+        if (apply.tagName !== 'BUTTON') { apply = apply.querySelector('button') || apply; }
+        apply.click();
+    }
+    // In-table color dropdowns: relay each select's pick to the hidden sink
+    // textbox + apply button so the backend updates the shape record. The
+    // native popup survives because Color cells' pointer events are
+    // swallowed before the dataframe can open its cell editor (see
+    // isolateColorCell below).
+    document.addEventListener('change', function (event) {
+        var el = event.target;
+        if (!el || !el.classList || !el.classList.contains('pp-color-select')) return;
+        var match = (el.className || '').match(/pp-idx-([0-9]+)/);
+        if (!match) return;
+        relayColorChoice(match[1], el.value);
+    }, true);
+    // In-table color swatches (if a cell renders palette chips instead):
+    // clicking a chip relays "rowIdx|#hex" the same way.
+    document.addEventListener('click', function (event) {
+        var el = event.target;
+        if (!el || !el.classList || !el.classList.contains('pp-swatch')) return;
+        var idxMatch = (el.className || '').match(/pp-idx-([0-9]+)/);
+        var hexMatch = (el.className || '').match(/pp-hex-([0-9a-fA-F]{6})/);
+        if (!idxMatch || !hexMatch) return;
+        event.preventDefault();
+        event.stopPropagation();
+        relayColorChoice(idxMatch[1], '#' + hexMatch[1].toLowerCase());
+    }, true);
     function enableUndoButtons(root) {
         (root || document).querySelectorAll('.model3D button[aria-label="Undo"]').forEach(function (btn) {
             if (btn.disabled) {
@@ -335,9 +420,29 @@ APP_HEAD = """
             }
         }, 0);
     }
+    // Color cells host clickable palette chips: swallow pointer events before
+    // the dataframe's own handlers run, or a click would select the cell and
+    // open the raw-HTML cell editor on top of the chips.
+    function isolateColorCell(event) {
+        var el = event.target;
+        if (!el || !el.closest) return;
+        var cell = el.closest('td, [role="gridcell"]');
+        if (!cell || !cell.querySelector('.pp-color-cell')) return;
+        event.stopPropagation();
+        if (event.type === 'dblclick') {
+            event.preventDefault();
+        }
+    }
     function start() {
         enableUndoButtons();
         document.addEventListener('focusin', suppressDeleteCellEditor);
+        document.addEventListener('pointerdown', isolateColorCell, true);
+        document.addEventListener('mousedown', isolateColorCell, true);
+        document.addEventListener('touchstart', isolateColorCell, true);
+        document.addEventListener('dblclick', isolateColorCell, true);
+        // 'click' too: registered AFTER the swatch relay above, so the chip
+        // click is applied first, then the dataframe never sees the event.
+        document.addEventListener('click', isolateColorCell, true);
         var observer = new MutationObserver(function (mutations) {
             for (var i = 0; i < mutations.length; i++) {
                 var m = mutations[i];
@@ -1154,7 +1259,8 @@ GCODE_SOURCE_UPLOAD = "Upload G-Code file"
 PARALLEL_COLOR_CHOICES = [
     ("Orange", "#ff7f0e"), ("Blue", "#1f77b4"), ("Green", "#2ca02c"),
     ("Red", "#d62728"), ("Purple", "#9467bd"), ("Pink", "#e377c2"),
-    ("Teal", "#17becf"), ("Black", "#000000"),
+    ("Teal", "#17becf"), ("Yellow", "#ffe119"), ("White", "#ffffff"),
+    ("Black", "#000000"),
 ]
 DEFAULT_PARALLEL_COLORS = ("#ff7f0e", "#1f77b4", "#2ca02c")
 SHAPE_COLOR_NAMES = [name for name, _hex in PARALLEL_COLOR_CHOICES]
@@ -1166,6 +1272,62 @@ def _color_display(value: str | None) -> str:
     """Palette name for a stored color; unknown values show as-is."""
     text = str(value or "").strip()
     return _COLOR_NAME_BY_HEX.get(text.lower(), text)
+
+
+def apply_color_selection(
+    records: list[dict] | None,
+    settings_table: Any,
+    payload: str | None,
+) -> tuple[list[dict], list[list[Any]]]:
+    """Apply an in-table color dropdown change ("idx|#hex" from the sink)."""
+    records = _apply_shape_settings(records or [], settings_table)
+    parts = str(payload or "").split("|")
+    if len(parts) >= 2:
+        try:
+            idx = int(parts[0])
+        except (TypeError, ValueError):
+            idx = None
+        hex_value = parts[1].strip().lower()
+        palette = {value.lower() for _name, value in PARALLEL_COLOR_CHOICES}
+        if idx is not None and hex_value in palette:
+            records = [
+                dict(record, color=hex_value)
+                if int(record.get("idx", 0) or 0) == idx
+                else record
+                for record in records
+            ]
+    return records, _shape_settings_rows(records)
+
+
+def _color_select_cell(record: dict) -> str:
+    """HTML dropdown for a shape's Color cell (markdown-rendered).
+
+    The select carries the record idx as a sanitizer-safe class token; a
+    delegated head-script change listener relays picks to the hidden
+    sink/apply pair, which updates the record and re-renders the table. The
+    closed select shows the current color as its background. Works because
+    the head script also swallows pointer events on Color cells before the
+    dataframe's handlers run — otherwise the cell editor would open on
+    mousedown and kill the native dropdown popup.
+    """
+    idx = int(record.get("idx", 0) or 0)
+    current = str(record.get("color", _default_color(idx))).strip().lower()
+    options = "".join(
+        '<option value="{hex}"{sel}>{name}</option>'.format(
+            hex=hex_value,
+            sel=" selected" if hex_value.lower() == current else "",
+            name=name,
+        )
+        for name, hex_value in PARALLEL_COLOR_CHOICES
+    )
+    text_color = "#ffffff" if current in ("#000000",) else "#000000"
+    return (
+        '<span class="pp-color-cell">'
+        '<select class="pp-color-select pp-idx-{idx}" '
+        'style="background-color:{bg};color:{fg}">{options}</select>'
+        "</span>"
+    ).format(idx=idx, bg=current if current.startswith("#") else "#ffffff",
+             fg=text_color, options=options)
 
 
 def _color_from_cell(cell, fallback: str) -> str:
@@ -1403,7 +1565,7 @@ SHAPE_SETTINGS_DATATYPES = [
     "number",
     "number",
     "number",
-    "str",
+    "markdown",
     "number",
     "bool",
     "bool",
@@ -1584,7 +1746,7 @@ def _shape_settings_rows(records: list[dict]) -> list[list[Any]]:
             record.get("valve", 4),
             _record_nozzle_number(record, int(record["idx"])),
             record.get("port", 1),
-            _color_display(record.get("color", _default_color(record["idx"]))),
+            _color_select_cell(record),
             _coerce_float(record.get("infill", 100.0), 100.0),
             bool(record.get("contour_tracing", False)),
             bool(record.get("lead_in", False)),
@@ -2249,14 +2411,121 @@ def show_selected_model(
     )
 
 
-def _slice_params_snapshot(record: dict, layer_height: float, scale_mode: str | None) -> dict:
+def _slice_params_snapshot(
+    record: dict,
+    layer_height: float,
+    scale_mode: str | None,
+    z_levels: list[float] | None = None,
+) -> dict:
     return {
         "layer_height": float(layer_height),
         "scale_mode": _normalize_scale_mode(scale_mode),
         "target_x": record.get("target_x"),
         "target_y": record.get("target_y"),
         "target_z": record.get("target_z"),
+        # Multi-material mode: the shared Z grid fingerprint. Adding/removing
+        # an assembly part changes the grid, which correctly marks every
+        # part's slices stale.
+        "z_grid": (round(z_levels[0], 6), len(z_levels)) if z_levels else None,
     }
+
+
+def _multi_material_groups(records: list[dict]) -> dict[int, list[dict]]:
+    """Multi-material groups: uploaded shapes that share a nozzle number.
+
+    Shapes on the same nozzle print from the same physical position, so
+    their STLs are parts of one assembly (one STL per material). They must
+    slice on one shared Z grid and keep their modelled positions relative to
+    each other. Shapes alone on their nozzle stay ordinary. Split pieces
+    (no stl_path) are excluded — they carry their own frame alignment.
+    """
+    by_nozzle: dict[int, list[dict]] = {}
+    for record in records:
+        if not record.get("stl_path"):
+            continue
+        nozzle = _record_nozzle_number(record, int(record.get("idx", 1) or 1))
+        by_nozzle.setdefault(nozzle, []).append(record)
+    return {nozzle: members for nozzle, members in by_nozzle.items() if len(members) > 1}
+
+
+def _stamp_multi_material_frames(records: list[dict], fil_width: float = 0.8) -> None:
+    """Stamp each sliced stack's multi-material group frame and seam-free
+    contour paths (or clear them).
+
+    Group members get the group's combined XY bbox as `align_frame`, so the
+    reference alignment moves them as one rigid unit, and `contour_paths`
+    that exclude material-to-material interfaces — the assembled parts form
+    ONE shape, so only its true outer surface is contoured (boundary within
+    half a bead of a sibling material counts as an interface, covering both
+    exact contact and fit-tolerance gaps). Idempotent — safe to call before
+    every reference build so nozzle renumbering in the table takes effect
+    without re-slicing.
+    """
+    grouped_ids: set[int] = set()
+    for members in _multi_material_groups(records).values():
+        stacks = [
+            member.get("layer_stack")
+            for member in members
+            if member.get("layer_stack") is not None
+        ]
+        if len(stacks) < 2:
+            continue
+        frame = (
+            min(stack.bounds[0][0] for stack in stacks),
+            min(stack.bounds[0][1] for stack in stacks),
+            max(stack.bounds[1][0] for stack in stacks),
+            max(stack.bounds[1][1] for stack in stacks),
+        )
+        for stack in stacks:
+            stack.align_frame = frame
+            stack.contour_paths = group_contour_paths(
+                stack,
+                [other for other in stacks if other is not stack],
+                tolerance=float(fil_width or 0.8) / 2.0,
+            )
+            grouped_ids.add(id(stack))
+    for record in records:
+        stack = record.get("layer_stack")
+        if stack is not None and id(stack) not in grouped_ids and record.get("stl_path"):
+            stack.align_frame = None
+            stack.contour_paths = None
+
+
+def _multi_material_z_levels(
+    records: list[dict],
+    layer_height: float,
+    scale_mode: str | None,
+) -> list[float] | None:
+    """One shared Z grid spanning the given parts' scaled extents.
+
+    Multi-material group members must slice on the SAME planes so a part
+    that starts higher gets empty lower layers instead of having its first
+    material layer treated as layer 0.
+    """
+    z_lo = math.inf
+    z_hi = -math.inf
+    for record in records:
+        stl_path = record.get("stl_path")
+        if not stl_path:
+            continue
+        try:
+            mesh = load_mesh(stl_path)
+            scale_factors = _resolve_mesh_scale_factors(
+                mesh,
+                True,
+                scale_mode,
+                record.get("target_x"),
+                record.get("target_y"),
+                record.get("target_z"),
+            )
+            scaled = scale_mesh(mesh, scale_factors)
+        except Exception:
+            continue
+        z_lo = min(z_lo, float(scaled.bounds[0][2]))
+        z_hi = max(z_hi, float(scaled.bounds[1][2]))
+    if not math.isfinite(z_lo) or not math.isfinite(z_hi):
+        return None
+    return calculate_z_levels(z_lo, z_hi, float(layer_height))
 
 
 def _slice_record(
@@ -2264,6 +2533,7 @@ def _slice_record(
     layer_height: float,
     scale_mode: str | None,
     progress_callback=None,
+    z_levels: list[float] | None = None,
 ) -> LayerStack:
     stl_path = record["stl_path"]
     mesh = load_mesh(stl_path)
@@ -2281,10 +2551,34 @@ def _slice_record(
         progress_callback=progress_callback,
         scale_factors=scale_factors,
         name=str(record.get("name") or Path(stl_path).stem),
+        z_levels=z_levels,
     )
     record["layer_stack"] = stack
-    record["slice_params"] = _slice_params_snapshot(record, layer_height, scale_mode)
+    record["slice_params"] = _slice_params_snapshot(record, layer_height, scale_mode, z_levels)
     return stack
+
+
+def _group_z_levels_by_record(
+    records: list[dict],
+    layer_height: float,
+    scale_mode: str | None,
+    messages: list[str] | None = None,
+) -> dict[int, list[float]]:
+    """Shared Z grid per multi-material group, keyed by member record id."""
+    z_by_record: dict[int, list[float]] = {}
+    for nozzle, members in sorted(_multi_material_groups(records).items()):
+        z_levels = _multi_material_z_levels(members, layer_height, scale_mode)
+        if z_levels is None:
+            continue
+        for member in members:
+            z_by_record[id(member)] = z_levels
+        if messages is not None:
+            names = ", ".join(str(m.get("name") or f"Shape {m['idx']}") for m in members)
+            messages.append(
+                f"Multi-material group (nozzle {nozzle}): {names} — sliced on one "
+                f"shared Z grid ({len(z_levels)} layers), positions locked together."
+            )
+    return z_by_record
 
 
 def generate_dynamic_layer_stacks(
@@ -2300,6 +2594,7 @@ def generate_dynamic_layer_stacks(
         return records, "Upload at least one STL first.", None
     total = len(records)
     messages: list[str] = []
+    z_by_record = _group_z_levels_by_record(records, layer_height, scale_mode, messages)
     for pos, record in enumerate(records):
         stl_path = record.get("stl_path")
         if not stl_path:
@@ -2313,7 +2608,9 @@ def generate_dynamic_layer_stacks(
             progress((offset + cur / tot) / total, desc=f"Slicing shape {offset + 1} of {total}...")
 
         try:
-            stack = _slice_record(record, layer_height, scale_mode, report_progress)
+            stack = _slice_record(
+                record, layer_height, scale_mode, report_progress, z_by_record.get(id(record))
+            )
             (x_min, y_min, _z_min), (x_max, y_max, _z_max) = stack.bounds
             messages.append(
                 f"Shape {record['idx']}: sliced {len(stack.layers)} layers "
@@ -2335,10 +2632,182 @@ def generate_dynamic_reference_stack(
 ) -> LayerStack | None:
     # Snapping the alignment to the fil grid keeps split pieces' scan-grid
     # phase intact under shared reference motion (exact one-fil seam pitch).
+    # Shapes sharing a nozzle are multi-material assembly parts: their group
+    # frame makes them align as one rigid unit at their modeled positions.
+    records = records or []
+    _stamp_multi_material_frames(records, fil_width)
     return build_reference_stack(
-        [record.get("layer_stack") for record in (records or [])],
+        [record.get("layer_stack") for record in records],
         grid=float(fil_width) if fil_width else None,
     )
+
+
+SPLIT_STATUS_DEFAULT = (
+    "Slice a shape, then split it for multi-nozzle printing. Shapes that share "
+    "a nozzle number are one multi-material assembly: selecting any of them "
+    "splits the **whole group** together as one shape."
+)
+
+
+def describe_split_source(records: list[dict] | None, selected: str | None) -> str:
+    """Split-source note: warn up front when the selection splits a whole group."""
+    records = records or []
+    pos = _selected_record_index(records, selected)
+    if pos < 0 or pos >= len(records):
+        return SPLIT_STATUS_DEFAULT
+    source = records[pos]
+    if not source.get("stl_path"):
+        return SPLIT_STATUS_DEFAULT
+    nozzle = _record_nozzle_number(source, int(source.get("idx", pos + 1) or (pos + 1)))
+    members = _multi_material_groups(records).get(nozzle, [])
+    if len(members) <= 1:
+        return SPLIT_STATUS_DEFAULT
+    names = ", ".join(
+        "**{}**".format(member.get("name") or f"Shape {member.get('idx')}")
+        for member in members
+    )
+    return (
+        f"⚠️ This shape is part of the multi-material group on nozzle {nozzle} "
+        f"({names}). Splitting it splits the **whole group as one shape**: every "
+        "material is clipped by the same cells, each cell's pieces share a nozzle, "
+        "and every piece gets its own valve."
+    )
+
+
+def _split_group_records(
+    records: list[dict],
+    group_members: list[dict],
+    group_nozzle: int,
+    split_column_count: int,
+    split_row_count: int,
+    overlapping_layers: bool,
+    starting_nozzle: Any,
+    starting_valve: Any,
+    fil_width: float,
+    selected: str | None,
+    _outputs,
+) -> tuple:
+    """Split a whole multi-material group as one shape.
+
+    Every material is clipped by the same cell grid over the group's
+    combined bounds and one shared scan frame, so cell-mates assemble
+    exactly. Pieces are emitted cell-major: each cell's pieces share a
+    nozzle (making the cell a multi-material group again, with the same
+    alignment and seam-free-contour behavior), and every piece gets its own
+    valve. Cells where a material has no geometry are skipped.
+    """
+    unsliced = [
+        member
+        for member in group_members
+        if member.get("layer_stack") is None or not member["layer_stack"].layers
+    ]
+    if unsliced:
+        return _outputs(
+            records,
+            selected,
+            f"Split failed: shape(s) on nozzle {group_nozzle} have no sliced layers yet - "
+            "press Slice Shapes first so the group shares one Z grid.",
+        )
+    stacks = [member["layer_stack"] for member in group_members]
+    layer_counts = {len(stack.layers) for stack in stacks}
+    z_starts = {round(stack.z_values[0], 6) for stack in stacks if stack.z_values}
+    if len(layer_counts) != 1 or len(z_starts) > 1:
+        return _outputs(
+            records,
+            selected,
+            f"Split failed: the shapes on nozzle {group_nozzle} were sliced on different "
+            "Z grids - press Slice Shapes to re-slice the group together.",
+        )
+
+    # Stamp group frames + seam-free contours so pieces inherit contour
+    # linework that already excludes material-to-material interfaces.
+    _stamp_multi_material_frames(records, float(fil_width))
+    frame = stacks[0].align_frame
+
+    try:
+        pieces_by_member = [
+            (
+                member,
+                split_layer_stack_grid(
+                    member["layer_stack"],
+                    columns=split_column_count,
+                    rows=split_row_count,
+                    overlapping_layers=bool(overlapping_layers),
+                    overlap=float(fil_width) if overlapping_layers else 0.0,
+                    grid=float(fil_width),
+                    frame=frame,
+                ),
+            )
+            for member in group_members
+        ]
+    except Exception as exc:
+        return _outputs(records, selected, f"Split failed: {exc}")
+
+    first_member = group_members[0]
+    first_nozzle = max(1, _coerce_int(starting_nozzle, 1))
+    first_valve = max(
+        1, _coerce_int(starting_valve, _coerce_int(first_member.get("valve", 4), 4))
+    )
+    split_group_id = f"split-{int(time.time() * 1_000_000)}-{first_member.get('idx', 1)}"
+    cell_count = split_column_count * split_row_count
+    split_records: list[dict] = []
+    valve_cursor = first_valve
+    for cell in range(cell_count):
+        row_index = cell // split_column_count + 1
+        col_index = cell % split_column_count + 1
+        for member, pieces in pieces_by_member:
+            piece = pieces[cell]
+            if all(layer.is_empty for layer in piece.layers):
+                continue  # this material has nothing in this cell
+            (piece_x_min, piece_y_min, _z_min), (piece_x_max, piece_y_max, _z_max) = piece.bounds
+            member_name = str(member.get("name") or f"Shape {member.get('idx')}")
+            piece_record = dict(member)
+            piece_record.update({
+                "name": f"{member_name} - R{row_index}C{col_index}",
+                "stl_path": None,
+                "target_x": (piece_x_max - piece_x_min) or member.get("target_x", DEFAULT_TARGET_EXTENTS[0]),
+                "target_y": (piece_y_max - piece_y_min) or member.get("target_y", DEFAULT_TARGET_EXTENTS[1]),
+                "nozzle": first_nozzle + cell,
+                "valve": valve_cursor,
+                "split_group_id": split_group_id,
+                "split_index": cell,
+                "split_row": row_index,
+                "split_col": col_index,
+                "split_rows": split_row_count,
+                "split_columns": split_column_count,
+                "layer_stack": piece,
+                "slice_params": member.get("slice_params"),
+                "gcode_path": None,
+            })
+            valve_cursor += 1
+            split_records.append(piece_record)
+
+    member_ids = {id(member) for member in group_members}
+    first_pos = min(
+        index for index, record in enumerate(records) if id(record) in member_ids
+    )
+    kept = [record for record in records if id(record) not in member_ids]
+    insert_at = sum(1 for record in records[:first_pos] if id(record) not in member_ids)
+    next_records = _reindex_shape_records(
+        [*kept[:insert_at], *split_records, *kept[insert_at:]]
+    )
+    split_selected = (
+        _shape_choice(next_records[insert_at]) if insert_at < len(next_records) else None
+    )
+    status = (
+        f"Split the multi-material group on nozzle {group_nozzle} "
+        f"({len(group_members)} materials) as one shape into {cell_count} cells "
+        f"({split_column_count} columns x {split_row_count} rows) - "
+        f"{len(split_records)} piece(s); material-empty cells skipped.  \n"
+        f"Each cell's pieces share a nozzle (nozzles {first_nozzle}-"
+        f"{first_nozzle + cell_count - 1}); valves {first_valve}-{valve_cursor - 1}."
+    )
+    if overlapping_layers:
+        status += (
+            "  \nOverlapping Layers is enabled: split boundaries alternate by one "
+            "filament width per layer so neighbouring pieces interlock."
+        )
+    return _outputs(next_records, split_selected, status)
 
 
 def split_selected_shape_for_grid(
@@ -2383,6 +2852,33 @@ def split_selected_shape_for_grid(
 
     split_column_count = max(1, _coerce_int(columns, 2))
     split_row_count = max(1, _coerce_int(rows, 1))
+
+    # A shape sharing its nozzle with others is one material of a
+    # multi-material assembly: the whole group splits together as ONE shape,
+    # every material clipped by the same cell grid over the group's combined
+    # bounds. Cell-mates share a nozzle (so each cell is itself a
+    # multi-material group); every piece keeps its own valve.
+    group_nozzle = _record_nozzle_number(source, int(source.get("idx", pos + 1) or (pos + 1)))
+    group_members = (
+        _multi_material_groups(records).get(group_nozzle, [])
+        if source.get("stl_path")
+        else []
+    )
+    if len(group_members) > 1:
+        return _split_group_records(
+            records,
+            group_members,
+            group_nozzle,
+            split_column_count,
+            split_row_count,
+            overlapping_layers,
+            starting_nozzle,
+            starting_valve,
+            fil_width,
+            selected,
+            _outputs,
+        )
+
     try:
         pieces = split_layer_stack_grid(
             stack,
@@ -2464,16 +2960,18 @@ def _ensure_records_sliced(
     messages: list[str],
 ) -> bool:
     """Re-slice records whose layers are missing or stale for the current settings."""
+    z_by_record = _group_z_levels_by_record(records, layer_height, scale_mode)
     resliced = False
     for record in records:
         stl_path = record.get("stl_path")
         if not stl_path:
             continue  # Split pieces carry their clipped layers; nothing to re-slice.
-        current = _slice_params_snapshot(record, layer_height, scale_mode)
+        z_levels = z_by_record.get(id(record))
+        current = _slice_params_snapshot(record, layer_height, scale_mode, z_levels)
         if record.get("layer_stack") is not None and record.get("slice_params") == current:
             continue
         try:
-            stack = _slice_record(record, layer_height, scale_mode)
+            stack = _slice_record(record, layer_height, scale_mode, None, z_levels)
             messages.append(
                 f"Shape {record['idx']}: sliced automatically ({len(stack.layers)} layers)."
             )
@@ -2532,12 +3030,14 @@ def generate_dynamic_gcode(
     records = _apply_shape_settings(records or [], settings_table)
     messages: list[str] = []
     resliced = _ensure_records_sliced(records, layer_height, scale_mode, messages)
-    if use_reference_motion:
+    if use_reference_motion or resliced:
         # Always rebuild with the CURRENT fil width: the reference stack's
         # alignment snap grid must match the fil the G-code is generated with.
         ref_layers = generate_dynamic_reference_stack(records, fil_width)
-    elif resliced:
-        ref_layers = generate_dynamic_reference_stack(records, fil_width)
+    else:
+        # Still refresh group frames + seam-free contours: nozzle numbers may
+        # have been edited in the table since the last slice.
+        _stamp_multi_material_frames(records, fil_width)
     contour_sources = _contour_tracing_sources(records)
     if contour_sources:
         enabled = ", ".join(f"Shape {source.owner_idx}" for source in contour_sources)
@@ -2834,7 +3334,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 """
                 # Shapes & Slicing
                 Upload any number of STL files, edit per-shape dimensions and print settings in the table, then slice each shape into per-layer outlines.
-                Color accepts: Orange, Blue, Green, Red, Purple, Pink, Teal, Black.
+                Pick each shape's plot color straight from the dropdown in the **Color** column.
                 """
             )
             with gr.Row():
@@ -2856,6 +3356,19 @@ def build_dynamic_demo() -> gr.Blocks:
                         label="Scaling Mode",
                     )
 
+            # Visually hidden (not visible=False: Gradio would omit them
+            # from the DOM entirely and the color-select relay needs them).
+            color_sink = gr.Textbox(
+                label="color sink",
+                container=False,
+                elem_id="pp-color-sink",
+                elem_classes=["pp-visually-hidden"],
+            )
+            color_apply = gr.Button(
+                "apply color",
+                elem_id="pp-color-apply",
+                elem_classes=["pp-visually-hidden"],
+            )
             shape_settings = gr.Dataframe(
                 headers=SHAPE_SETTINGS_HEADERS,
                 value=[],
@@ -2863,6 +3376,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 column_count=(len(SHAPE_SETTINGS_HEADERS), "fixed"),
                 datatype=SHAPE_SETTINGS_DATATYPES,
                 interactive=True,
+                static_columns=[SHAPE_SETTINGS_HEADERS.index("Color")],
                 label="Shape Settings",
                 elem_id="shape-settings-table",
             )
@@ -2882,7 +3396,7 @@ def build_dynamic_demo() -> gr.Blocks:
                     split_start_valve = gr.Number(label="Starting Valve", value=4, minimum=1, step=1)
                 split_overlapping_layers = gr.Checkbox(label="Overlapping Layers", value=False)
                 split_button = gr.Button("Split Selected Shape into Grid Pieces", variant="primary")
-                split_status = gr.Markdown("Slice a shape, then split it for multi-nozzle printing.")
+                split_status = gr.Markdown(SPLIT_STATUS_DEFAULT)
 
             with gr.Accordion("Selected Shape Preview", open=False, elem_classes=["settings-accordion"]):
                 with gr.Row():
@@ -3099,6 +3613,12 @@ def build_dynamic_demo() -> gr.Blocks:
             outputs=[nozzle_grid_spacing_table],
             queue=False,
         )
+        color_apply.click(
+            fn=apply_color_selection,
+            inputs=[shape_records, shape_settings, color_sink],
+            outputs=[shape_records, shape_settings],
+            queue=False,
+        )
         shape_settings.select(
             fn=delete_shape_from_settings,
             inputs=[shape_records, shape_settings, last_shape_delete_at],
@@ -3162,6 +3682,14 @@ def build_dynamic_demo() -> gr.Blocks:
         )
 
         split_refresh_sources.click(fn=lambda records: _dropdown_update(records), inputs=[shape_records], outputs=[split_source], queue=False)
+        # .input (user selections only): programmatic dropdown refills after a
+        # split must not overwrite the split result message.
+        split_source.input(
+            fn=describe_split_source,
+            inputs=[shape_records, split_source],
+            outputs=[split_status],
+            queue=False,
+        )
         split_button.click(
             fn=split_selected_shape_for_grid,
             inputs=[
@@ -3311,15 +3839,25 @@ def build_dynamic_demo() -> gr.Blocks:
         travel_width_slider.release(fn=rerender_dynamic_toolpath_current_mode, inputs=[render_mode] + render_inputs, outputs=[toolpath_plot, toolpath_status, parsed_state])
         print_width_slider.release(fn=rerender_dynamic_toolpath_current_mode, inputs=[render_mode] + render_inputs, outputs=[toolpath_plot, toolpath_status, parsed_state])
 
-        def sync_width_sliders(v: float):
-            height = float(v or 0.8)
-            travel = height / 4
+        def sync_width_sliders(value: float):
+            # Visualization filament widths track the slicer's Filament/Line
+            # Width (what the G-code is actually generated with); travel
+            # lines render at a quarter of it.
+            width = float(value or 0.8)
+            travel = width / 4
             return (
-                gr.update(value=height, minimum=min(0.1, height), maximum=height * 1.5),
-                gr.update(value=travel, minimum=min(0.05, travel), maximum=height * 1.5),
+                gr.update(value=width, minimum=min(0.1, width), maximum=width * 1.5),
+                gr.update(value=travel, minimum=min(0.05, travel), maximum=width * 1.5),
+                gr.update(value=width, minimum=min(0.1, width), maximum=max(3.0, width * 1.5)),
+                gr.update(value=travel, minimum=min(0.05, travel), maximum=max(3.0, width * 1.5)),
             )
 
-        layer_height.change(fn=sync_width_sliders, inputs=[layer_height], outputs=[print_width_slider, travel_width_slider], queue=False)
+        fil_width.change(
+            fn=sync_width_sliders,
+            inputs=[fil_width],
+            outputs=[print_width_slider, travel_width_slider, pp_filament_width, pp_travel_width],
+            queue=False,
+        )
 
         parallel_render_inputs = [
             shape_records,

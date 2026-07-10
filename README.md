@@ -45,6 +45,7 @@ Then open the local Gradio URL in your browser, upload STL files or load the bun
 - Scales loaded STLs from editable target X/Y/Z dimensions in the Shape Settings table; new rows default to the STL's original dimensions, **Reset Dimensions** restores them, and **Keep Proportions** updates the other target sides from the edited side
 - Lets you choose layer height and filament/line width
 - Slices each shape into per-layer vector outlines held in memory (no intermediate image files)
+- Shapes that share a **nozzle number** are treated automatically as one multi-material assembly: sliced on one shared Z grid and kept exactly where they were modeled, while shapes alone on their nozzle behave as ordinary independent parts
 - Automatically unions the sliced shapes into a combined reference layer set whenever shapes are sliced
 - Splits one sliced shape's geometry into an editable row/column grid for multi-nozzle printing of one large shape
 - Converts sliced layers into G-code files with pressure, valve, nozzle, port, and infill % settings per shape from the Shape Settings table
@@ -57,6 +58,7 @@ Then open the local Gradio URL in your browser, upload STL files or load the bun
 - Visualizes generated or uploaded G-code tool paths, with the source selectable from any active generated shape or an uploaded file
 - Renders the tool path as a fast line plot or an animated 3D tube plot (play/pause, speed, scrub, frame-step, nozzle marker)
 - Plots the generated shapes using the configured nozzle spacing and animates them printing in parallel, with a server-side GIF export of that animation
+- Each shape's plot color is set with one click on a palette chip embedded in the Shape Settings **Color** column (Orange, Blue, Green, Red, Purple, Pink, Teal, Yellow, White, Black) — the cell shows the current color's name and highlights its chip
 
 ## Behavior and Implementation Notes
 
@@ -71,6 +73,18 @@ When you click **Slice Shapes**, the app automatically unions the sliced shapes 
 - Shapes are aligned by centering each shape's XY bounding box on a common center before the union.
 - Alignment is centered placement (in exact millimetres), not bottom-left anchoring.
 
+### Multi-Material Assemblies (shared nozzle numbers)
+
+For a multi-material object exported as separate STLs (one per material), give every part the **same nozzle number** in Shape Settings — parts sharing a nozzle print from the same physical position, so the app treats them automatically as one assembly:
+
+- Group members are sliced on **one shared Z grid** spanning the whole assembly, so a part that starts higher in the model simply has empty lower layers — it travels the shared path but dispenses nothing until the print reaches its height.
+- The group is aligned into the reference union as **one rigid unit**: each part keeps exactly the position it was modeled at relative to the others, so asymmetric assemblies line up the way they do in the 3D preview.
+- Shapes alone on their nozzle keep the normal behavior (centered onto the common reference), so regular shapes and multi-material assemblies can print together in one job.
+- **Contour Tracing** on assembly parts outlines only the assembly's true outer surface: edges where one material meets (or nearly meets, within half a bead — fit tolerances included) another material are internal interfaces and are skipped, exactly like the cut seams of grid-split pieces.
+- Combine with **Use combined reference outline for motion** so all heads share one synchronized path while each dispenses only its own part.
+- Nozzle renumbering in the table takes effect on the next slice or G-code generation — groups are re-detected automatically.
+- Leave assembly parts' target dimensions at their defaults (or scale every part identically); parts are scaled about their own corners, so unequal scaling would misalign an assembly.
+
 ### Multi-Nozzle Split
 
 The **Multi-Nozzle Split** accordion on the **Shapes & Slicing** tab can split one sliced shape into a grid of print-ready piece stacks. Choose a source shape that has been sliced, set the number of columns and rows, choose the starting nozzle and valve numbers, then click **Split Selected Shape into Grid Pieces**.
@@ -79,6 +93,7 @@ The **Multi-Nozzle Split** accordion on the **Shapes & Slicing** tab can split o
 - The selected shape is replaced in Shape Settings by one generated record per grid cell, named by row and column.
 - Nozzle and valve numbers are assigned sequentially from the starting values, and the **Generate G-Code** tab can generate separate G-code for each piece.
 - **Overlapping Layers** alternates the interior cut lines by one filament width per layer so neighbouring pieces interlock.
+- **Multi-material assemblies split as one shape**: if the selected shape shares its nozzle with other shapes, the whole group is split together — every material is clipped by the same cell grid over the group's combined bounds. Pieces are emitted cell by cell: each cell's pieces share a nozzle (so every cell is itself a multi-material group, keeping the alignment and seam-free contour behavior), each piece gets its own valve, and cells where a material has no geometry are skipped. Auto Align works on the result like any other split.
 
 ### G-code XY Step Size
 
@@ -95,9 +110,9 @@ The **Multi-Nozzle Split** accordion on the **Shapes & Slicing** tab can split o
 - **Lead In**: enabled per shape via the **Lead In** column in Shape Settings; the Lead In Options accordion on the Generate G-Code tab sets the patch geometry. Prints a purge patch before layer 1, in a selectable direction (Left/Right/Up/Down) at the configured clearance from the start point. The return route exits the patch laterally and comes home through the clearance lane, so the primed nozzle never drags back across the wet purge lines. For grid-split pieces the clearance is automatically extended by the assembly's remaining extent along the purge axis (reported in the G-code status), so under shared reference motion every nozzle's purge patch lands clear of the whole assembled part instead of on a neighbor's print area. The **Lead In** column in Shape Settings controls dispensing per shape: an opted-out head still travels the shared patch (keeping parallel heads in sync) but keeps its valve shut, and skips the lead-in moves entirely when printing without shared motion.
 - **Use combined reference outline for motion**: when enabled, every shape's *motion* is taken from the combined reference layer union while each shape's *valve/dispensing* comes from its own layer polygons — so parallel print heads share one synchronized nozzle path and each deposits only its own geometry. The reference union is rebuilt automatically when shapes are sliced. Contour tracing stays synchronized too: every shape traces every traced shape's contour, opening its valve only on its own outline.
 - Every generated file starts with a `; PathOrigin X.. Y..` comment: the world position (in the shape's own frame) that the relative toolpath starts from. Tools use it to place parallel parts so split pieces reassemble.
-- **Raster Pattern**: `X-direction raster` sweeps every layer back-and-forth in X. `Y-direction raster` rasters every layer in Y. `90° Woodpile raster` alternates the raster axis by layer, switching between X-direction and Y-direction sweeps. `45° Woodpile raster` rotates the sweep 45 degrees per layer, cycling 0, 45, 90, 135 degrees. `Rectangular Spiral raster` walks each layer from the outer layer bounds toward the center, then reverses from center to edge on the next layer. `Circle Spiral raster` prints concentric circles from the layer bounds toward the center — each revolution stays at a constant radius and steps inward by one line width between revolutions, so the walls are smooth true circles — then reverses outward on the next layer. Spiral motion covers the layer bounds; the valve opens only where the path is inside material.
+- **Raster Pattern**: `X-direction raster` sweeps every layer back-and-forth in X. `Y-direction raster` rasters every layer in Y. `90° Woodpile raster` alternates the raster axis by layer, switching between X-direction and Y-direction sweeps. `45° Woodpile raster` rotates the sweep 45 degrees per layer, cycling 0, 45, 90, 135 degrees. `Rectangular Spiral raster` walks each layer from the outer layer bounds toward the center, then reverses from center to edge on the next layer. `Circle Spiral raster` prints concentric circles stepping inward by one line width per revolution — each revolution stays at a constant radius, so the walls are smooth true circles — then reverses outward on the next layer. The outermost revolution is a perimeter wall hugging the layer's material edge (half a bead inside its farthest boundary point), so the printed silhouette follows the shape smoothly; a matching inner wall hugs a central hole when there is one. The fill rings between the walls come from one global radii grid anchored at the shape frame's center, so interior rings stack exactly across layers, and rings that cannot touch a layer's material (or would overlap a wall bead) are skipped instead of traveled. Walls always dispense even under partial infill, like contour tracing; elsewhere the valve opens only where the path is inside material.
 - **Auto Align Split Parts**: in Nozzle Spacing, computes exact per-connection grid gaps from the split pieces' generated G-code (`PathOrigin` anchors + toolpath bounds), sets the grid columns/rows from the split, and fills the Advanced Grid Spacing table. Works for every raster pattern, filament width, reference-motion setting, and overlapping-layer split. Requires the pieces' G-code to be generated first.
-- **Contour Tracing**: enabled per row in Shape Settings. The app traces the layer polygon's boundary rings (holes traced separately), travels from the layer raster end to the nearest contour point, prints the contour, then returns to the raster endpoint before the next layer. For grid-split pieces only the parent shape's true outer surface is traced — the cut seams between sibling pieces are excluded (open arcs are printed end-to-end without closing the loop; fully interior pieces get no contour).
+- **Contour Tracing**: enabled per row in Shape Settings. The app traces the layer polygon's boundary rings (holes traced separately), travels from the layer raster end to the nearest contour point, prints the contour, then returns to the raster endpoint before the next layer. For grid-split pieces only the parent shape's true outer surface is traced — the cut seams between sibling pieces are excluded (open arcs are printed end-to-end without closing the loop; fully interior pieces get no contour). Multi-material assembly parts (shapes sharing a nozzle) work the same way: boundary within half a bead of a sibling material counts as an internal interface and is not contoured — only the assembled shape's true outer surface is traced, and a part fully embedded in the assembly gets no contour at all.
 
 ### Print vs Travel Classification
 
@@ -113,7 +128,7 @@ The parser also handles standard slicer G-code: single-axis and Z-only moves, ax
 The G-code visualization tab renders generated shape G-code or an uploaded `.txt`, `.gcode`, or `.nc` file. It parses `G0`/`G1` movement lines, supports relative (`G91`) and absolute (`G90`) positioning, and offers two render modes:
 
 - **Line Plot** — fast thin scatter lines (print and travel), with color/opacity controls.
-- **Tube Plot with Animation** — mm-width filament tubes (circular, capped, lit) with a client-side build animation (play/pause, speed, scrub, frame-step) and a moving nozzle marker. Filament/travel widths default to the layer height and its quarter.
+- **Tube Plot with Animation** — mm-width filament tubes (circular, capped, lit) with a client-side build animation (play/pause, speed, scrub, frame-step) and a moving nozzle marker. Filament/travel widths automatically follow the slicer's Filament/Line Width and its quarter.
 
 ### Parallel Printing Visualization
 

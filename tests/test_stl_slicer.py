@@ -82,3 +82,61 @@ def test_compose_even_odd_polygons_preserves_holes() -> None:
     assert len(composed) == 1
     assert composed[0].area == outer.area - inner.area
     assert len(composed[0].interiors) == 1
+
+
+def test_slice_stl_unions_interpenetrating_bodies(tmp_path) -> None:
+    # One STL packing several separate solids that overlap (e.g. the stripe
+    # prisms of a flag part) must slice to their union — the whole-mesh
+    # even-odd rule would XOR the overlap into a false hole.
+    a = trimesh.creation.box(extents=(4.0, 2.0, 2.0))
+    b = trimesh.creation.box(extents=(2.0, 4.0, 2.0))
+    b.apply_translation((1.0, 0.0, 0.0))  # overlaps half of `a`
+    stl_path = tmp_path / "cross.stl"
+    trimesh.util.concatenate([a, b]).export(stl_path)
+
+    stack = slice_stl_to_layers(stl_path, layer_height=1.0)
+
+    # Union area: 8 + 8 - 2x2 overlap = 12 (XOR would give 8).
+    for layer in stack.layers:
+        assert layer.area == pytest.approx(12.0)
+        assert all(not polygon.interiors for polygon in layer.geoms)
+
+
+def test_slice_stl_subtracts_inverted_cavity_bodies(tmp_path) -> None:
+    # A watertight body wound inside-out (negative volume) is a modeller's
+    # cavity: it must stay a hole, not be unioned as a solid.
+    outer = trimesh.creation.box(extents=(6.0, 6.0, 2.0))
+    cavity = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    cavity.invert()
+    stl_path = tmp_path / "hollow.stl"
+    trimesh.util.concatenate([outer, cavity]).export(stl_path)
+
+    stack = slice_stl_to_layers(stl_path, layer_height=1.0)
+
+    for layer in stack.layers:
+        assert layer.area == pytest.approx(36.0 - 4.0)
+        assert sum(len(polygon.interiors) for polygon in layer.geoms) == 1
+
+
+def test_slice_stl_handles_abutting_cells_and_stray_open_quads(tmp_path) -> None:
+    # Checkerboard-style STL: watertight cells that touch at edges/corners,
+    # plus stray open quad fragments (internal walls). The cells must slice
+    # per body and union into the exact checker pattern; the open quads
+    # produce no closed rings and drop out.
+    cells = []
+    for cx, cy in ((0, 0), (1, 1), (2, 0), (0, 2), (2, 2)):
+        cell = trimesh.creation.box(extents=(10.0, 10.0, 10.0))
+        cell.apply_translation((cx * 10.0 + 5.0, cy * 10.0 + 5.0, 5.0))
+        cells.append(cell)
+    quad = trimesh.Trimesh(
+        vertices=[(10.0, 0.0, 0.0), (10.0, 10.0, 0.0), (10.0, 10.0, 10.0), (10.0, 0.0, 10.0)],
+        faces=[(0, 1, 2), (0, 2, 3)],
+    )
+    stl_path = tmp_path / "checker.stl"
+    trimesh.util.concatenate(cells + [quad]).export(stl_path)
+
+    stack = slice_stl_to_layers(stl_path, layer_height=1.0)
+
+    for layer in stack.layers:
+        assert layer.area == pytest.approx(500.0)
+        assert layer.bounds == pytest.approx((0.0, 0.0, 30.0, 30.0))

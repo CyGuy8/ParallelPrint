@@ -164,7 +164,9 @@ def test_shape_settings_round_trip_infill_column() -> None:
     assert _apply_shape_settings(records, rows)[0]["infill"] == 0.0
 
 
-def test_shape_settings_color_column_uses_palette_names() -> None:
+def test_color_cell_renders_an_in_table_dropdown() -> None:
+    from app import PARALLEL_COLOR_CHOICES
+
     records = [
         {
             "idx": 1,
@@ -184,18 +186,47 @@ def test_shape_settings_color_column_uses_palette_names() -> None:
 
     rows = _shape_settings_rows(records)
     color_pos = SHAPE_SETTINGS_HEADERS.index("Color")
-    # Stored hex displays as its friendly name.
-    assert rows[0][color_pos] == "Orange"
+    cell = rows[0][color_pos]
 
-    # Typing a palette name (any case) stores the matching hex.
-    rows[0][color_pos] = "red"
-    assert _apply_shape_settings(records, rows)[0]["color"] == "#d62728"
+    # The cell is a select carrying the record idx (as a class token — data
+    # attributes get sanitized out of markdown cells), wrapped in the
+    # pp-color-cell span the head script's pointer-event isolation keys on,
+    # with every palette color as an option and the current one selected.
+    assert cell.startswith('<span class="pp-color-cell">')
+    assert '<select class="pp-color-select pp-idx-1"' in cell
+    for name, hex_value in PARALLEL_COLOR_CHOICES:
+        assert f'value="{hex_value}"' in cell
+        assert f">{name}<" in cell
+    assert '<option value="#ff7f0e" selected>Orange</option>' in cell
+    assert cell.count(" selected") == 1
 
-    # Raw hex still works; unknown text keeps the previous color.
-    rows[0][color_pos] = "#123456"
-    assert _apply_shape_settings(records, rows)[0]["color"] == "#123456"
-    rows[0][color_pos] = "not-a-color"
+    # Round-tripping the table through _apply_shape_settings keeps the color
+    # (the html cell never parses as a color value).
     assert _apply_shape_settings(records, rows)[0]["color"] == "#ff7f0e"
+
+
+def test_apply_color_selection_updates_the_right_record() -> None:
+    from app import apply_color_selection
+
+    records = [
+        {"idx": 1, "name": "a", "stl_path": "a.stl", "color": "#ff7f0e",
+         "target_x": 1.0, "target_y": 1.0, "target_z": 1.0,
+         "pressure": 25.0, "valve": 4, "nozzle": 1, "port": 1},
+        {"idx": 2, "name": "b", "stl_path": "b.stl", "color": "#1f77b4",
+         "target_x": 1.0, "target_y": 1.0, "target_z": 1.0,
+         "pressure": 25.0, "valve": 5, "nozzle": 2, "port": 1},
+    ]
+
+    updated, rows = apply_color_selection(records, None, "2|#ffe119")
+    assert updated[0]["color"] == "#ff7f0e"
+    assert updated[1]["color"] == "#ffe119"  # Yellow applied to shape 2
+    assert 'value="#ffe119" selected' in rows[1][SHAPE_SETTINGS_HEADERS.index("Color")]
+
+    # White is available; junk payloads change nothing.
+    assert apply_color_selection(records, None, "1|#ffffff")[0][0]["color"] == "#ffffff"
+    assert apply_color_selection(records, None, "1|#123456")[0][0]["color"] == "#ff7f0e"
+    assert apply_color_selection(records, None, "garbage")[0][0]["color"] == "#ff7f0e"
+    assert apply_color_selection(records, None, None)[0][0]["color"] == "#ff7f0e"
 
 
 def test_lead_in_assembly_extension_covers_the_split_extent() -> None:
@@ -668,3 +699,120 @@ def test_delete_shape_cooldown_blocks_immediate_second_delete() -> None:
     )
 
     assert [record["name"] for record in second_outputs[1]] == ["first", "last"]
+
+
+def test_group_split_splits_all_materials_on_one_shared_grid() -> None:
+    from shapely.geometry import MultiPolygon, box
+
+    from app import split_selected_shape_for_grid
+    from stl_slicer import LayerStack
+
+    def _material(polygon, name: str) -> LayerStack:
+        layers = [MultiPolygon([polygon]), MultiPolygon([polygon])]
+        x_min, y_min, x_max, y_max = polygon.bounds
+        return LayerStack(
+            layers=layers,
+            z_values=[0.5, 1.5],
+            bounds=((x_min, y_min, 0.0), (x_max, y_max, 2.0)),
+            layer_height=1.0,
+            name=name,
+        )
+
+    def _record(idx: int, name: str, stack: LayerStack) -> dict:
+        return {
+            "idx": idx,
+            "name": name,
+            "stl_path": f"{name}.stl",
+            "target_x": 20.0,
+            "target_y": 5.0,
+            "target_z": 2.0,
+            "pressure": 25.0,
+            "valve": 4,
+            "nozzle": 1,  # both materials on nozzle 1 -> one assembly
+            "port": 1,
+            "color": "#111111",
+            "layer_stack": stack,
+        }
+
+    # Two materials tiling one 20x10 shape as horizontal strips.
+    records = [
+        _record(1, "bottom", _material(box(0.0, 0.0, 20.0, 5.0), "bottom")),
+        _record(2, "top", _material(box(0.0, 5.0, 20.0, 10.0), "top")),
+    ]
+
+    outputs = split_selected_shape_for_grid(
+        records,
+        None,  # selected -> defaults to the first record
+        None,  # settings table
+        2,  # columns
+        1,  # rows
+        False,  # overlapping layers
+        5,  # starting nozzle
+        9,  # starting valve
+        1.0,  # fil width
+    )
+    next_records = outputs[0]
+
+    pieces = [record for record in next_records if record.get("split_group_id")]
+    assert len(pieces) == 4  # 2 cells x 2 materials
+
+    # Cell-major: cell 1 pieces share nozzle 5, cell 2 pieces share nozzle 6;
+    # every piece gets its own valve.
+    assert [piece["nozzle"] for piece in pieces] == [5, 5, 6, 6]
+    assert [piece["valve"] for piece in pieces] == [9, 10, 11, 12]
+    assert [piece["name"] for piece in pieces] == [
+        "bottom - R1C1",
+        "top - R1C1",
+        "bottom - R1C2",
+        "top - R1C2",
+    ]
+
+    # Cell-mates carry IDENTICAL nominal cell bounds (the shared grid) and
+    # one shared scan frame covering the whole assembly.
+    for cell_first, cell_second in ((0, 1), (2, 3)):
+        assert pieces[cell_first]["layer_stack"].bounds == pieces[cell_second]["layer_stack"].bounds
+    frames = {piece["layer_stack"].scan_frame for piece in pieces}
+    assert frames == {(0.0, 0.0, 20.0, 10.0)}
+
+    # Geometry: each piece is its material clipped to its cell.
+    assert pieces[0]["layer_stack"].layers[0].bounds == (0.0, 0.0, 10.0, 5.0)
+    assert pieces[1]["layer_stack"].layers[0].bounds == (0.0, 5.0, 10.0, 10.0)
+    assert pieces[2]["layer_stack"].layers[0].bounds == (10.0, 0.0, 20.0, 5.0)
+
+    # Contours exclude BOTH the material interface (y=5) and the cut seam
+    # (x=10): piece R1C1 of `bottom` keeps only its west + south edges.
+    for path in pieces[0]["layer_stack"].contour_paths[0]:
+        for x, y in path:
+            assert x <= 10.0 - 0.5 + 1e-9 or y <= 5.0 - 0.5 + 1e-9
+
+
+def test_describe_split_source_warns_about_group_splits() -> None:
+    from shapely.geometry import MultiPolygon, box
+
+    from app import SPLIT_STATUS_DEFAULT, describe_split_source
+    from stl_slicer import LayerStack
+
+    def _stack(name: str) -> LayerStack:
+        return LayerStack(
+            layers=[MultiPolygon([box(0.0, 0.0, 1.0, 1.0)])],
+            z_values=[0.5],
+            bounds=((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+            layer_height=1.0,
+            name=name,
+        )
+
+    records = [
+        {"idx": 1, "name": "black", "stl_path": "black.stl", "nozzle": 1, "layer_stack": _stack("black")},
+        {"idx": 2, "name": "gold", "stl_path": "gold.stl", "nozzle": 1, "layer_stack": _stack("gold")},
+        {"idx": 3, "name": "solo", "stl_path": "solo.stl", "nozzle": 2, "layer_stack": _stack("solo")},
+    ]
+
+    grouped_note = describe_split_source(records, "1: black")
+    assert "whole group as one shape" in grouped_note
+    assert "black" in grouped_note and "gold" in grouped_note
+    assert "nozzle 1" in grouped_note
+
+    assert describe_split_source(records, "3: solo") == SPLIT_STATUS_DEFAULT
+    # No selection defaults to the first shape - which is grouped here.
+    assert "whole group as one shape" in describe_split_source(records, None)
+    assert describe_split_source([], None) == SPLIT_STATUS_DEFAULT

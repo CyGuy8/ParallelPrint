@@ -7,6 +7,7 @@ from typing import Callable, Sequence
 
 import numpy as np
 from shapely.geometry import GeometryCollection, MultiPolygon, Polygon
+from shapely.ops import unary_union
 from shapely.validation import make_valid
 import trimesh
 
@@ -44,6 +45,12 @@ class LayerStack:
     scan_frame: tuple[float, float, float, float] | None = None
     align_center: tuple[float, float] | None = None
     align_grid: float | None = None
+    # Multi-material group frame: the combined XY bbox of every part sharing
+    # this shape's nozzle. Group members all carry the SAME frame and are
+    # aligned by its centre instead of their own bbox centre, so they move as
+    # one rigid unit and keep their modelled positions relative to each
+    # other. None = align by the shape's own bbox centre (normal shapes).
+    align_frame: tuple[float, float, float, float] | None = None
     # Grid-split pieces: per-layer contour polylines from the PARENT shape's
     # boundary clipped to this piece's cell — cut seams between sibling
     # pieces are excluded, so contour tracing only outlines the true outer
@@ -168,7 +175,20 @@ def _extract_world_polygons(section: trimesh.path.Path3D) -> list[tuple[np.ndarr
     else:
         planar, to_3d = section.to_planar()
 
-    composed_polygons = _compose_even_odd_polygons(list(planar.polygons_closed))
+    # polygons_full composes rings by containment depth (ring in a ring is a
+    # hole, ring in a hole is an island), so rings from separate solids that
+    # merely OVERLAP each other stay separate solids — the caller unions
+    # them. A flat even-odd XOR across all rings would punch false holes
+    # wherever interpenetrating solids overlap (e.g. flag stripe prisms
+    # packed into one STL).
+    try:
+        composed_polygons = [
+            polygon
+            for polygon in planar.polygons_full
+            if polygon is not None and not polygon.is_empty
+        ]
+    except BaseException:
+        composed_polygons = _compose_even_odd_polygons(list(planar.polygons_closed))
     polygons: list[tuple[np.ndarray, list[np.ndarray]]] = []
     for polygon in composed_polygons:
         exterior = _ring_to_world_xy(polygon.exterior.coords, to_3d)
@@ -206,13 +226,56 @@ def _section_to_multipolygon(section: trimesh.path.Path3D | None) -> MultiPolygo
         return MultiPolygon()
 
     polygons = [
-        Polygon(exterior, holes)
+        make_valid(Polygon(exterior, holes))
         for exterior, holes in _extract_world_polygons(section)
     ]
     if not polygons:
         return MultiPolygon()
 
-    return _as_multipolygon(make_valid(MultiPolygon(polygons)))
+    # Union, not just collect: polygons from interpenetrating solids overlap.
+    return _as_multipolygon(make_valid(unary_union(polygons)))
+
+
+def _split_solids_and_cavities(
+    mesh: trimesh.Trimesh,
+) -> tuple[list[trimesh.Trimesh], list[trimesh.Trimesh]]:
+    """Connected bodies of a mesh, split into solids and explicit cavities.
+
+    A single STL often packs several separate solids that touch or
+    interpenetrate (checkerboard cells, overlapping stripe prisms).
+    Sectioning such a mesh whole corrupts the ring reconstruction where
+    rings cross or meet, so each WATERTIGHT body is sliced separately and
+    the results unioned; a watertight body wound inside-out (negative
+    volume) is a modeller's cavity, subtracted instead of unioned.
+
+    Everything that is not watertight — stray internal quads, meshes whose
+    face connectivity shreds into open fragments (T-vertices, unstitched
+    fans) — is kept together as ONE remainder mesh and sectioned whole,
+    where ring reconstruction can stitch across fragment boundaries; open
+    slivers there simply produce no closed rings and drop out.
+    """
+    try:
+        bodies = [body for body in mesh.split(only_watertight=False) if len(body.faces)]
+    except Exception:
+        return [mesh], []
+    if len(bodies) <= 1:
+        return [mesh], []
+
+    solids: list[trimesh.Trimesh] = []
+    cavities: list[trimesh.Trimesh] = []
+    remainder: list[trimesh.Trimesh] = []
+    for body in bodies:
+        if not body.is_watertight:
+            remainder.append(body)
+        elif body.is_winding_consistent and float(body.volume) < 0.0:
+            cavities.append(body)
+        else:
+            solids.append(body)
+    if remainder:
+        solids.append(
+            trimesh.util.concatenate(remainder) if len(remainder) > 1 else remainder[0]
+        )
+    return solids, cavities
 
 
 def slice_stl_to_layers(
@@ -221,21 +284,41 @@ def slice_stl_to_layers(
     progress_callback: ProgressCallback = None,
     scale_factors: Sequence[float] | None = None,
     name: str | None = None,
+    z_levels: Sequence[float] | None = None,
 ) -> LayerStack:
-    """Slice an STL into per-layer vector outlines (world-XY millimetres)."""
+    """Slice an STL into per-layer vector outlines (world-XY millimetres).
+
+    `z_levels` overrides the per-mesh Z planes with an explicit (world) grid —
+    used by multi-material assemblies so every part slices on ONE shared grid
+    and parts that start higher simply get empty lower layers.
+    """
     stl_path = Path(stl_path)
     mesh = scale_mesh(load_mesh(stl_path), scale_factors)
     (x_min, y_min, z_min), (x_max, y_max, z_max) = mesh.bounds
 
-    z_values = calculate_z_levels(float(z_min), float(z_max), layer_height)
+    if z_levels is not None:
+        z_values = [float(z) for z in z_levels]
+    else:
+        z_values = calculate_z_levels(float(z_min), float(z_max), layer_height)
+
+    solids, cavities = _split_solids_and_cavities(mesh)
+
+    def section_at(body: trimesh.Trimesh, z_value: float) -> MultiPolygon:
+        return _section_to_multipolygon(
+            body.section(
+                plane_origin=np.array([0.0, 0.0, z_value], dtype=float),
+                plane_normal=np.array([0.0, 0.0, 1.0], dtype=float),
+            )
+        )
 
     layers: list[MultiPolygon] = []
     for index, z_value in enumerate(z_values):
-        section = mesh.section(
-            plane_origin=np.array([0.0, 0.0, z_value], dtype=float),
-            plane_normal=np.array([0.0, 0.0, 1.0], dtype=float),
-        )
-        layers.append(_section_to_multipolygon(section))
+        layer = unary_union([section_at(body, z_value) for body in solids])
+        if cavities:
+            layer = layer.difference(
+                unary_union([section_at(body, z_value) for body in cavities])
+            )
+        layers.append(_as_multipolygon(make_valid(layer)))
 
         if progress_callback is not None:
             progress_callback(index + 1, len(z_values))
