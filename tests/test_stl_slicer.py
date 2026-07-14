@@ -140,3 +140,79 @@ def test_slice_stl_handles_abutting_cells_and_stray_open_quads(tmp_path) -> None
     for layer in stack.layers:
         assert layer.area == pytest.approx(500.0)
         assert layer.bounds == pytest.approx((0.0, 0.0, 30.0, 30.0))
+
+
+def test_scale_mesh_about_an_explicit_anchor() -> None:
+    mesh = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    mesh.apply_translation((6.0, 6.0, 6.0))  # spans 5..7 on every axis
+
+    scaled = scale_mesh(mesh, (2.0, 2.0, 2.0), anchor=(0.0, 0.0, 0.0))
+
+    # Scaling about the shared origin: 5..7 becomes 10..14 (own-corner
+    # scaling would give 5..9 and shift the part within an assembly).
+    np.testing.assert_allclose(scaled.bounds[0], (10.0, 10.0, 10.0))
+    np.testing.assert_allclose(scaled.bounds[1], (14.0, 14.0, 14.0))
+
+
+def test_slice_stl_scale_anchor_keeps_assembly_parts_together(tmp_path) -> None:
+    # Two assembly parts side by side; both scaled x2 about the ASSEMBLY
+    # corner must stay adjacent (B's min corner moves from 4 to 8).
+    a = trimesh.creation.box(extents=(4.0, 4.0, 4.0))
+    a.apply_translation((2.0, 2.0, 2.0))  # spans 0..4
+    b = trimesh.creation.box(extents=(4.0, 4.0, 4.0))
+    b.apply_translation((6.0, 2.0, 2.0))  # spans 4..8 in x
+    path_a = tmp_path / "a.stl"
+    path_b = tmp_path / "b.stl"
+    a.export(path_a)
+    b.export(path_b)
+
+    anchor = (0.0, 0.0, 0.0)
+    stack_a = slice_stl_to_layers(path_a, 1.0, scale_factors=(2.0, 2.0, 2.0), scale_anchor=anchor)
+    stack_b = slice_stl_to_layers(path_b, 1.0, scale_factors=(2.0, 2.0, 2.0), scale_anchor=anchor)
+
+    assert stack_a.bounds[0][0] == pytest.approx(0.0)
+    assert stack_a.bounds[1][0] == pytest.approx(8.0)
+    assert stack_b.bounds[0][0] == pytest.approx(8.0)  # still flush against A
+    assert stack_b.bounds[1][0] == pytest.approx(16.0)
+
+
+def test_flip_z_mirrors_the_shape_top_to_bottom(tmp_path) -> None:
+    # Wide slab with a narrow tower on top; flipped, the tower prints first.
+    slab = trimesh.creation.box(extents=(10.0, 10.0, 1.0))
+    slab.apply_translation((5.0, 5.0, 0.5))       # z 0..1
+    tower = trimesh.creation.box(extents=(2.0, 2.0, 1.0))
+    tower.apply_translation((5.0, 5.0, 1.5))      # z 1..2
+    stl_path = tmp_path / "tower.stl"
+    trimesh.util.concatenate([slab, tower]).export(stl_path)
+
+    normal = slice_stl_to_layers(stl_path, layer_height=1.0)
+    flipped = slice_stl_to_layers(stl_path, layer_height=1.0, flip_z=True)
+
+    assert [round(layer.area) for layer in normal.layers] == [100, 4]
+    assert [round(layer.area) for layer in flipped.layers] == [4, 100]
+    # Flip about the own midplane preserves the Z range.
+    assert flipped.bounds[0][2] == pytest.approx(normal.bounds[0][2])
+    assert flipped.bounds[1][2] == pytest.approx(normal.bounds[1][2])
+
+
+def test_flip_z_about_a_group_midplane_flips_the_assembly_as_one(tmp_path) -> None:
+    # Two assembly parts at different heights flip about the SHARED midplane:
+    # the part that was on top lands on the bottom of the shared Z range.
+    low = trimesh.creation.box(extents=(4.0, 4.0, 1.0))
+    low.apply_translation((2.0, 2.0, 0.5))   # z 0..1
+    high = trimesh.creation.box(extents=(4.0, 4.0, 1.0))
+    high.apply_translation((6.0, 2.0, 2.5))  # z 2..3
+    path_low = tmp_path / "low.stl"
+    path_high = tmp_path / "high.stl"
+    low.export(path_low)
+    high.export(path_high)
+
+    group_mid = 1.5  # shared z range 0..3
+    z_levels = [0.5, 1.5, 2.5]
+    stack_low = slice_stl_to_layers(path_low, 1.0, z_levels=z_levels, flip_z=True, z_flip_mid=group_mid)
+    stack_high = slice_stl_to_layers(path_high, 1.0, z_levels=z_levels, flip_z=True, z_flip_mid=group_mid)
+
+    # `low` (was z 0..1) now occupies z 2..3; `high` now z 0..1.
+    assert [layer.is_empty for layer in stack_low.layers] == [True, True, False]
+    assert [layer.is_empty for layer in stack_high.layers] == [False, True, True]
+    assert stack_high.layers[0].area == pytest.approx(16.0)

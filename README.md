@@ -83,7 +83,8 @@ For a multi-material object exported as separate STLs (one per material), give e
 - **Contour Tracing** on assembly parts outlines only the assembly's true outer surface: edges where one material meets (or nearly meets, within half a bead — fit tolerances included) another material are internal interfaces and are skipped, exactly like the cut seams of grid-split pieces.
 - Combine with **Use combined reference outline for motion** so all heads share one synchronized path while each dispenses only its own part.
 - Nozzle renumbering in the table takes effect on the next slice or G-code generation — groups are re-detected automatically.
-- Leave assembly parts' target dimensions at their defaults (or scale every part identically); parts are scaled about their own corners, so unequal scaling would misalign an assembly.
+- **Dimension edits scale the whole assembly**: changing a dimension of one group member applies the same scale factor (target ÷ original, per axis) to every shape on that nozzle, in both scaling modes — in Keep Proportions one edit rescales every member proportionally; in Independent X/Y/Z the edited axis's factor propagates to the group. Factors (not absolute values) keep differently-sized parts proportional to each other, and group members are scaled about the assembly's shared corner so the parts stay assembled at any size.
+- **Flip Z** (per-shape checkbox) prints a shape the other way up by mirroring it about its Z midplane. Checking it on any assembly member flips the **whole group** about the group's shared midplane, so the assembly stays together — useful when a multi-material model is authored with its display face down (e.g. the detail layer would otherwise print first instead of last).
 
 ### Multi-Nozzle Split
 

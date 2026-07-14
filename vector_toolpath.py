@@ -367,8 +367,13 @@ def _scan_coords(
         count = int(math.floor((hi - lo) / fil_width + 1e-9))
         return [anchor + index * fil_width for index in range(count)]
 
-    k_lo = math.ceil((lo - anchor) / fil_width - 1e-9)
-    k_hi = math.floor((hi - anchor) / fil_width - 1e-9)
+    # The epsilon is in grid-cell units and must swamp float noise from the
+    # anchor/edge arithmetic: a piece whose material starts EXACTLY on a grid
+    # line (a split cut on the line) can compute (lo-anchor)/fil as
+    # -1.0000000000000009, and a 1e-9 epsilon then ceils the boundary line
+    # away — nobody prints it and every assembled seam gets a one-fil gap.
+    k_lo = math.ceil((lo - anchor) / fil_width - 1e-6)
+    k_hi = math.floor((hi - anchor) / fil_width - 1e-6)
     return [anchor + k * fil_width for k in range(int(k_lo), int(k_hi) + 1)]
 
 
@@ -411,10 +416,20 @@ def _axis_raster_segments(
         scan_lo, scan_hi, fil_width
     )
 
+    # A grid line can graze the material boundary from OUTSIDE by float ulps
+    # (split cuts sit exactly on grid lines, and the piece's material edge IS
+    # the cut): probe the chords a hair inside the bounds so the boundary
+    # sweep is still found, while emitting at the true grid coordinate.
+    # A dropped boundary sweep prints a one-fil gap at every assembled seam.
+    probe_eps = fil_width * 1e-6
+    probe_lo = min(scan_lo + probe_eps, (scan_lo + scan_hi) / 2.0)
+    probe_hi = max(scan_hi - probe_eps, (scan_lo + scan_hi) / 2.0)
+
     segments: list[Seg] = []
     sweep_number = 0
     for coord in coords:
-        motion_runs = _chord_runs(motion, axis, coord)
+        probe = min(max(coord, probe_lo), probe_hi)
+        motion_runs = _chord_runs(motion, axis, probe)
         if not motion_runs:
             continue
 
@@ -426,7 +441,7 @@ def _axis_raster_segments(
             valve_runs: list[tuple[float, float]] = []
         else:
             valve_runs = []
-            for lo, hi in _chord_runs(valve, axis, coord):
+            for lo, hi in _chord_runs(valve, axis, probe):
                 lo = max(lo, sweep_lo)
                 hi = min(hi, sweep_hi)
                 if hi - lo > EPS:

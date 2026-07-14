@@ -88,15 +88,28 @@ def _normalize_scale_factors(scale_factors: Sequence[float] | None) -> ScaleFact
     return (values[0], values[1], values[2])
 
 
-def scale_mesh(mesh: trimesh.Trimesh, scale_factors: Sequence[float] | None = None) -> trimesh.Trimesh:
-    """Return a copy of `mesh` scaled around its minimum XYZ corner."""
+def scale_mesh(
+    mesh: trimesh.Trimesh,
+    scale_factors: Sequence[float] | None = None,
+    anchor: Sequence[float] | None = None,
+) -> trimesh.Trimesh:
+    """Return a copy of `mesh` scaled around `anchor` (its own minimum XYZ
+    corner by default).
+
+    Multi-material assembly parts pass their GROUP's combined corner: parts
+    scaled by the same factors about one shared point stay assembled, while
+    each scaling about its own corner would shift them relative to each
+    other.
+    """
     sx, sy, sz = _normalize_scale_factors(scale_factors)
     scaled = mesh.copy()
 
     if math.isclose(sx, 1.0) and math.isclose(sy, 1.0) and math.isclose(sz, 1.0):
         return scaled
 
-    anchor = np.asarray(mesh.bounds[0], dtype=float)
+    anchor = np.asarray(
+        mesh.bounds[0] if anchor is None else anchor, dtype=float
+    )
     transform = np.eye(4)
     transform[0, 0] = sx
     transform[1, 1] = sy
@@ -285,15 +298,37 @@ def slice_stl_to_layers(
     scale_factors: Sequence[float] | None = None,
     name: str | None = None,
     z_levels: Sequence[float] | None = None,
+    scale_anchor: Sequence[float] | None = None,
+    flip_z: bool = False,
+    z_flip_mid: float | None = None,
 ) -> LayerStack:
     """Slice an STL into per-layer vector outlines (world-XY millimetres).
 
     `z_levels` overrides the per-mesh Z planes with an explicit (world) grid —
     used by multi-material assemblies so every part slices on ONE shared grid
-    and parts that start higher simply get empty lower layers.
+    and parts that start higher simply get empty lower layers. `scale_anchor`
+    is the point target-dimension scaling happens about (assembly parts share
+    their group's corner so they stay assembled when rescaled).
+
+    `flip_z` mirrors the scaled mesh about the horizontal plane at
+    `z_flip_mid` (its own Z midpoint by default) — printing the shape the
+    other way up. Assembly parts pass their GROUP's midplane so the whole
+    assembly flips as one unit.
     """
     stl_path = Path(stl_path)
-    mesh = scale_mesh(load_mesh(stl_path), scale_factors)
+    mesh = scale_mesh(load_mesh(stl_path), scale_factors, anchor=scale_anchor)
+    if flip_z:
+        mid = (
+            float(z_flip_mid)
+            if z_flip_mid is not None
+            else (float(mesh.bounds[0][2]) + float(mesh.bounds[1][2])) / 2.0
+        )
+        mirror = np.eye(4)
+        mirror[2, 2] = -1.0
+        mirror[2, 3] = 2.0 * mid
+        # apply_transform reverses face winding for negative determinants,
+        # so normals stay outward and cavity detection keeps working.
+        mesh.apply_transform(mirror)
     (x_min, y_min, z_min), (x_max, y_max, z_max) = mesh.bounds
 
     if z_levels is not None:

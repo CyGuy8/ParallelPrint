@@ -111,7 +111,7 @@ def test_shape_settings_round_trip_contour_tracing_column() -> None:
 
     rows = _shape_settings_rows(records)
     assert SHAPE_SETTINGS_HEADERS[6:9] == ["Valve", "Nozzle", "Port"]
-    assert SHAPE_SETTINGS_HEADERS[-3:] == ["Contour Tracing", "Lead In", "Delete"]
+    assert SHAPE_SETTINGS_HEADERS[-4:] == ["Contour Tracing", "Lead In", "Flip Z", "Delete"]
     contour_pos = SHAPE_SETTINGS_HEADERS.index("Contour Tracing")
     lead_in_pos = SHAPE_SETTINGS_HEADERS.index("Lead In")
     assert rows[0][6:9] == [4, 1, 1]
@@ -691,6 +691,8 @@ def test_delete_shape_cooldown_blocks_immediate_second_delete() -> None:
     ]
 
     first_outputs = delete_shape_from_settings(records, _shape_settings_rows(records), 0.0, Event())
+    assert [record["name"] for record in first_outputs[1]] == ["first", "last"]
+
     second_outputs = delete_shape_from_settings(
         first_outputs[1],
         first_outputs[2],
@@ -698,7 +700,26 @@ def test_delete_shape_cooldown_blocks_immediate_second_delete() -> None:
         Event(),
     )
 
-    assert [record["name"] for record in second_outputs[1]] == ["first", "last"]
+    # Blocked by the cooldown: every output is skipped (nothing rewritten).
+    assert not isinstance(second_outputs[1], list)
+
+
+def test_non_delete_cell_selection_touches_nothing() -> None:
+    # The select handler fires on EVERY cell click; unless the click is on
+    # the Delete column it must skip all outputs — echoing the table here
+    # raced (and clobbered) the Keep Proportions dimension recompute.
+    class Event:
+        index = (0, 3)  # a Target Y cell
+
+    records = [
+        {"idx": 1, "name": "first", "stl_path": "first.stl", "target_x": 10.0, "target_y": 11.0, "target_z": 12.0, "pressure": 25, "valve": 4, "port": 1, "color": "#111111"},
+    ]
+
+    outputs = delete_shape_from_settings(records, _shape_settings_rows(records), 0.0, Event())
+
+    assert len(outputs) == 8
+    assert all(not isinstance(value, list) for value in outputs)
+    assert not isinstance(outputs[1], list)  # records State untouched
 
 
 def test_group_split_splits_all_materials_on_one_shared_grid() -> None:
@@ -816,3 +837,259 @@ def test_describe_split_source_warns_about_group_splits() -> None:
     # No selection defaults to the first shape - which is grouped here.
     assert "whole group as one shape" in describe_split_source(records, None)
     assert describe_split_source([], None) == SPLIT_STATUS_DEFAULT
+
+
+def test_keep_proportions_is_stale_echo_proof() -> None:
+    # The table's .change event delivers stale/echoed tables out of order.
+    # Anchoring must come from the ROW's own ratios (odd one out), never from
+    # diffing against fresher records - that mis-anchored and reverted the
+    # first edit. Self-consistent rows must skip the table write entirely.
+    import gradio as gr
+
+    def _record(**overrides):
+        record = {
+            "idx": 1, "name": "cube", "stl_path": "cube.stl",
+            "original_x": 38.1, "original_y": 38.1, "original_z": 32.99557,
+            "target_x": 38.1, "target_y": 38.1, "target_z": 32.99557,
+            "pressure": 25.0, "valve": 4, "nozzle": 1, "port": 1,
+            "color": "#111111", "last_scaled_axis": "target_x",
+        }
+        record.update(overrides)
+        return record
+
+    # 1) A user edit (odd ratio on Y) rescales everything and writes the table.
+    records = [_record()]
+    rows = _shape_settings_rows(records)
+    rows[0][3] = 50.0
+    updated, table_out = normalize_shape_dimensions_for_mode(records, rows, SCALE_MODE_UNIFORM_FACTOR)
+    assert updated[0]["target_x"] == 50.0
+    assert updated[0]["target_z"] == 43.301273
+    assert isinstance(table_out, list)  # table written
+
+    # 2) A stale PRE-EDIT echo arrives while records already hold the scaled
+    #    dims: the row is self-consistent, so no re-anchor, no revert write.
+    stale_rows = _shape_settings_rows([_record()])
+    updated2, table_out2 = normalize_shape_dimensions_for_mode(updated, stale_rows, SCALE_MODE_UNIFORM_FACTOR)
+    assert not isinstance(table_out2, list)  # table output skipped
+
+    # 3) The echo of our own scaled write-back is also a no-op.
+    scaled_rows = _shape_settings_rows(updated)
+    updated3, table_out3 = normalize_shape_dimensions_for_mode(updated, scaled_rows, SCALE_MODE_UNIFORM_FACTOR)
+    assert not isinstance(table_out3, list)
+    assert updated3[0]["target_x"] == 50.0
+    assert updated3[0]["target_z"] == 43.301273
+
+
+def _mm_member(idx: int, nozzle: int, ox: float, oy: float, oz: float) -> dict:
+    return {
+        "idx": idx, "name": f"part{idx}", "stl_path": f"part{idx}.stl",
+        "original_x": ox, "original_y": oy, "original_z": oz,
+        "target_x": ox, "target_y": oy, "target_z": oz,
+        "pressure": 25.0, "valve": 4, "nozzle": nozzle, "port": 1,
+        "color": "#111111", "last_scaled_axis": "target_x",
+    }
+
+
+def test_group_members_share_scale_factors_in_independent_mode() -> None:
+    from app import SCALE_MODE_TARGET_DIMENSIONS
+
+    # Two assembly parts of DIFFERENT sizes on nozzle 1, a solo on nozzle 2.
+    records = [
+        _mm_member(1, 1, 40.0, 20.0, 10.0),
+        _mm_member(2, 1, 20.0, 20.0, 10.0),
+        _mm_member(3, 2, 30.0, 30.0, 30.0),
+    ]
+    rows = _shape_settings_rows(records)
+    rows[0][2] = 60.0  # X of part 1: factor 1.5
+
+    updated, table_out = normalize_shape_dimensions_for_mode(
+        records, rows, SCALE_MODE_TARGET_DIMENSIONS
+    )
+
+    # Part 2 gets the same FACTOR (x 20 -> 30), not the same absolute value.
+    assert updated[0]["target_x"] == 60.0
+    assert updated[1]["target_x"] == 30.0
+    # Unedited axes keep factor 1.
+    assert updated[0]["target_y"] == 20.0 and updated[1]["target_y"] == 20.0
+    # Solo shape on its own nozzle is untouched.
+    assert updated[2]["target_x"] == 30.0
+    assert isinstance(table_out, list)  # propagation must be written back
+
+
+def test_group_members_share_scale_factors_in_keep_proportions() -> None:
+    records = [
+        _mm_member(1, 1, 40.0, 20.0, 10.0),
+        _mm_member(2, 1, 20.0, 20.0, 10.0),
+    ]
+    rows = _shape_settings_rows(records)
+    rows[0][3] = 30.0  # Y of part 1: factor 1.5
+
+    updated, table_out = normalize_shape_dimensions_for_mode(
+        records, rows, SCALE_MODE_UNIFORM_FACTOR
+    )
+
+    # Part 1 rescales proportionally; part 2 follows with the same factor.
+    assert [updated[0][k] for k in ("target_x", "target_y", "target_z")] == [60.0, 30.0, 15.0]
+    assert [updated[1][k] for k in ("target_x", "target_y", "target_z")] == [30.0, 30.0, 15.0]
+    assert isinstance(table_out, list)
+
+    # The echo of that write-back is a converged no-op.
+    echoed_rows = _shape_settings_rows(updated)
+    updated2, table_out2 = normalize_shape_dimensions_for_mode(
+        updated, echoed_rows, SCALE_MODE_UNIFORM_FACTOR
+    )
+    assert not isinstance(table_out2, list)
+    assert updated2[1]["target_x"] == 30.0
+
+
+def test_group_propagation_skips_when_the_source_is_ambiguous() -> None:
+    from app import SCALE_MODE_TARGET_DIMENSIONS
+
+    # A stale echo can make SEVERAL members look edited at once: the
+    # propagation must not guess a source (guessing reverted edits).
+    records = [
+        _mm_member(1, 1, 40.0, 20.0, 10.0),
+        _mm_member(2, 1, 20.0, 20.0, 10.0),
+    ]
+    records[0]["target_x"] = 60.0  # records already hold part 1 scaled...
+    rows = _shape_settings_rows(records)
+    rows[0][2] = 44.0  # ...while the table flags edits on BOTH members
+    rows[1][2] = 24.0
+
+    updated, _table_out = normalize_shape_dimensions_for_mode(
+        records, rows, SCALE_MODE_TARGET_DIMENSIONS
+    )
+
+    # Both edits applied as-is; no propagation happened (factors differ).
+    assert updated[0]["target_x"] == 44.0
+    assert updated[1]["target_x"] == 24.0
+
+
+def test_joining_a_nozzle_group_adopts_the_group_scale() -> None:
+    from app import SCALE_MODE_TARGET_DIMENSIONS
+
+    # Nozzle-1 group already scaled x1.5; a solo shape moves onto nozzle 1
+    # via the Nozzle column and must adopt the group's factors.
+    member_a = _mm_member(1, 1, 40.0, 20.0, 10.0)
+    member_b = _mm_member(2, 1, 20.0, 20.0, 10.0)
+    for member in (member_a, member_b):
+        for axis in ("x", "y", "z"):
+            member[f"target_{axis}"] = member[f"original_{axis}"] * 1.5
+    solo = _mm_member(3, 2, 30.0, 10.0, 10.0)
+
+    records = [member_a, member_b, solo]
+    rows = _shape_settings_rows(records)
+    nozzle_pos = SHAPE_SETTINGS_HEADERS.index("Nozzle")
+    rows[2][nozzle_pos] = 1  # solo joins the assembly
+
+    updated, table_out = normalize_shape_dimensions_for_mode(
+        records, rows, SCALE_MODE_TARGET_DIMENSIONS
+    )
+
+    assert [updated[2][k] for k in ("target_x", "target_y", "target_z")] == [45.0, 15.0, 15.0]
+    # Incumbents unchanged.
+    assert updated[0]["target_x"] == 60.0
+    assert isinstance(table_out, list)
+
+    # The echo of that write-back converges (nozzle now matches the record).
+    echoed = _shape_settings_rows(updated)
+    updated2, table_out2 = normalize_shape_dimensions_for_mode(
+        updated, echoed, SCALE_MODE_TARGET_DIMENSIONS
+    )
+    assert not isinstance(table_out2, list)
+    assert updated2[2]["target_x"] == 45.0
+
+
+def test_split_pieces_are_never_rescaled_by_keep_proportions() -> None:
+    # Regression: split pieces inherit the parent's original_* dims while
+    # their targets are the CELL sizes; a table echo in Keep Proportions
+    # used to "restore" the parent dimensions (shapes visibly reset after
+    # e.g. a color change).
+    piece = {
+        "idx": 1, "name": "cube - R1C1", "stl_path": None,
+        "original_x": 30.0, "original_y": 30.0, "original_z": 30.0,
+        "target_x": 15.2, "target_y": 15.2, "target_z": 30.0,
+        "pressure": 25.0, "valve": 4, "nozzle": 1, "port": 1,
+        "color": "#111111", "split_group_id": "split-1", "split_columns": 2,
+        "split_rows": 2, "last_scaled_axis": "target_x",
+    }
+    records = [piece, dict(piece, idx=2, name="cube - R1C2", nozzle=1, valve=5)]
+    rows = _shape_settings_rows(records)
+
+    updated, table_out = normalize_shape_dimensions_for_mode(
+        records, rows, SCALE_MODE_UNIFORM_FACTOR
+    )
+
+    assert updated[0]["target_x"] == 15.2  # NOT reset to 30
+    assert updated[0]["target_z"] == 30.0
+    assert updated[1]["target_x"] == 15.2
+    assert not isinstance(table_out, list)  # nothing changed, no write-back
+
+
+def test_select_all_string_bools_trigger_a_canonical_rewrite() -> None:
+    # Gradio's header "select all" writes STRING "true"/"false" into the
+    # checkbox columns (rendered as text / stray stale checkboxes). The
+    # normalizer must answer with real rows so the table re-renders with
+    # proper booleans; a clean payload must stay a no-op.
+    from app import SCALE_MODE_TARGET_DIMENSIONS
+
+    records = [
+        _mm_member(1, 1, 10.0, 10.0, 10.0),
+        _mm_member(2, 2, 10.0, 10.0, 10.0),
+    ]
+    rows = _shape_settings_rows(records)
+    lead_in_pos = SHAPE_SETTINGS_HEADERS.index("Lead In")
+    for row in rows:
+        row[lead_in_pos] = "true"  # select-all artifact
+
+    updated, table_out = normalize_shape_dimensions_for_mode(
+        records, rows, SCALE_MODE_TARGET_DIMENSIONS
+    )
+
+    assert all(record["lead_in"] is True for record in updated)
+    assert isinstance(table_out, list)  # canonical rewrite issued
+    assert all(row[lead_in_pos] is True for row in table_out)  # real booleans
+
+    # The rewrite's echo is clean -> converges to a no-op.
+    updated2, table_out2 = normalize_shape_dimensions_for_mode(
+        updated, table_out, SCALE_MODE_TARGET_DIMENSIONS
+    )
+    assert not isinstance(table_out2, list)
+
+    # Unchecking via select-all ("false" strings) round-trips too.
+    rows_off = _shape_settings_rows(updated2)
+    for row in rows_off:
+        row[lead_in_pos] = "false"
+    updated3, table_out3 = normalize_shape_dimensions_for_mode(
+        updated2, rows_off, SCALE_MODE_TARGET_DIMENSIONS
+    )
+    assert all(record["lead_in"] is False for record in updated3)
+    assert isinstance(table_out3, list)
+
+
+def test_apply_bulk_bool_selection_sets_a_whole_column() -> None:
+    from app import apply_bulk_bool_selection
+
+    records = [
+        _mm_member(1, 1, 10.0, 10.0, 10.0),
+        _mm_member(2, 2, 10.0, 10.0, 10.0),
+        _mm_member(3, 3, 10.0, 10.0, 10.0),
+    ]
+    flip_pos = SHAPE_SETTINGS_HEADERS.index("Flip Z")
+    lead_pos = SHAPE_SETTINGS_HEADERS.index("Lead In")
+
+    updated, rows = apply_bulk_bool_selection(records, None, f"{flip_pos}|1")
+    assert all(record["flip_z"] is True for record in updated)
+    assert all(record.get("lead_in") is not True for record in updated)  # no bleed
+    assert all(row[flip_pos] is True for row in rows)
+    assert all(row[lead_pos] is False for row in rows)
+
+    # Unchecking clears the whole column; junk payloads change nothing.
+    cleared, rows2 = apply_bulk_bool_selection(updated, rows, f"{flip_pos}|0")
+    assert all(record["flip_z"] is False for record in cleared)
+    same, _rows3 = apply_bulk_bool_selection(cleared, rows2, "garbage")
+    assert all(record["flip_z"] is False for record in same)
+    # Non-bool columns are refused.
+    color_pos = SHAPE_SETTINGS_HEADERS.index("Color")
+    refused, _rows4 = apply_bulk_bool_selection(cleared, rows2, f"{color_pos}|1")
+    assert refused[0].get("color") == cleared[0].get("color")

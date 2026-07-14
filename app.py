@@ -404,6 +404,39 @@ APP_HEAD = """
         event.stopPropagation();
         relayColorChoice(idxMatch[1], '#' + hexMatch[1].toLowerCase());
     }, true);
+    // Header "select all" checkboxes: Gradio's own implementation is buggy
+    // (sometimes toggles nothing server-side, sometimes bleeds a stray value
+    // into the neighbouring column's first row). Hijack the click and set
+    // the whole column through the backend instead.
+    function relayBulkBool(columnIndex, value) {
+        var sink = document.querySelector('#pp-bulk-sink textarea, #pp-bulk-sink input');
+        var apply = document.querySelector('#pp-bulk-apply button, button#pp-bulk-apply, #pp-bulk-apply');
+        if (!sink || !apply) return;
+        sink.value = columnIndex + '|' + value;
+        sink.dispatchEvent(new Event('input', { bubbles: true }));
+        if (apply.tagName !== 'BUTTON') { apply = apply.querySelector('button') || apply; }
+        apply.click();
+    }
+    document.addEventListener('click', function (event) {
+        var el = event.target;
+        if (!el || !el.closest) return;
+        if (!el.closest('#shape-settings-table thead')) return;
+        var wrap = el.closest('label') || el;
+        var cb = (wrap.matches && wrap.matches('input[type=checkbox]'))
+            ? wrap
+            : (wrap.querySelector ? wrap.querySelector('input[type=checkbox]') : null);
+        if (!cb) return;
+        event.preventDefault();
+        event.stopPropagation();
+        var row = cb.closest('tr');
+        var cell = cb.closest('th, td');
+        if (!row || !cell) return;
+        var col = Array.prototype.indexOf.call(row.children, cell);
+        // Checkbox pre-click activation: by the time click handlers run the
+        // box has ALREADY toggled (preventDefault rolls it back visually),
+        // so cb.checked is the state the user is asking for.
+        relayBulkBool(col, cb.checked ? 1 : 0);
+    }, true);
     function enableUndoButtons(root) {
         (root || document).querySelectorAll('.model3D button[aria-label="Undo"]').forEach(function (btn) {
             if (btn.disabled) {
@@ -1553,6 +1586,7 @@ SHAPE_SETTINGS_HEADERS = [
     "Infill %",
     "Contour Tracing",
     "Lead In",
+    "Flip Z",
     "Delete",
 ]
 SHAPE_SETTINGS_DATATYPES = [
@@ -1567,6 +1601,7 @@ SHAPE_SETTINGS_DATATYPES = [
     "number",
     "markdown",
     "number",
+    "bool",
     "bool",
     "bool",
     "str",
@@ -1750,6 +1785,7 @@ def _shape_settings_rows(records: list[dict]) -> list[list[Any]]:
             _coerce_float(record.get("infill", 100.0), 100.0),
             bool(record.get("contour_tracing", False)),
             bool(record.get("lead_in", False)),
+            bool(record.get("flip_z", False)),
             "Delete",
         ]
         for record in records
@@ -1825,6 +1861,13 @@ def _apply_shape_settings(records: list[dict], settings_table: Any) -> list[dict
                 copy["lead_in"] = _coerce_bool(row[lead_in_pos], bool(copy.get("lead_in", False)))
             except IndexError:
                 copy["lead_in"] = bool(copy.get("lead_in", False))
+            flip_pos = lead_in_pos + 1
+            # Parse only when the Flip Z column is present (Delete follows it);
+            # an old-format row would otherwise coerce the "Delete" cell.
+            if len(row) > flip_pos + 1:
+                copy["flip_z"] = _coerce_bool(row[flip_pos], bool(copy.get("flip_z", False)))
+            else:
+                copy["flip_z"] = bool(copy.get("flip_z", False))
         updated.append(copy)
     return updated
 
@@ -2275,6 +2318,15 @@ def _shape_delete_outputs(
     )
 
 
+def _shape_select_noop() -> tuple:
+    """Skip every output: a cell click that is not a Delete click must not
+    touch anything. This handler fires on EVERY cell selection (queued, so it
+    lands late); echoing records/rows here raced the dimension normalizer's
+    write-back — the stale echo clobbered the recomputed proportions on the
+    first Keep Proportions edit and re-rendered the table mid-typing."""
+    return tuple(gr.skip() for _ in range(8))
+
+
 def delete_shape_from_settings(
     records: list[dict] | None,
     settings_table: Any | None,
@@ -2284,20 +2336,20 @@ def delete_shape_from_settings(
     now = time.monotonic()
     rows = _normalise_rows(settings_table)
     selected = getattr(evt, "index", None)
-    current_records = _apply_shape_settings(records or [], settings_table)
     if not isinstance(selected, (list, tuple)) or len(selected) < 2:
-        return _shape_delete_outputs(current_records, last_delete_at)
+        return _shape_select_noop()
 
     try:
         row_index, column_index = int(selected[0]), int(selected[1])
     except (TypeError, ValueError):
-        return _shape_delete_outputs(current_records, last_delete_at)
+        return _shape_select_noop()
     delete_column_index = len(SHAPE_SETTINGS_HEADERS) - 1
     if column_index != delete_column_index or row_index < 0 or row_index >= len(rows):
-        return _shape_delete_outputs(current_records, last_delete_at)
+        return _shape_select_noop()
     if last_delete_at and now - float(last_delete_at) < DELETE_SHAPE_COOLDOWN_SECONDS:
-        return _shape_delete_outputs(current_records, last_delete_at)
+        return _shape_select_noop()
 
+    current_records = _apply_shape_settings(records or [], settings_table)
     try:
         delete_idx = int(float(rows[row_index][0]))
     except (IndexError, TypeError, ValueError):
@@ -2335,23 +2387,228 @@ def reset_shape_dimensions(records: list[dict] | None, settings_table: Any | Non
     return reset_records, _shape_settings_rows(reset_records)
 
 
+BULK_BOOL_COLUMNS = {
+    "Contour Tracing": "contour_tracing",
+    "Lead In": "lead_in",
+    "Flip Z": "flip_z",
+}
+
+
+def apply_bulk_bool_selection(
+    records: list[dict] | None,
+    settings_table: Any,
+    payload: str | None,
+) -> tuple[list[dict], list[list[Any]]]:
+    """Set a checkbox column for ALL shapes ("columnIndex|0/1" from the sink).
+
+    Backs the header select-all checkboxes: Gradio's own implementation is
+    unreliable (see the head-script hijack), so the whole column is set here
+    and the table re-rendered canonically.
+    """
+    records = _apply_shape_settings(records or [], settings_table)
+    parts = str(payload or "").split("|")
+    if len(parts) >= 2:
+        try:
+            column_index = int(parts[0])
+            value = bool(int(parts[1]))
+        except (TypeError, ValueError):
+            column_index = -1
+            value = False
+        if 0 <= column_index < len(SHAPE_SETTINGS_HEADERS):
+            key = BULK_BOOL_COLUMNS.get(SHAPE_SETTINGS_HEADERS[column_index])
+            if key:
+                records = [dict(record, **{key: value}) for record in records]
+    return records, _shape_settings_rows(records)
+
+
+def _bool_cells_need_rewrite(settings_table: Any) -> bool:
+    """True when the checkbox columns carry non-boolean cell values.
+
+    Gradio's header "select all" writes the STRING "true"/"false" into the
+    column's cells (and leaves some rendered as plain text or stale
+    checkboxes in neighbouring columns) instead of booleans. Detecting that
+    lets the normalizer answer with a canonical re-render, which restores
+    real checkboxes and stomps any visual strays within one round-trip.
+    """
+    rows = _normalise_rows(settings_table)
+    contour_pos = SHAPE_SETTINGS_HEADERS.index("Contour Tracing")
+    bool_positions = (contour_pos, contour_pos + 1, contour_pos + 2)
+    for row in rows:
+        if len(row) < len(SHAPE_SETTINGS_HEADERS):
+            continue
+        for pos in bool_positions:
+            if not isinstance(row[pos], bool):
+                return True
+    return False
+
+
+def _last_edited_nozzles(records: list[dict] | None, settings_table: Any) -> set[int]:
+    """Record idx whose Nozzle cell differs from the record — i.e. shapes the
+    user just moved onto a (possibly new) nozzle via the table."""
+    rows = _normalise_rows(settings_table)
+    previous_by_idx: dict[int, dict] = {}
+    for record in records or []:
+        try:
+            previous_by_idx[int(record.get("idx", 0))] = record
+        except (TypeError, ValueError):
+            continue
+
+    nozzle_pos = SHAPE_SETTINGS_HEADERS.index("Nozzle")
+    changed: set[int] = set()
+    for row in rows:
+        try:
+            idx = int(float(row[0]))
+        except (IndexError, TypeError, ValueError):
+            continue
+        previous = previous_by_idx.get(idx)
+        if not previous or len(row) <= nozzle_pos:
+            continue
+        old_nozzle = _record_nozzle_number(previous, idx)
+        new_nozzle = _coerce_int(row[nozzle_pos], old_nozzle)
+        if new_nozzle > 0 and new_nozzle != old_nozzle:
+            changed.add(idx)
+    return changed
+
+
+def _record_scale_factors(record: dict) -> tuple[float, float, float] | None:
+    """Per-axis target/original factors, or None when they can't be computed."""
+    try:
+        originals = [float(record.get(f"original_{axis}")) for axis in ("x", "y", "z")]
+        targets = [float(record.get(f"target_{axis}")) for axis in ("x", "y", "z")]
+    except (TypeError, ValueError):
+        return None
+    if any(not math.isfinite(v) or v <= 0 for v in originals + targets):
+        return None
+    return tuple(target / original for target, original in zip(targets, originals))
+
+
+def _propagate_group_scale_factors(
+    records: list[dict],
+    edited_axes: dict[int, str],
+    recomputed_idx: set[int],
+    joined_idx: set[int] | None = None,
+) -> list[dict]:
+    """Sync each multi-material group's scale factors from the edited member.
+
+    Shapes sharing a nozzle are one assembly, so a dimension edit on one
+    part scales EVERY part by the same per-axis factor (target/original) —
+    absolute values would distort assemblies whose parts differ in size.
+    The source member must be unambiguous: the one whose row was actually
+    recomputed this round (Keep Proportions), the single member the user
+    edited, or — when a shape just JOINED the group by a nozzle edit — the
+    incumbent members' shared factors, which the newcomer adopts. Groups
+    already in sync, or with no clear source (e.g. stale .change echoes that
+    flag several members at once), are left untouched, so the event storm
+    converges instead of ping-ponging.
+    """
+    joined_idx = joined_idx or set()
+
+    def _triples_close(a: tuple, b: tuple) -> bool:
+        return all(
+            math.isclose(fa, fb, rel_tol=1e-6, abs_tol=1e-9) for fa, fb in zip(a, b)
+        )
+
+    for members in _multi_material_groups(records).values():
+        factors = {id(member): _record_scale_factors(member) for member in members}
+        if any(value is None for value in factors.values()):
+            continue
+        triples = list(factors.values())
+        if all(_triples_close(triples[0], triple) for triple in triples[1:]):
+            continue  # group already in sync
+
+        recomputed_members = [
+            member for member in members if int(member.get("idx", 0)) in recomputed_idx
+        ]
+        edited_members = [
+            member for member in members if int(member.get("idx", 0)) in edited_axes
+        ]
+        newcomers = [
+            member for member in members if int(member.get("idx", 0)) in joined_idx
+        ]
+        incumbents = [
+            member for member in members if int(member.get("idx", 0)) not in joined_idx
+        ]
+        if len(recomputed_members) == 1:
+            source = recomputed_members[0]
+        elif len(edited_members) == 1:
+            source = edited_members[0]
+        elif newcomers and incumbents and all(
+            _triples_close(factors[id(incumbents[0])], factors[id(member)])
+            for member in incumbents[1:]
+        ):
+            # Nozzle edit pulled newcomers into the group: they adopt the
+            # incumbents' shared scale factors.
+            source = incumbents[0]
+        else:
+            continue  # ambiguous (stale echo): do not guess
+
+        source_factors = factors[id(source)]
+        for member in members:
+            if member is source:
+                continue
+            for axis, factor in zip(("x", "y", "z"), source_factors):
+                member[f"target_{axis}"] = round(
+                    float(member[f"original_{axis}"]) * factor, 6
+                )
+            member["last_scaled_axis"] = source.get(
+                "last_scaled_axis", member.get("last_scaled_axis")
+            )
+    return records
+
+
 def normalize_shape_dimensions_for_mode(
     records: list[dict] | None,
     settings_table: Any | None,
     scale_mode: str | None,
 ) -> tuple:
+    """Apply table edits to the records; in Keep Proportions, rescale each
+    shape's other dimensions from the edited axis. In BOTH modes, a
+    dimension edit on a multi-material group member (shapes sharing a
+    nozzle) propagates its scale factors to the whole group, so assemblies
+    stay proportional as one unit.
+
+    Wired to the table's .change event, WHICH ALSO FIRES FOR OUR OWN
+    WRITE-BACK (Gradio's Dataframe does not emit .input for cell edits at
+    all). The cascade is broken server-side: the table output is skipped
+    whenever normalization did not change any dimension — so a user edit
+    costs exactly two rounds (recompute + converged no-op), and programmatic
+    table updates cost one no-op round instead of looping.
+    """
     edited_axes = _last_edited_target_axes(records, settings_table)
+    joined_idx = _last_edited_nozzles(records, settings_table)
     records = _apply_shape_settings(records or [], settings_table)
     if _normalize_scale_mode(scale_mode) != SCALE_MODE_UNIFORM_FACTOR:
-        for record in records:
+        normalized = [dict(record) for record in records]
+        for record in normalized:
             idx = int(record.get("idx", 0))
             if idx in edited_axes:
                 record["last_scaled_axis"] = edited_axes[idx]
-        return records, _shape_settings_rows(records)
+        normalized = _propagate_group_scale_factors(normalized, edited_axes, set(), joined_idx)
+        changed = any(
+            not math.isclose(
+                float(before.get(key) or 0.0),
+                float(after.get(key) or 0.0),
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+            for before, after in zip(records, normalized)
+            for key in TARGET_DIMENSION_KEYS
+        )
+        if not changed and not _bool_cells_need_rewrite(settings_table):
+            return normalized, gr.skip()
+        return normalized, _shape_settings_rows(normalized)
 
+    recomputed_idx: set[int] = set()
     normalized: list[dict] = []
     for record in records:
         copy = dict(record)
+        if not copy.get("stl_path"):
+            # Split pieces: their targets are CELL sizes while original_* is
+            # inherited from the parent shape, so the ratio logic would
+            # misread them as mid-edit and "restore" the parent dimensions.
+            # Piece dimensions are informational — never rescale them.
+            normalized.append(copy)
+            continue
         originals = np.asarray([
             copy.get("original_x"),
             copy.get("original_y"),
@@ -2373,18 +2630,69 @@ def normalize_shape_dimensions_for_mode(
             normalized.append(copy)
             continue
         idx = int(copy.get("idx", 0))
-        anchor_key = edited_axes.get(idx) or copy.get("last_scaled_axis") or "target_x"
-        try:
-            anchor_index = TARGET_DIMENSION_KEYS.index(str(anchor_key))
-        except ValueError:
-            anchor_index = 0
+
+        # Anchor on the row's own evidence: in a proportional row all three
+        # target/original ratios agree; a user edit makes exactly one ratio
+        # the odd one out. This is ORDER-INDEPENDENT — the .change event
+        # storm delivers stale/echoed tables whose rows are self-consistent,
+        # and those must recompute to themselves (skip) instead of being
+        # diffed against fresher records, mis-anchored, and reverted.
+        ratios = targets / originals
+
+        def _close(a: float, b: float) -> bool:
+            return math.isclose(float(a), float(b), rel_tol=1e-6, abs_tol=1e-9)
+
+        if _close(ratios[0], ratios[1]) and _close(ratios[1], ratios[2]):
+            # Already proportional (a pristine row or an echo of our own
+            # write-back): nothing to recompute.
+            if idx in edited_axes:
+                copy["last_scaled_axis"] = edited_axes[idx]
+            normalized.append(copy)
+            continue
+        # others_agree[i] means the OTHER two ratios agree -> axis i was edited.
+        others_agree = [
+            _close(ratios[1], ratios[2]),
+            _close(ratios[0], ratios[2]),
+            _close(ratios[0], ratios[1]),
+        ]
+        if sum(others_agree) == 1:
+            anchor_index = others_agree.index(True)
+        else:
+            # All three differ (e.g. custom dims from Independent mode):
+            # fall back to the detected edit, then the last anchor.
+            anchor_key = edited_axes.get(idx) or copy.get("last_scaled_axis") or "target_x"
+            try:
+                anchor_index = TARGET_DIMENSION_KEYS.index(str(anchor_key))
+            except ValueError:
+                anchor_index = 0
         scale = float(targets[anchor_index] / originals[anchor_index])
         copy["last_scaled_axis"] = TARGET_DIMENSION_KEYS[anchor_index]
         scaled = originals * scale
         copy["target_x"] = round(float(scaled[0]), 6)
         copy["target_y"] = round(float(scaled[1]), 6)
         copy["target_z"] = round(float(scaled[2]), 6)
+        recomputed_idx.add(idx)
         normalized.append(copy)
+
+    normalized = _propagate_group_scale_factors(
+        normalized, edited_axes, recomputed_idx, joined_idx
+    )
+
+    # Idempotence guard (breaks the .change write-back cascade): only write
+    # the table when a dimension actually changed — or when the checkbox
+    # columns need a canonical re-render after a header "select all".
+    changed = any(
+        not math.isclose(
+            float(before.get(key) or 0.0),
+            float(after.get(key) or 0.0),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        for before, after in zip(records, normalized)
+        for key in TARGET_DIMENSION_KEYS
+    )
+    if not changed and not _bool_cells_need_rewrite(settings_table):
+        return normalized, gr.skip()
     return normalized, _shape_settings_rows(normalized)
 
 
@@ -2415,18 +2723,24 @@ def _slice_params_snapshot(
     record: dict,
     layer_height: float,
     scale_mode: str | None,
-    z_levels: list[float] | None = None,
+    slice_plan: tuple[list[float], tuple[float, float, float], float | None] | None = None,
 ) -> dict:
+    z_levels = slice_plan[0] if slice_plan else None
+    anchor = slice_plan[1] if slice_plan else None
+    z_flip_mid = slice_plan[2] if slice_plan else None
     return {
         "layer_height": float(layer_height),
         "scale_mode": _normalize_scale_mode(scale_mode),
         "target_x": record.get("target_x"),
         "target_y": record.get("target_y"),
         "target_z": record.get("target_z"),
-        # Multi-material mode: the shared Z grid fingerprint. Adding/removing
-        # an assembly part changes the grid, which correctly marks every
-        # part's slices stale.
+        # Multi-material groups: the shared Z grid + scale anchor
+        # fingerprint. Adding/removing an assembly part changes them, which
+        # correctly marks every part's slices stale.
         "z_grid": (round(z_levels[0], 6), len(z_levels)) if z_levels else None,
+        "scale_anchor": tuple(round(v, 6) for v in anchor) if anchor else None,
+        "flip_z": bool(record.get("flip_z", False)),
+        "z_flip_mid": round(z_flip_mid, 6) if z_flip_mid is not None else None,
     }
 
 
@@ -2491,19 +2805,24 @@ def _stamp_multi_material_frames(records: list[dict], fil_width: float = 0.8) ->
             stack.contour_paths = None
 
 
-def _multi_material_z_levels(
+def _multi_material_slice_plan(
     records: list[dict],
     layer_height: float,
     scale_mode: str | None,
-) -> list[float] | None:
-    """One shared Z grid spanning the given parts' scaled extents.
+) -> tuple[list[float], tuple[float, float, float], float | None] | None:
+    """(shared Z grid, shared scale anchor, Z-flip midplane) for one group.
 
-    Multi-material group members must slice on the SAME planes so a part
-    that starts higher gets empty lower layers instead of having its first
-    material layer treated as layer 0.
+    Group members must slice on the SAME planes so a part that starts
+    higher gets empty lower layers instead of having its first material
+    layer treated as layer 0 — and any target-dimension scaling must happen
+    about ONE shared point (the group's combined un-scaled corner), or
+    same-factor scaling would still shift the parts relative to each other.
+    When any member has Flip Z checked, the WHOLE assembly mirrors about
+    the group's combined Z midplane (so it stays assembled, just printed
+    the other way up); the midplane is returned, else None.
     """
-    z_lo = math.inf
-    z_hi = -math.inf
+    loaded: list[tuple[Any, tuple[float, float, float]]] = []
+    corner = [math.inf, math.inf, math.inf]
     for record in records:
         stl_path = record.get("stl_path")
         if not stl_path:
@@ -2518,14 +2837,30 @@ def _multi_material_z_levels(
                 record.get("target_y"),
                 record.get("target_z"),
             )
-            scaled = scale_mesh(mesh, scale_factors)
+        except Exception:
+            continue
+        loaded.append((mesh, scale_factors))
+        for axis in range(3):
+            corner[axis] = min(corner[axis], float(mesh.bounds[0][axis]))
+    if not loaded or not all(math.isfinite(value) for value in corner):
+        return None
+
+    anchor = (corner[0], corner[1], corner[2])
+    z_lo = math.inf
+    z_hi = -math.inf
+    for mesh, scale_factors in loaded:
+        try:
+            scaled = scale_mesh(mesh, scale_factors, anchor=anchor)
         except Exception:
             continue
         z_lo = min(z_lo, float(scaled.bounds[0][2]))
         z_hi = max(z_hi, float(scaled.bounds[1][2]))
     if not math.isfinite(z_lo) or not math.isfinite(z_hi):
         return None
-    return calculate_z_levels(z_lo, z_hi, float(layer_height))
+    # Mirroring about the group midplane preserves the group's Z range, so
+    # the shared grid stays valid for the flipped assembly.
+    z_flip_mid = (z_lo + z_hi) / 2.0 if any(r.get("flip_z") for r in records) else None
+    return calculate_z_levels(z_lo, z_hi, float(layer_height)), anchor, z_flip_mid
 
 
 def _slice_record(
@@ -2533,7 +2868,7 @@ def _slice_record(
     layer_height: float,
     scale_mode: str | None,
     progress_callback=None,
-    z_levels: list[float] | None = None,
+    slice_plan: tuple[list[float], tuple[float, float, float], float | None] | None = None,
 ) -> LayerStack:
     stl_path = record["stl_path"]
     mesh = load_mesh(stl_path)
@@ -2545,16 +2880,23 @@ def _slice_record(
         record.get("target_y"),
         record.get("target_z"),
     )
+    # Group members flip together about the group midplane (any member's
+    # Flip Z flips the whole assembly); solo shapes flip about their own.
+    z_flip_mid = slice_plan[2] if slice_plan else None
+    flip_z = (z_flip_mid is not None) if slice_plan else bool(record.get("flip_z", False))
     stack = slice_stl_to_layers(
         stl_path,
         layer_height=float(layer_height),
         progress_callback=progress_callback,
         scale_factors=scale_factors,
         name=str(record.get("name") or Path(stl_path).stem),
-        z_levels=z_levels,
+        z_levels=slice_plan[0] if slice_plan else None,
+        scale_anchor=slice_plan[1] if slice_plan else None,
+        flip_z=flip_z,
+        z_flip_mid=z_flip_mid,
     )
     record["layer_stack"] = stack
-    record["slice_params"] = _slice_params_snapshot(record, layer_height, scale_mode, z_levels)
+    record["slice_params"] = _slice_params_snapshot(record, layer_height, scale_mode, slice_plan)
     return stack
 
 
@@ -2563,22 +2905,27 @@ def _group_z_levels_by_record(
     layer_height: float,
     scale_mode: str | None,
     messages: list[str] | None = None,
-) -> dict[int, list[float]]:
-    """Shared Z grid per multi-material group, keyed by member record id."""
-    z_by_record: dict[int, list[float]] = {}
+) -> dict[int, tuple[list[float], tuple[float, float, float]]]:
+    """Per multi-material group member: (shared Z grid, shared scale anchor),
+    keyed by record id."""
+    plan_by_record: dict[int, tuple[list[float], tuple[float, float, float]]] = {}
     for nozzle, members in sorted(_multi_material_groups(records).items()):
-        z_levels = _multi_material_z_levels(members, layer_height, scale_mode)
-        if z_levels is None:
+        plan = _multi_material_slice_plan(members, layer_height, scale_mode)
+        if plan is None:
             continue
+        z_levels = plan[0]
         for member in members:
-            z_by_record[id(member)] = z_levels
+            plan_by_record[id(member)] = plan
         if messages is not None:
             names = ", ".join(str(m.get("name") or f"Shape {m['idx']}") for m in members)
-            messages.append(
+            note = (
                 f"Multi-material group (nozzle {nozzle}): {names} — sliced on one "
                 f"shared Z grid ({len(z_levels)} layers), positions locked together."
             )
-    return z_by_record
+            if plan[2] is not None:
+                note += " Flip Z is set: the whole assembly prints mirrored top-to-bottom."
+            messages.append(note)
+    return plan_by_record
 
 
 def generate_dynamic_layer_stacks(
@@ -2594,7 +2941,7 @@ def generate_dynamic_layer_stacks(
         return records, "Upload at least one STL first.", None
     total = len(records)
     messages: list[str] = []
-    z_by_record = _group_z_levels_by_record(records, layer_height, scale_mode, messages)
+    plan_by_record = _group_z_levels_by_record(records, layer_height, scale_mode, messages)
     for pos, record in enumerate(records):
         stl_path = record.get("stl_path")
         if not stl_path:
@@ -2609,7 +2956,7 @@ def generate_dynamic_layer_stacks(
 
         try:
             stack = _slice_record(
-                record, layer_height, scale_mode, report_progress, z_by_record.get(id(record))
+                record, layer_height, scale_mode, report_progress, plan_by_record.get(id(record))
             )
             (x_min, y_min, _z_min), (x_max, y_max, _z_max) = stack.bounds
             messages.append(
@@ -2960,18 +3307,18 @@ def _ensure_records_sliced(
     messages: list[str],
 ) -> bool:
     """Re-slice records whose layers are missing or stale for the current settings."""
-    z_by_record = _group_z_levels_by_record(records, layer_height, scale_mode)
+    plan_by_record = _group_z_levels_by_record(records, layer_height, scale_mode)
     resliced = False
     for record in records:
         stl_path = record.get("stl_path")
         if not stl_path:
             continue  # Split pieces carry their clipped layers; nothing to re-slice.
-        z_levels = z_by_record.get(id(record))
-        current = _slice_params_snapshot(record, layer_height, scale_mode, z_levels)
+        slice_plan = plan_by_record.get(id(record))
+        current = _slice_params_snapshot(record, layer_height, scale_mode, slice_plan)
         if record.get("layer_stack") is not None and record.get("slice_params") == current:
             continue
         try:
-            stack = _slice_record(record, layer_height, scale_mode, None, z_levels)
+            stack = _slice_record(record, layer_height, scale_mode, None, slice_plan)
             messages.append(
                 f"Shape {record['idx']}: sliced automatically ({len(stack.layers)} layers)."
             )
@@ -3369,6 +3716,17 @@ def build_dynamic_demo() -> gr.Blocks:
                 elem_id="pp-color-apply",
                 elem_classes=["pp-visually-hidden"],
             )
+            bulk_sink = gr.Textbox(
+                label="bulk sink",
+                container=False,
+                elem_id="pp-bulk-sink",
+                elem_classes=["pp-visually-hidden"],
+            )
+            bulk_apply = gr.Button(
+                "apply bulk",
+                elem_id="pp-bulk-apply",
+                elem_classes=["pp-visually-hidden"],
+            )
             shape_settings = gr.Dataframe(
                 headers=SHAPE_SETTINGS_HEADERS,
                 value=[],
@@ -3619,10 +3977,17 @@ def build_dynamic_demo() -> gr.Blocks:
             outputs=[shape_records, shape_settings],
             queue=False,
         )
+        bulk_apply.click(
+            fn=apply_bulk_bool_selection,
+            inputs=[shape_records, shape_settings, bulk_sink],
+            outputs=[shape_records, shape_settings],
+            queue=False,
+        )
         shape_settings.select(
             fn=delete_shape_from_settings,
             inputs=[shape_records, shape_settings, last_shape_delete_at],
             outputs=[stl_upload, *shape_sync_outputs, last_shape_delete_at],
+            queue=False,
         ).then(
             fn=lambda records: _dropdown_update(records),
             inputs=[shape_records],
@@ -3636,6 +4001,11 @@ def build_dynamic_demo() -> gr.Blocks:
         )
 
         preview_inputs = [shape_records, selected_shape, shape_settings, model_opacity, scale_mode]
+        # .change is the ONLY event the Dataframe emits for cell edits (it has
+        # no working .input) — and it also fires for the normalizer's own
+        # write-back. The infinite/minute-long cascade is prevented inside
+        # normalize_shape_dimensions_for_mode: it skips the table output
+        # whenever no dimension actually changed.
         shape_settings.change(
             fn=normalize_shape_dimensions_for_mode,
             inputs=[shape_records, shape_settings, scale_mode],

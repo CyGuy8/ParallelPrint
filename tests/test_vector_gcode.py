@@ -1619,3 +1619,83 @@ def test_group_contour_paths_exclude_material_interfaces() -> None:
     shell_layer = box(0.0, 0.0, 4.0, 4.0).difference(box(1.0, 1.0, 3.0, 3.0))
     shell = _stack(shell_layer, name="shell")
     assert group_contour_paths(core, [shell], tolerance=0.4) == [[]]
+
+
+def test_scan_coords_keep_a_boundary_line_despite_float_noise() -> None:
+    from vector_toolpath import _scan_coords
+
+    # A split cut can land exactly ON a grid line; the piece above the cut
+    # owns that line (half-open interval), and float noise in the ratio must
+    # not ceil it away. These are the real flag-split numbers.
+    coords = _scan_coords(-15.2, 0.0, 0.8, anchor=-14.4)
+    assert abs(coords[0] - (-15.2)) < 1e-9   # boundary line kept
+    assert abs(coords[-1] - (-0.8)) < 1e-9   # cut line excluded (half-open)
+
+    # Same numbers arriving with adversarial float error.
+    noisy_lo = 0.0 - 19 * 0.8  # -15.200000000000001
+    coords2 = _scan_coords(noisy_lo, 0.0, 0.8, anchor=-14.4)
+    assert abs(coords2[0] - (-15.2)) < 1e-6
+
+
+def test_split_seam_on_a_grid_line_reassembles_at_one_fil_pitch(tmp_path) -> None:
+    # Frame y[-15, 15] with 2 rows puts the cut at y=0 — exactly on a
+    # scanline of the shared grid. The seam line must be printed by exactly
+    # one piece, and the reassembled seam must keep one-fil bead pitch (a
+    # dropped line printed a visible one-pixel gap at every seam).
+    from gcode_viewer import parse_gcode_path
+
+    layer = box(-25.0, -15.0, 25.0, 15.0)
+    stack = _stack(layer, layer, name="flagish")
+    stack = LayerStack(
+        layers=stack.layers,
+        z_values=stack.z_values,
+        bounds=((-25.0, -15.0, 0.0), (25.0, 15.0, 2.0)),
+        layer_height=1.0,
+        name="flagish",
+    )
+    pieces = split_layer_stack_grid(stack, columns=1, rows=2, grid=0.8)
+    reference = build_reference_stack(list(pieces), grid=0.8)
+
+    world_lines: dict[str, list[float]] = {}
+    for piece in pieces:
+        gcode_path = generate_vector_gcode(
+            piece,
+            shape_name=piece.name,
+            pressure=25,
+            valve=7,
+            port=3,
+            fil_width=0.8,
+            layer_height=1.0,
+            motion=reference,
+            output_dir=tmp_path,
+        )
+        parsed = parse_gcode_path(gcode_path.read_text())
+        _ox, oy = parsed["path_origin"]
+        world_lines[piece.name] = sorted(
+            {round(y + oy, 6) for seg in parsed["print_segments"] for _x, y, _z in seg}
+        )
+
+    top = world_lines[pieces[0].name]     # row 1 = top strip
+    bottom = world_lines[pieces[1].name]
+    # The cut line at y=0 belongs to the TOP piece (its material starts there).
+    assert abs(top[0] - 0.0) < 1e-6
+    assert abs(bottom[-1] - (-0.8)) < 1e-6
+    # Seam pitch is exactly one fil; the line is printed exactly once.
+    assert abs((top[0] - bottom[-1]) - 0.8) < 1e-6
+    overlap = set(top) & set(bottom)
+    assert not overlap
+
+
+def test_boundary_grid_line_grazing_from_outside_still_prints() -> None:
+    from vector_toolpath import _axis_raster_segments
+
+    # Real flag-split floats: the grid line computes as -15.200000000000001
+    # while the material's bottom edge is -15.199999999999999 — the line
+    # grazes the material from OUTSIDE by two ulps. The chord probe must
+    # still find the boundary sweep or the assembled seam gets a one-fil gap.
+    material = MultiPolygon([box(-25.0, -15.2, 25.0, 0.0)])
+    segments = _axis_raster_segments(
+        material, material, 0.8, axis="X", scan_anchor=-14.4
+    )
+    print_ys = sorted({y0 for _x0, y0, _x1, _y1, color in segments if color == 255})
+    assert abs(print_ys[0] - (-15.2)) < 1e-6  # boundary sweep printed
