@@ -30,6 +30,7 @@ from vector_toolpath import (
     _normalize_raster_pattern,
     align_stack_to,
     build_contour_layers,
+    circle_wall_radius,
     plan_layer_moves,
 )
 
@@ -211,6 +212,7 @@ def generate_vector_gcode(
     lead_in_lines: int = 3,
     lead_in_direction: str = LEAD_IN_DIRECTION_LEFT,
     lead_in_dispense: bool = True,
+    wall_sources: list[LayerStack] | None = None,
     output_dir: str | Path | None = None,
 ) -> Path:
     """Generate G-code for one sliced shape.
@@ -220,6 +222,11 @@ def generate_vector_gcode(
     follows the shared reference path while the valve opens only inside this
     shape's own geometry, aligned into the reference frame — so parallel
     heads share one motion but each dispenses only its own shape.
+
+    `wall_sources` (all shapes in the job, whole shapes only) matters for
+    the Circle Spiral under shared motion: every shape's own wall radius
+    joins the ONE shared ring set, so each shape keeps a smooth complete
+    outer circle. Pass the SAME list to every shape's generation call.
     """
     if shape is None or not shape.layers:
         raise ValueError("The shape has no sliced layers to generate G-code from.")
@@ -258,6 +265,53 @@ def generate_vector_gcode(
         (frame_x_min, frame_y_min, _fz), (frame_x_max, frame_y_max, _fz2) = frame_stack.bounds
         scan_frame = (frame_x_min, frame_y_min, frame_x_max, frame_y_max)
 
+    # Circle Spiral under shared motion (whole shapes): rings centre on the
+    # reference ALIGN centre (each shape is concentric with it), every
+    # shape's own wall radius joins the shared ring set, and each shape's
+    # dispensing is capped just outside its own wall so grid rings grazing
+    # its boundary stop printing spotty specks / half arcs.
+    extra_wall_radii = None
+    valve_ring_caps = None
+    ring_center = None
+    if (
+        raster_pattern == RASTER_PATTERN_CIRCLE_SPIRAL
+        and motion is not None
+        and motion.scan_frame is None
+        and shape.scan_frame is None
+    ):
+        if motion.align_center is not None:
+            ring_center = motion.align_center
+        else:
+            ring_center = (
+                (scan_frame[0] + scan_frame[2]) / 2.0,
+                (scan_frame[1] + scan_frame[3]) / 2.0,
+            )
+        n_layers = len(motion_layers)
+        valve_ring_caps = [
+            circle_wall_radius(valve_layers[index], ring_center[0], ring_center[1], fil_width)
+            for index in range(n_layers)
+        ]
+        extra_wall_radii = [[] for _ in range(n_layers)]
+        sources = [
+            source
+            for source in (wall_sources or [])
+            if source is not None and source.layers and source.scan_frame is None
+        ]
+        if sources:
+            for source in sources:
+                aligned = align_stack_to(source, motion, n_layers)
+                for index in range(n_layers):
+                    wall = circle_wall_radius(
+                        aligned[index], ring_center[0], ring_center[1], fil_width
+                    )
+                    if wall is not None:
+                        extra_wall_radii[index].append(wall)
+        else:
+            # No source list: at least this shape's own wall.
+            for index, cap in enumerate(valve_ring_caps):
+                if cap is not None:
+                    extra_wall_radii[index].append(cap)
+
     gcode_list, toolpath_origin = plan_layer_moves(
         motion_layers,
         valve_layers,
@@ -269,6 +323,9 @@ def generate_vector_gcode(
         shared_motion=motion is not None,
         scan_frame=scan_frame,
         infill_fraction=max(0.0, min(1.0, float(infill))),
+        extra_wall_radii=extra_wall_radii,
+        valve_ring_caps=valve_ring_caps,
+        ring_center=ring_center,
     )
 
     # World anchor: the toolpath origin expressed in the shape's own frame.

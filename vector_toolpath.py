@@ -685,6 +685,76 @@ def _rectangular_spiral_polyline(
     return _extend_polyline_ends(points, half)
 
 
+def circle_wall_radius(
+    layer: MultiPolygon | None,
+    center_x: float,
+    center_y: float,
+    fil_width: float,
+) -> float | None:
+    """A layer's outermost COMPLETE ring radius about the ring centre.
+
+    Uses the minimum OUTER-boundary distance (holes ignored; the material
+    may sit slightly off the ring centre). When a global grid ring already
+    lies close under the boundary it IS the outer ring (no extra wall — a
+    custom wall a fraction of a bead away would just double-deposit);
+    otherwise the wall sits half a bead inside the closest boundary point.
+    Only meaningful when the material surrounds the centre.
+    """
+    if layer is None or layer.is_empty:
+        return None
+    center = Point(center_x, center_y)
+    for polygon in layer.geoms:
+        if not polygon.covers(center):
+            continue
+        d_min = float(polygon.exterior.distance(center))
+        grid_j = int(math.floor(d_min / fil_width - 0.5 + 1e-9))
+        if grid_j >= 0:
+            grid_ring = (grid_j + 0.5) * fil_width
+            if d_min - grid_ring <= fil_width * 0.75:
+                return grid_ring
+        wall = d_min - fil_width / 2.0
+        return wall if wall > fil_width * 0.25 else None
+    return None
+
+
+def _frame_spiral_bounds(
+    frame: tuple[float, float, float, float],
+    material_bounds: tuple[float, float, float, float],
+    fil_width: float,
+) -> tuple[float, float, float, float]:
+    """Outer bounds for a rectangular spiral, on the FRAME's loop family.
+
+    The spiral's loops live on the family "frame inset by half + k*fil per
+    side" so every layer (and every split sibling) walks the same
+    rectangles and walls stack. Loops that enclose this layer's material
+    with more than half a bead of margin on EVERY side are pure travel:
+    skip them by starting k0 loops in. Returns the frame shrunk by k0*fil
+    per side (still on the family).
+    """
+    frame_left, frame_bottom, frame_right, frame_top = frame
+    mat_left, mat_bottom, mat_right, mat_top = material_bounds
+    half = fil_width / 2.0
+    # Margin between the base loop (frame inset by half) and the material.
+    min_margin = min(
+        mat_left - (frame_left + half),
+        mat_bottom - (frame_bottom + half),
+        (frame_right - half) - mat_right,
+        (frame_top - half) - mat_top,
+    )
+    skip = max(0, int(math.ceil((min_margin - half) / fil_width - 1e-9)))
+    # Never shrink past the material's own footprint.
+    max_skip_x = (frame_right - frame_left - (mat_right - mat_left)) / (2.0 * fil_width)
+    max_skip_y = (frame_top - frame_bottom - (mat_top - mat_bottom)) / (2.0 * fil_width)
+    skip = min(skip, max(0, int(min(max_skip_x, max_skip_y))))
+    inset = skip * fil_width
+    return (
+        frame_left + inset,
+        frame_bottom + inset,
+        frame_right - inset,
+        frame_top - inset,
+    )
+
+
 def _circle_ring_radii(
     motion: MultiPolygon,
     center_x: float,
@@ -1237,6 +1307,9 @@ def plan_layer_moves(
     shared_motion: bool = False,
     scan_frame: tuple[float, float, float, float] | None = None,
     infill_fraction: float = 1.0,
+    extra_wall_radii: list[list[float]] | None = None,
+    valve_ring_caps: list[float | None] | None = None,
+    ring_center: tuple[float, float] | None = None,
 ) -> tuple[list[dict], tuple[float, float]]:
     """Assemble per-layer segments into a relative move list for all patterns.
 
@@ -1277,9 +1350,45 @@ def plan_layer_moves(
             # and rings that never touch this layer's material are skipped
             # instead of swept as full travel circles.
             frame = scan_frame if scan_frame is not None else motion.bounds
-            center_x = (frame[0] + frame[2]) / 2.0
-            center_y = (frame[1] + frame[3]) / 2.0
+            if ring_center is not None:
+                # Shared-motion whole shapes: rings centred where every
+                # shape's centre was ALIGNED to (the reference align
+                # centre), so each shape is concentric with the ring set —
+                # a bbox-union centre can sit off it when shapes differ in
+                # size, making rings graze boundaries.
+                center_x, center_y = ring_center
+            else:
+                center_x = (frame[0] + frame[2]) / 2.0
+                center_y = (frame[1] + frame[3]) / 2.0
             radii, wall_radii = _circle_ring_radii(motion, center_x, center_y, fil_width)
+
+            # Shared-motion parallel printing: every shape's own wall radius
+            # joins the ONE ring set (all heads travel all walls; each
+            # dispenses only on its own), so every shape keeps a smooth,
+            # complete outer circle instead of whatever grid ring happens to
+            # graze its boundary.
+            extra_walls = (
+                extra_wall_radii[layer_number]
+                if extra_wall_radii is not None and layer_number < len(extra_wall_radii)
+                else []
+            )
+            if extra_walls:
+                merged = sorted(set(radii) | set(extra_walls), reverse=True)
+                radii = []
+                for radius in merged:
+                    if radius <= EPS:
+                        continue
+                    if radii and radii[-1] - radius < fil_width * 0.05:
+                        continue  # near-duplicate wall/ring
+                    radii.append(radius)
+                wall_radii = tuple(sorted(set(wall_radii) | set(extra_walls), reverse=True))
+
+            valve_cap = (
+                valve_ring_caps[layer_number]
+                if valve_ring_caps is not None and layer_number < len(valve_ring_caps)
+                else None
+            )
+
             points = _circle_rings_polyline(center_x, center_y, radii, fil_width)
             if layer_number % 2 == 1:
                 points.reverse()
@@ -1294,9 +1403,20 @@ def plan_layer_moves(
                 radius_1 = math.hypot(x1 - center_x, y1 - center_y)
                 if abs(radius_1 - radius_0) > fil_width * 0.25:
                     return False  # radial jump between rings: travel only
+                radius_mid = (radius_0 + radius_1) / 2.0
+                if (
+                    valve_cap is not None
+                    and valve_cap + fil_width * 0.25
+                    < radius_mid
+                    <= valve_cap + fil_width
+                ):
+                    # The thin band just outside this shape's own wall:
+                    # rings there graze its boundary and would print spotty
+                    # specks/half arcs. Rings further out are genuine
+                    # crossings (e.g. a square's corners) and stay.
+                    return False
                 if infill_keep is None:
                     return True
-                radius_mid = (radius_0 + radius_1) / 2.0
                 if any(abs(radius_mid - wall) <= fil_width * 0.25 for wall in wall_radii):
                     return True  # perimeter walls always print, like contours
                 ring = round(radius_mid / fil_width - 0.5)
@@ -1304,16 +1424,24 @@ def plan_layer_moves(
 
             segments = _classify_polyline(points, valve, keep_segment=keep_segment)
         elif raster_pattern == RASTER_PATTERN_RECTANGULAR_SPIRAL:
+            # Anchor the loop family to the FRAME (constant across layers,
+            # shapes, and split pieces), not each layer's own material
+            # bounds: layers with smaller footprints would otherwise spiral
+            # at their own offsets and the walls would not stack. Outer
+            # loops that enclose this layer's material with more than half a
+            # bead to spare are skipped instead of traveled.
+            frame = scan_frame if scan_frame is not None else motion.bounds
+            spiral_bounds = _frame_spiral_bounds(frame, motion.bounds, fil_width)
             points = _rectangular_spiral_polyline(
-                motion.bounds,
+                spiral_bounds,
                 fil_width,
                 reverse=layer_number % 2 == 1,
             )
             keep_point = None
             if infill_keep is not None:
-                # A spiral "line" is one ring: ring k sits k*fil inside the
-                # half-fil-inset bounding box the spiral walks.
-                min_x, min_y, max_x, max_y = motion.bounds
+                # A spiral "line" is one ring; index rings from the FRAME's
+                # base loop so the selection lines up across layers.
+                min_x, min_y, max_x, max_y = frame
                 half = fil_width / 2.0
                 left, right = min_x + half, max_x - half
                 bottom, top = min_y + half, max_y - half
@@ -1528,10 +1656,12 @@ def _centering_delta(stack: LayerStack, reference: LayerStack) -> tuple[float, f
     else:
         reference_x, reference_y = _stack_center(reference)
     center_x, center_y = _alignment_center(stack)
-    return (
-        _snap_to_grid(reference_x - center_x, grid),
-        _snap_to_grid(reference_y - center_y, grid),
-    )
+    # No grid snap here: whole shapes centre EXACTLY on the align centre
+    # (circle-spiral rings are centred there, and a snapped residue of up
+    # to half a fil would make rings graze the shape's boundary). The snap
+    # only ever mattered for split pieces, which take the scan-frame corner
+    # rule above.
+    return (reference_x - center_x, reference_y - center_y)
 
 
 def align_stack_to(

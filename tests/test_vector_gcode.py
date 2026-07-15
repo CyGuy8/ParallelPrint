@@ -1699,3 +1699,146 @@ def test_boundary_grid_line_grazing_from_outside_still_prints() -> None:
     )
     print_ys = sorted({y0 for _x0, y0, _x1, _y1, color in segments if color == 255})
     assert abs(print_ys[0] - (-15.2)) < 1e-6  # boundary sweep printed
+
+
+def test_rectangular_spiral_layers_share_one_loop_family(tmp_path) -> None:
+    from gcode_viewer import parse_gcode_path
+
+    # Layers with different footprints must walk the SAME frame-anchored
+    # rectangles — a smaller layer used to spiral at its own inset, leaving
+    # its walls visibly out of line with the rest of the print.
+    big = box(0.0, 0.0, 20.0, 20.0)
+    small = box(5.0, 5.0, 15.0, 15.0)
+    gcode_path = generate_vector_gcode(
+        _stack(big, small),
+        shape_name="loop_family",
+        pressure=25,
+        valve=7,
+        port=3,
+        fil_width=0.8,
+        layer_height=1.0,
+        raster_pattern=RASTER_PATTERN_RECTANGULAR_SPIRAL,
+        output_dir=tmp_path,
+    )
+    parsed = parse_gcode_path(gcode_path.read_text())
+    origin_x, origin_y = parsed["path_origin"]
+
+    # Loop side lines = x positions of VERTICAL runs (valve-split points
+    # and the start stub sit mid-edge and are not loop lines).
+    per_layer_xs: dict[int, set] = {}
+    for kind in ("print_segments", "travel_segments"):
+        for segment in parsed[kind]:
+            for a, b in zip(segment, segment[1:]):
+                if abs(a[0] - b[0]) < 1e-9 and abs(a[1] - b[1]) > 1e-6:
+                    per_layer_xs.setdefault(int(round(a[2])), set()).add(
+                        round(a[0] + origin_x, 3)
+                    )
+    layer0 = per_layer_xs[0]
+    stray = {x for x in per_layer_xs[1] if x not in layer0}
+    assert not stray, stray
+
+
+def test_circle_spiral_interior_is_stepped_rings(tmp_path) -> None:
+    from gcode_viewer import parse_gcode_path
+
+    # The fill is concentric CONSTANT-RADIUS rings (wall at the material
+    # edge, interior rings on the global grid) stepping inward by one fil
+    # per revolution - not a continuously decreasing spiral.
+    disc = Point(5.0, 5.0).buffer(5.0, quad_segs=64)
+    gcode_path = generate_vector_gcode(
+        _stack(disc, disc),
+        shape_name="stepped",
+        pressure=25,
+        valve=7,
+        port=3,
+        fil_width=0.8,
+        layer_height=1.0,
+        raster_pattern=RASTER_PATTERN_CIRCLE_SPIRAL,
+        output_dir=tmp_path,
+    )
+    parsed = parse_gcode_path(gcode_path.read_text())
+    origin_x, origin_y = parsed["path_origin"]
+
+    radii = sorted({
+        round(math.hypot(x + origin_x - 5.0, y + origin_y - 5.0), 1)
+        for seg in parsed["print_segments"]
+        for x, y, z in seg
+        if abs(z) < 0.5
+    })
+    # A handful of discrete radii: the wall (4.6) plus grid rings.
+    assert len(radii) <= 8, radii
+    assert abs(radii[-1] - (5.0 - 0.4)) < 0.05  # wall hugs the material edge
+    for radius in radii[:-1]:
+        ring = radius / 0.8 - 0.5
+        assert abs(ring - round(ring)) < 0.15  # interior rings on the grid
+
+
+def test_parallel_circle_keeps_a_complete_outer_ring(tmp_path) -> None:
+    from gcode_viewer import parse_gcode_path
+
+    # Under shared reference motion the ring set used to come from the
+    # UNION only: the grid ring nearest a circle's boundary grazed it and
+    # printed spotty specks (dimensions on the grid) or a half circle
+    # (off-grid dimensions). Every shape's own wall now joins the shared
+    # ring set and grazing rings are suppressed per shape.
+    for diameter in (20.0, 20.5):
+        disc_layer = Point(diameter / 2.0, diameter / 2.0).buffer(diameter / 2.0, quad_segs=64)
+        square_layer = box(0.0, 0.0, 20.0, 20.0)
+        disc = _stack(disc_layer, name=f"disc{int(diameter * 10)}")
+        square = _stack(square_layer, name=f"square{int(diameter * 10)}")
+        reference = build_reference_stack([disc, square], grid=0.8)
+        wall_sources = [disc, square]
+
+        lengths = []
+        for stack in (disc, square):
+            gcode_path = generate_vector_gcode(
+                stack,
+                shape_name=stack.name + "_p",
+                pressure=25,
+                valve=7,
+                port=3,
+                fil_width=0.8,
+                layer_height=1.0,
+                raster_pattern=RASTER_PATTERN_CIRCLE_SPIRAL,
+                motion=reference,
+                wall_sources=wall_sources,
+                output_dir=tmp_path,
+            )
+            parsed = parse_gcode_path(gcode_path.read_text())
+            lengths.append(
+                round(
+                    sum(
+                        math.dist(a[:2], b[:2])
+                        for kind in ("print_segments", "travel_segments")
+                        for seg in parsed[kind]
+                        for a, b in zip(seg, seg[1:])
+                    ),
+                    6,
+                )
+            )
+            if stack is not disc:
+                continue
+            origin_x, origin_y = parsed["path_origin"]
+            center = diameter / 2.0
+            per_ring: dict[float, dict[str, float]] = {}
+            for kind, key in (("print_segments", "p"), ("travel_segments", "t")):
+                for seg in parsed[kind]:
+                    for a, b in zip(seg, seg[1:]):
+                        radius = round(
+                            math.hypot(
+                                (a[0] + b[0]) / 2 + origin_x - center,
+                                (a[1] + b[1]) / 2 + origin_y - center,
+                            ),
+                            1,
+                        )
+                        per_ring.setdefault(radius, {"p": 0.0, "t": 0.0})[key] += math.dist(a[:2], b[:2])
+            printed = [r for r, v in per_ring.items() if v["p"] > 1.0]
+            outer = max(printed)
+            v = per_ring[outer]
+            # The disc's outermost ring is COMPLETE (no spotty/half arcs).
+            assert v["p"] / (v["p"] + v["t"]) > 0.98, (diameter, outer, v)
+            # And it hugs the boundary (within one bead of the radius).
+            assert diameter / 2.0 - outer < 0.8, (diameter, outer)
+        # Parallel sync: same path length (tolerance = 6-decimal G-code
+        # rounding; moves split at different valve boundaries per shape).
+        assert abs(lengths[0] - lengths[1]) < 1e-3, lengths

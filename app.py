@@ -50,7 +50,11 @@ from vector_toolpath import (
 )
 
 
-SAMPLE_STL_FILENAMES = ("Hollow_Pyramid.stl", "Rounded_Cube_Through_Holes.stl", "halfsphere.stl")
+SAMPLE_STL_SETS = {
+    "Standard Shapes": ("Hollow_Pyramid.stl", "Rounded_Cube_Through_Holes.stl", "halfsphere.stl"),
+    "Simple Shapes": ("Simple_Circle.stl", "Simple_Square.stl", "Simple_Triangle.stl"),
+}
+DEFAULT_SAMPLE_STL_SET = "Standard Shapes"
 SAMPLE_STL_DIR = Path(__file__).resolve().parent / "sample_stls"
 DEFAULT_TARGET_EXTENTS = (20.0, 20.0, 20.0)
 DELETE_SHAPE_COOLDOWN_SECONDS = 1.0
@@ -2291,9 +2295,13 @@ def load_sample_shapes(
     files: Any,
     records: list[dict] | None,
     settings_table: Any | None = None,
+    sample_set: str | None = None,
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
-    paths = [str(SAMPLE_STL_DIR / filename) for filename in SAMPLE_STL_FILENAMES if (SAMPLE_STL_DIR / filename).exists()]
+    filenames = SAMPLE_STL_SETS.get(
+        str(sample_set or ""), SAMPLE_STL_SETS[DEFAULT_SAMPLE_STL_SET]
+    )
+    paths = [str(SAMPLE_STL_DIR / filename) for filename in filenames if (SAMPLE_STL_DIR / filename).exists()]
     merged_paths = _append_file_paths(files, paths)
     return (
         gr.update(value=merged_paths),
@@ -3389,6 +3397,15 @@ def generate_dynamic_gcode(
     if contour_sources:
         enabled = ", ".join(f"Shape {source.owner_idx}" for source in contour_sources)
         messages.append(f"Contour tracing enabled for {enabled}.")
+    # Circle Spiral under shared motion: every shape's own wall radius joins
+    # the one shared ring set (same list for every shape, so motion stays in
+    # sync). Split pieces carry a scan frame and are excluded.
+    wall_sources = [
+        record["layer_stack"]
+        for record in records
+        if record.get("layer_stack") is not None
+        and getattr(record["layer_stack"], "scan_frame", None) is None
+    ]
     # Lead-in is driven entirely by the per-shape "Lead In" column: the
     # purge motion exists whenever any shape dispenses it (all heads must
     # share the motion), and each shape's own flag gates its valve.
@@ -3433,6 +3450,7 @@ def generate_dynamic_gcode(
                 lead_in_lines=max(1, _coerce_int(lead_in_lines, 3)),
                 lead_in_direction=lead_in_direction or LEAD_IN_DIRECTION_LEFT,
                 lead_in_dispense=bool(record.get("lead_in", True)),
+                wall_sources=wall_sources if use_reference_motion else None,
             )
             record["gcode_path"] = str(gcode_path)
             messages.append(f"Shape {record['idx']}: wrote `{gcode_path.name}`.")
@@ -3694,6 +3712,12 @@ def build_dynamic_demo() -> gr.Blocks:
                 )
                 with gr.Column(scale=0, min_width=200):
                     load_samples_button = gr.Button("Load Sample STLs", variant="secondary", size="sm", elem_id="load-sample-stls-button")
+                    sample_set_selector = gr.Dropdown(
+                        choices=list(SAMPLE_STL_SETS),
+                        value=DEFAULT_SAMPLE_STL_SET,
+                        label="Sample Set",
+                        container=False,
+                    )
                     sync_uploads_button = gr.Button("Sync Uploaded STLs", variant="secondary", size="sm")
                     reset_dimensions_button = gr.Button("Reset Dimensions", variant="secondary", size="sm")
                     model_opacity = gr.Checkbox(label="Use 75% 3D Model Opacity", value=False)
@@ -3825,8 +3849,8 @@ def build_dynamic_demo() -> gr.Blocks:
                         )
                         nozzle_grid_columns = gr.Number(label="Grid Columns", value=2, minimum=1, step=1)
                         nozzle_grid_rows = gr.Number(label="Grid Rows", value=2, minimum=1, step=1)
-                        nozzle_grid_column_spacing = gr.Number(label="Column Gap (X, mm)", value=0.0, step=0.1)
-                        nozzle_grid_row_spacing = gr.Number(label="Row Gap (Y, mm)", value=0.0, step=0.1)
+                        nozzle_grid_column_spacing = gr.Number(label="Column Gap (X, mm)", value=5.0, step=0.1)
+                        nozzle_grid_row_spacing = gr.Number(label="Row Gap (Y, mm)", value=5.0, step=0.1)
                     with gr.Row():
                         auto_align_split_parts_button = gr.Button("Auto Align Split Parts", variant="secondary", size="sm")
                         nozzle_grid_use_individual_spacing = gr.Checkbox(label="Advanced Grid Spacing", value=False)
@@ -3960,7 +3984,7 @@ def build_dynamic_demo() -> gr.Blocks:
             outputs=[nozzle_grid_spacing_table],
             queue=False,
         )
-        load_samples_button.click(fn=load_sample_shapes, inputs=[stl_upload, shape_records, shape_settings], outputs=[stl_upload, *shape_sync_outputs]).then(
+        load_samples_button.click(fn=load_sample_shapes, inputs=[stl_upload, shape_records, shape_settings, sample_set_selector], outputs=[stl_upload, *shape_sync_outputs]).then(
             fn=lambda records: _dropdown_update(records),
             inputs=[shape_records],
             outputs=[split_source],

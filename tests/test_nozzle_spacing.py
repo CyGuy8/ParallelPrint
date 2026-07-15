@@ -1093,3 +1093,24 @@ def test_apply_bulk_bool_selection_sets_a_whole_column() -> None:
     color_pos = SHAPE_SETTINGS_HEADERS.index("Color")
     refused, _rows4 = apply_bulk_bool_selection(cleared, rows2, f"{color_pos}|1")
     assert refused[0].get("color") == cleared[0].get("color")
+
+
+def test_load_sample_shapes_respects_the_selected_set() -> None:
+    from app import DEFAULT_SAMPLE_STL_SET, SAMPLE_STL_SETS, load_sample_shapes
+
+    simple = load_sample_shapes(None, [], None, "Simple Shapes")
+    assert [record["name"] for record in simple[1]] == [
+        "Simple_Circle", "Simple_Square", "Simple_Triangle",
+    ]
+
+    standard = load_sample_shapes(None, [], None, "Standard Shapes")
+    assert [record["name"] for record in standard[1]] == [
+        "Hollow_Pyramid", "Rounded_Cube_Through_Holes", "halfsphere",
+    ]
+
+    # Unknown/empty selection falls back to the default set.
+    fallback = load_sample_shapes(None, [], None, None)
+    assert [record["name"] for record in fallback[1]] == [
+        "Hollow_Pyramid", "Rounded_Cube_Through_Holes", "halfsphere",
+    ]
+    assert DEFAULT_SAMPLE_STL_SET in SAMPLE_STL_SETS
