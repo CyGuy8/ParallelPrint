@@ -163,6 +163,7 @@ def test_slanted_shape_gcode_round_trips_through_the_viewer(tmp_path) -> None:
         port=3,
         fil_width=0.8,
         layer_height=1.0,
+        origin_sink=(origin_sink := {}),
         output_dir=tmp_path,
     )
 
@@ -183,6 +184,7 @@ def test_gcode_header_writes_presets_before_initial_aux_commands(tmp_path) -> No
         valve=7,
         port=3,
         fil_width=1.0,
+        origin_sink=(origin_sink := {}),
         output_dir=tmp_path,
     )
 
@@ -193,13 +195,14 @@ def test_gcode_header_writes_presets_before_initial_aux_commands(tmp_path) -> No
     ]
 
     assert lines[0] == "G91"
-    # World anchor of the relative toolpath (origin at sweep start (-1, 0.5)).
-    assert lines[1] == "; PathOrigin X-1.0 Y0.5"
-    assert lines[2] == "{aux_command}WAGO_ValveCommands(7, 0)"
-    assert lines[3] == "serialPort3.write(eval(setpress(25)))"
-    assert lines[4] == "serialPort3.write(eval(togglepress()))"
+    # No metadata comments: the file starts straight with machine commands
+    # (the toolpath's world anchor is returned via origin_sink instead).
+    assert not any("PathOrigin" in line for line in lines)
+    assert lines[1] == "{aux_command}WAGO_ValveCommands(7, 0)"
+    assert lines[2] == "serialPort3.write(eval(setpress(25)))"
+    assert lines[3] == "serialPort3.write(eval(togglepress()))"
+    assert lines[4].startswith("{aux_command}WAGO_ValveCommands(")
     assert lines[5].startswith("{aux_command}WAGO_ValveCommands(")
-    assert lines[6].startswith("{aux_command}WAGO_ValveCommands(")
 
 
 def test_gcode_lead_in_runs_once_before_first_layer(tmp_path) -> None:
@@ -215,6 +218,7 @@ def test_gcode_lead_in_runs_once_before_first_layer(tmp_path) -> None:
         lead_in_length=3.0,
         lead_in_clearance=4.0,
         lead_in_lines=3,
+        origin_sink=(origin_sink := {}),
         output_dir=tmp_path,
     )
 
@@ -259,6 +263,7 @@ def test_gcode_lead_in_direction_points_the_purge_patch(tmp_path) -> None:
         lead_in_clearance=4.0,
         lead_in_lines=2,
         lead_in_direction=LEAD_IN_DIRECTION_UP,
+        origin_sink=(origin_sink := {}),
         output_dir=tmp_path,
     )
 
@@ -388,6 +393,7 @@ def test_gcode_uses_g1_for_print_and_g0_for_travel(tmp_path) -> None:
         valve=7,
         port=3,
         fil_width=1.0,
+        origin_sink=(origin_sink := {}),
         output_dir=tmp_path,
     )
 
@@ -412,6 +418,7 @@ def test_woodpile_raster_switches_print_axis_between_layers(tmp_path) -> None:
         port=3,
         fil_width=1.0,
         raster_pattern=RASTER_PATTERN_WOODPILE,
+        origin_sink=(origin_sink := {}),
         output_dir=tmp_path,
     )
 
@@ -487,6 +494,7 @@ def test_y_direction_raster_prints_each_layer_along_y_axis(tmp_path) -> None:
         port=3,
         fil_width=1.0,
         raster_pattern=RASTER_PATTERN_Y_DIRECTION,
+        origin_sink=(origin_sink := {}),
         output_dir=tmp_path,
     )
 
@@ -541,6 +549,7 @@ def test_diagonal_woodpile_rotates_45_degrees_per_layer(tmp_path) -> None:
         fil_width=1.0,
         layer_height=1.0,
         raster_pattern=RASTER_PATTERN_DIAGONAL_WOODPILE,
+        origin_sink=(origin_sink := {}),
         output_dir=tmp_path,
     )
 
@@ -610,6 +619,7 @@ def test_raster_crosses_interior_holes_with_valve_off(tmp_path) -> None:
         valve=7,
         port=3,
         fil_width=1.0,
+        origin_sink=(origin_sink := {}),
         output_dir=tmp_path,
     )
 
@@ -646,6 +656,7 @@ def test_rectangular_spiral_raster_reverses_between_layers(tmp_path) -> None:
         fil_width=1.0,
         layer_height=1.0,
         raster_pattern=RASTER_PATTERN_RECTANGULAR_SPIRAL,
+        origin_sink=(origin_sink := {}),
         output_dir=tmp_path,
     )
 
@@ -734,11 +745,12 @@ def test_circle_spiral_dome_has_no_travel_rings_and_monotone_radii(tmp_path) -> 
         fil_width=0.8,
         layer_height=1.0,
         raster_pattern=RASTER_PATTERN_CIRCLE_SPIRAL,
+        origin_sink=(origin_sink := {}),
         output_dir=tmp_path,
     )
 
     parsed = parse_gcode_path(gcode_path.read_text())
-    origin_x, origin_y = parsed["path_origin"]
+    origin_x, origin_y = origin_sink["path_origin"]
 
     def layer_of(z: float) -> int:
         return max(0, min(len(layer_radii) - 1, int(round(z))))
@@ -777,11 +789,12 @@ def test_circle_spiral_ring_steps_travel_with_valve_shut(tmp_path) -> None:
         fil_width=0.8,
         layer_height=1.0,
         raster_pattern=RASTER_PATTERN_CIRCLE_SPIRAL,
+        origin_sink=(origin_sink := {}),
         output_dir=tmp_path,
     )
 
     parsed = parse_gcode_path(gcode_path.read_text())
-    origin_x, origin_y = parsed["path_origin"]
+    origin_x, origin_y = origin_sink["path_origin"]
     center_x = center_y = 5.0
 
     # Print moves stay on a constant-radius ring (within chord flattening);
@@ -807,6 +820,7 @@ def test_circle_spiral_raster_reverses_between_layers(tmp_path) -> None:
         fil_width=1.0,
         layer_height=1.0,
         raster_pattern=RASTER_PATTERN_CIRCLE_SPIRAL,
+        origin_sink=(origin_sink := {}),
         output_dir=tmp_path,
     )
 
@@ -958,6 +972,7 @@ def test_contour_tracing_travels_to_nearest_border_after_infill(tmp_path) -> Non
         all_g1=True,
         contour_sources=[ContourSource(owner_idx=1, stack=stack)],
         active_contour_owner=1,
+        origin_sink=(origin_sink := {}),
         output_dir=tmp_path,
     )
 
@@ -986,6 +1001,7 @@ def test_contour_tracing_closes_loop_and_restores_raster_endpoint(tmp_path) -> N
         all_g1=True,
         contour_sources=[ContourSource(owner_idx=1, stack=stack)],
         active_contour_owner=1,
+        origin_sink=(origin_sink := {}),
         output_dir=tmp_path,
     )
 
@@ -1236,6 +1252,7 @@ def test_solo_contours_still_trace_only_own_shape(tmp_path) -> None:
         fil_width=1.0,
         contour_sources=contour_sources,
         active_contour_owner=1,
+        origin_sink=(origin_sink := {}),
         output_dir=tmp_path,
     )
 
@@ -1501,12 +1518,10 @@ def test_group_frame_reference_keeps_modeled_positions(tmp_path) -> None:
     # Layer 0 = lower box (0..4) union solo centered to (3..7): 16+16-4 overlap.
     assert abs(reference.layers[0].area - 28.0) < 1e-6
 
-    def _world_motion_polyline(text: str) -> list[tuple[float, float, float]]:
+    def _world_motion_polyline(text: str, origin: tuple[float, float]) -> list[tuple[float, float, float]]:
         # Ordered nozzle path in world coordinates, simplified so points that
         # only mark valve changes (collinear, same direction) drop out.
-        origin_line = next(line for line in text.splitlines() if "PathOrigin" in line)
-        tokens = origin_line.split()
-        origin_x, origin_y = float(tokens[-2][1:]), float(tokens[-1][1:])
+        origin_x, origin_y = origin
         moves = _moves_with_colors(text)
         points = [moves[0]["start"]] + [move["end"] for move in moves]
         world = [(x + origin_x, y + origin_y, z) for x, y, z in points]
@@ -1543,16 +1558,17 @@ def test_group_frame_reference_keeps_modeled_positions(tmp_path) -> None:
             fil_width=1.0,
             layer_height=1.0,
             motion=reference,
+            origin_sink=(origin_sink := {}),
             output_dir=tmp_path,
         )
         text = gcode_path.read_text()
         parsed = parse_gcode_path(text)
-        origin_x, origin_y = parsed["path_origin"]
+        origin_x, origin_y = origin_sink["path_origin"]
         prints[stack.name] = [
             [(x + origin_x, y + origin_y, z) for x, y, z in segment]
             for segment in parsed["print_segments"]
         ]
-        motions[stack.name] = _world_motion_polyline(text)
+        motions[stack.name] = _world_motion_polyline(text, origin_sink["path_origin"])
 
     # Shared motion: both heads trace exactly the same world path.
     assert motions["lower"] == motions["upper"]
@@ -1667,10 +1683,11 @@ def test_split_seam_on_a_grid_line_reassembles_at_one_fil_pitch(tmp_path) -> Non
             fil_width=0.8,
             layer_height=1.0,
             motion=reference,
+            origin_sink=(origin_sink := {}),
             output_dir=tmp_path,
         )
         parsed = parse_gcode_path(gcode_path.read_text())
-        _ox, oy = parsed["path_origin"]
+        _ox, oy = origin_sink["path_origin"]
         world_lines[piece.name] = sorted(
             {round(y + oy, 6) for seg in parsed["print_segments"] for _x, y, _z in seg}
         )
@@ -1718,10 +1735,11 @@ def test_rectangular_spiral_layers_share_one_loop_family(tmp_path) -> None:
         fil_width=0.8,
         layer_height=1.0,
         raster_pattern=RASTER_PATTERN_RECTANGULAR_SPIRAL,
+        origin_sink=(origin_sink := {}),
         output_dir=tmp_path,
     )
     parsed = parse_gcode_path(gcode_path.read_text())
-    origin_x, origin_y = parsed["path_origin"]
+    origin_x, origin_y = origin_sink["path_origin"]
 
     # Loop side lines = x positions of VERTICAL runs (valve-split points
     # and the start stub sit mid-edge and are not loop lines).
@@ -1754,10 +1772,11 @@ def test_circle_spiral_interior_is_stepped_rings(tmp_path) -> None:
         fil_width=0.8,
         layer_height=1.0,
         raster_pattern=RASTER_PATTERN_CIRCLE_SPIRAL,
+        origin_sink=(origin_sink := {}),
         output_dir=tmp_path,
     )
     parsed = parse_gcode_path(gcode_path.read_text())
-    origin_x, origin_y = parsed["path_origin"]
+    origin_x, origin_y = origin_sink["path_origin"]
 
     radii = sorted({
         round(math.hypot(x + origin_x - 5.0, y + origin_y - 5.0), 1)
@@ -1802,6 +1821,7 @@ def test_parallel_circle_keeps_a_complete_outer_ring(tmp_path) -> None:
                 raster_pattern=RASTER_PATTERN_CIRCLE_SPIRAL,
                 motion=reference,
                 wall_sources=wall_sources,
+                origin_sink=(origin_sink := {}),
                 output_dir=tmp_path,
             )
             parsed = parse_gcode_path(gcode_path.read_text())
@@ -1818,7 +1838,7 @@ def test_parallel_circle_keeps_a_complete_outer_ring(tmp_path) -> None:
             )
             if stack is not disc:
                 continue
-            origin_x, origin_y = parsed["path_origin"]
+            origin_x, origin_y = origin_sink["path_origin"]
             center = diameter / 2.0
             per_ring: dict[float, dict[str, float]] = {}
             for kind, key in (("print_segments", "p"), ("travel_segments", "t")):
@@ -1837,8 +1857,62 @@ def test_parallel_circle_keeps_a_complete_outer_ring(tmp_path) -> None:
             v = per_ring[outer]
             # The disc's outermost ring is COMPLETE (no spotty/half arcs).
             assert v["p"] / (v["p"] + v["t"]) > 0.98, (diameter, outer, v)
-            # And it hugs the boundary (within one bead of the radius).
-            assert diameter / 2.0 - outer < 0.8, (diameter, outer)
+            # It sits within one bead-and-a-bit of the radius (always the
+            # outermost GRID ring inside the material, so spacing stays
+            # uniform - no "too close" pairs, no skipped lines).
+            assert diameter / 2.0 - outer <= 0.8 + 1e-6, (diameter, outer)
+            spacings = {
+                round(a - b, 3)
+                for a, b in zip(sorted(printed, reverse=True), sorted(printed, reverse=True)[1:])
+            }
+            assert spacings <= {0.8}, (diameter, spacings)
         # Parallel sync: same path length (tolerance = 6-decimal G-code
         # rounding; moves split at different valve boundaries per shape).
         assert abs(lengths[0] - lengths[1]) < 1e-3, lengths
+
+
+def test_parallel_circle_spiral_fills_square_corners(tmp_path) -> None:
+    from shapely.geometry import LineString
+    from shapely.ops import unary_union
+
+    from gcode_viewer import parse_gcode_path
+
+    # Regression: the graze-suppression used to silence the ring just above
+    # a shape's inscribed radius — for squares/triangles that ring carries
+    # REAL corner fill, leaving crescent voids in the middle of the shape.
+    square_layer = box(0.0, 0.0, 20.0, 20.0)
+    disc_layer = Point(10.0, 10.0).buffer(10.0, quad_segs=64)
+    square = _stack(square_layer, name="sq_void")
+    disc = _stack(disc_layer, name="disc_void")
+    reference = build_reference_stack([square, disc], grid=0.8)
+
+    sink: dict = {}
+    gcode_path = generate_vector_gcode(
+        square,
+        shape_name="sq_void_p",
+        pressure=25,
+        valve=7,
+        port=3,
+        fil_width=0.8,
+        layer_height=1.0,
+        raster_pattern=RASTER_PATTERN_CIRCLE_SPIRAL,
+        motion=reference,
+        wall_sources=[square, disc],
+        origin_sink=sink,
+        output_dir=tmp_path,
+    )
+    parsed = parse_gcode_path(gcode_path.read_text())
+    origin_x, origin_y = sink["path_origin"]
+
+    lines = [
+        LineString([(x + origin_x, y + origin_y) for x, y, _z in seg])
+        for seg in parsed["print_segments"]
+        if len(seg) >= 2
+    ]
+    covered = unary_union([line.buffer(0.4, cap_style=2) for line in lines])
+    uncovered = square_layer.difference(covered)
+    pockets = list(getattr(uncovered, "geoms", [uncovered]))
+    biggest = max((pocket.area for pocket in pockets), default=0.0)
+    # No crescent voids: every uncovered pocket is a sub-bead sliver.
+    assert biggest < 1.5, biggest
+    assert uncovered.area / square_layer.area < 0.05

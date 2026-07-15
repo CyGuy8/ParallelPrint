@@ -685,6 +685,33 @@ def _rectangular_spiral_polyline(
     return _extend_polyline_ends(points, half)
 
 
+def _drop_short_print_runs(segments: list[Seg], min_length: float) -> list[Seg]:
+    """Close the valve over isolated dispensing runs shorter than min_length.
+
+    Motion is untouched — only the color flips to travel, so shared-motion
+    parallel heads stay in sync. Used against boundary-grazing flicker,
+    which no valve can deposit cleanly anyway.
+    """
+    result = list(segments)
+    index = 0
+    while index < len(result):
+        if result[index][4] != 255:
+            index += 1
+            continue
+        end = index
+        run_length = 0.0
+        while end < len(result) and result[end][4] == 255:
+            x0, y0, x1, y1, _color = result[end]
+            run_length += math.hypot(x1 - x0, y1 - y0)
+            end += 1
+        if run_length < min_length:
+            for position in range(index, end):
+                x0, y0, x1, y1, _color = result[position]
+                result[position] = (x0, y0, x1, y1, 0)
+        index = end
+    return result
+
+
 def circle_wall_radius(
     layer: MultiPolygon | None,
     center_x: float,
@@ -709,9 +736,13 @@ def circle_wall_radius(
         d_min = float(polygon.exterior.distance(center))
         grid_j = int(math.floor(d_min / fil_width - 0.5 + 1e-9))
         if grid_j >= 0:
-            grid_ring = (grid_j + 0.5) * fil_width
-            if d_min - grid_ring <= fil_width * 0.75:
-                return grid_ring
+            # ALWAYS the outermost grid ring that fits: an off-grid
+            # edge-hugging wall would land within half a bead of the grid
+            # ring below it (visibly "too close"), and suppressing that
+            # ring instead leaves a visibly skipped line. Staying on the
+            # grid keeps ring spacing uniform; the rim sits at most half a
+            # bead further in at unlucky dimensions.
+            return (grid_j + 0.5) * fil_width
         wall = d_min - fil_width / 2.0
         return wall if wall > fil_width * 0.25 else None
     return None
@@ -1308,7 +1339,6 @@ def plan_layer_moves(
     scan_frame: tuple[float, float, float, float] | None = None,
     infill_fraction: float = 1.0,
     extra_wall_radii: list[list[float]] | None = None,
-    valve_ring_caps: list[float | None] | None = None,
     ring_center: tuple[float, float] | None = None,
 ) -> tuple[list[dict], tuple[float, float]]:
     """Assemble per-layer segments into a relative move list for all patterns.
@@ -1383,12 +1413,6 @@ def plan_layer_moves(
                     radii.append(radius)
                 wall_radii = tuple(sorted(set(wall_radii) | set(extra_walls), reverse=True))
 
-            valve_cap = (
-                valve_ring_caps[layer_number]
-                if valve_ring_caps is not None and layer_number < len(valve_ring_caps)
-                else None
-            )
-
             points = _circle_rings_polyline(center_x, center_y, radii, fil_width)
             if layer_number % 2 == 1:
                 points.reverse()
@@ -1404,17 +1428,6 @@ def plan_layer_moves(
                 if abs(radius_1 - radius_0) > fil_width * 0.25:
                     return False  # radial jump between rings: travel only
                 radius_mid = (radius_0 + radius_1) / 2.0
-                if (
-                    valve_cap is not None
-                    and valve_cap + fil_width * 0.25
-                    < radius_mid
-                    <= valve_cap + fil_width
-                ):
-                    # The thin band just outside this shape's own wall:
-                    # rings there graze its boundary and would print spotty
-                    # specks/half arcs. Rings further out are genuine
-                    # crossings (e.g. a square's corners) and stay.
-                    return False
                 if infill_keep is None:
                     return True
                 if any(abs(radius_mid - wall) <= fil_width * 0.25 for wall in wall_radii):
@@ -1423,6 +1436,12 @@ def plan_layer_moves(
                 return infill_keep(max(0, int(ring)))
 
             segments = _classify_polyline(points, valve, keep_segment=keep_segment)
+            # A ring grazing a faceted boundary flickers in/out of material,
+            # printing sub-bead dashes (the spotty outer ring); real fill
+            # arcs — a square's corner fill, a triangle's lobes — are far
+            # longer and must stay. Close the valve over runs too short to
+            # deposit cleanly; the motion is untouched.
+            segments = _drop_short_print_runs(segments, fil_width * 1.5)
         elif raster_pattern == RASTER_PATTERN_RECTANGULAR_SPIRAL:
             # Anchor the loop family to the FRAME (constant across layers,
             # shapes, and split pieces), not each layer's own material

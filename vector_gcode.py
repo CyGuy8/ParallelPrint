@@ -115,7 +115,6 @@ def write_gcode_file(
     increase_pressure_per_layer: float,
     pressure_ramp_enabled: bool,
     all_g1: bool,
-    path_origin: tuple[float, float] | None = None,
 ) -> None:
     off_color = 0
     com_port = f"serialPort{port}"
@@ -129,13 +128,6 @@ def write_gcode_file(
 
     with open(gcode_path, "w") as f:
         f.write("G91\n")
-        if path_origin is not None:
-            # World anchor of the relative toolpath: absolute position (in the
-            # shape's own coordinate frame) of the point the moves start from.
-            # Lets tools place parallel parts so split pieces reassemble.
-            f.write(
-                f"; PathOrigin X{_coord(path_origin[0])} Y{_coord(path_origin[1])}\n"
-            )
         f.write(_valve_cmd(valve, 0))
         for line in setpress_lines:
             f.write(f"{line}\n")
@@ -213,6 +205,7 @@ def generate_vector_gcode(
     lead_in_direction: str = LEAD_IN_DIRECTION_LEFT,
     lead_in_dispense: bool = True,
     wall_sources: list[LayerStack] | None = None,
+    origin_sink: dict | None = None,
     output_dir: str | Path | None = None,
 ) -> Path:
     """Generate G-code for one sliced shape.
@@ -266,12 +259,10 @@ def generate_vector_gcode(
         scan_frame = (frame_x_min, frame_y_min, frame_x_max, frame_y_max)
 
     # Circle Spiral under shared motion (whole shapes): rings centre on the
-    # reference ALIGN centre (each shape is concentric with it), every
-    # shape's own wall radius joins the shared ring set, and each shape's
-    # dispensing is capped just outside its own wall so grid rings grazing
-    # its boundary stop printing spotty specks / half arcs.
+    # reference ALIGN centre (each shape is concentric with it) and every
+    # shape's outermost-fitting grid ring joins the shared ring set, so each
+    # shape keeps a complete, uniformly spaced outer circle.
     extra_wall_radii = None
-    valve_ring_caps = None
     ring_center = None
     if (
         raster_pattern == RASTER_PATTERN_CIRCLE_SPIRAL
@@ -287,10 +278,6 @@ def generate_vector_gcode(
                 (scan_frame[1] + scan_frame[3]) / 2.0,
             )
         n_layers = len(motion_layers)
-        valve_ring_caps = [
-            circle_wall_radius(valve_layers[index], ring_center[0], ring_center[1], fil_width)
-            for index in range(n_layers)
-        ]
         extra_wall_radii = [[] for _ in range(n_layers)]
         sources = [
             source
@@ -307,10 +294,13 @@ def generate_vector_gcode(
                     if wall is not None:
                         extra_wall_radii[index].append(wall)
         else:
-            # No source list: at least this shape's own wall.
-            for index, cap in enumerate(valve_ring_caps):
-                if cap is not None:
-                    extra_wall_radii[index].append(cap)
+            # No source list: at least this shape's own outer ring.
+            for index in range(n_layers):
+                wall = circle_wall_radius(
+                    valve_layers[index], ring_center[0], ring_center[1], fil_width
+                )
+                if wall is not None:
+                    extra_wall_radii[index].append(wall)
 
     gcode_list, toolpath_origin = plan_layer_moves(
         motion_layers,
@@ -324,18 +314,22 @@ def generate_vector_gcode(
         scan_frame=scan_frame,
         infill_fraction=max(0.0, min(1.0, float(infill))),
         extra_wall_radii=extra_wall_radii,
-        valve_ring_caps=valve_ring_caps,
         ring_center=ring_center,
     )
 
     # World anchor: the toolpath origin expressed in the shape's own frame.
     # With reference motion the geometry was translated by the centering
-    # delta, so subtract it to get back to the shape's coordinates.
+    # delta, so subtract it to get back to the shape's coordinates. It is
+    # handed back through `origin_sink` (NOT written into the G-code — the
+    # printed file stays free of metadata): the app stores it on the shape
+    # record for Auto Align Split Parts and the visualizations.
     if motion is not None:
         delta_x, delta_y = _centering_delta(shape, motion)
     else:
         delta_x = delta_y = 0.0
     path_origin = (toolpath_origin[0] - delta_x, toolpath_origin[1] - delta_y)
+    if origin_sink is not None:
+        origin_sink["path_origin"] = path_origin
 
     # A shape that opts out of the lead-in still TRAVELS the purge patch when
     # motion is shared (all heads must move identically) but keeps its valve
@@ -369,6 +363,5 @@ def generate_vector_gcode(
         increase_pressure_per_layer=float(increase_pressure_per_layer),
         pressure_ramp_enabled=bool(pressure_ramp_enabled),
         all_g1=bool(all_g1),
-        path_origin=path_origin,
     )
     return gcode_path

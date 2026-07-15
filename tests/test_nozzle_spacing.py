@@ -347,6 +347,7 @@ def _split_piece_records(
 
     records: list[dict] = []
     for index, piece in enumerate(pieces):
+        origin_sink: dict = {}
         gcode_path = generate_vector_gcode(
             piece,
             shape_name=f"piece_{index}",
@@ -356,6 +357,7 @@ def _split_piece_records(
             fil_width=1.0,
             motion=reference,
             raster_pattern=raster_pattern,
+            origin_sink=origin_sink,
             output_dir=tmp_path / f"piece_{index}",
         )
         records.append(
@@ -365,6 +367,7 @@ def _split_piece_records(
                 "nozzle": index + 1,
                 "color": "#000000",
                 "gcode_path": str(gcode_path),
+                "path_origin": origin_sink.get("path_origin"),
                 "split_group_id": "split-a",
                 "split_index": index,
                 "split_row": index // columns + 1,
@@ -473,6 +476,7 @@ def test_split_pieces_share_parent_scan_grid_so_column_gaps_equal_fil(tmp_path) 
     pieces = split_layer_stack_grid(stack, columns=4, rows=1)
     records = []
     for index, piece in enumerate(pieces):
+        origin_sink: dict = {}
         gcode_path = generate_vector_gcode(
             piece,
             shape_name=f"col_{index}",
@@ -481,6 +485,7 @@ def test_split_pieces_share_parent_scan_grid_so_column_gaps_equal_fil(tmp_path) 
             port=1,
             fil_width=fil,
             raster_pattern=RASTER_PATTERN_Y_DIRECTION,
+            origin_sink=origin_sink,
             output_dir=tmp_path / f"col_{index}",
         )
         records.append(
@@ -490,6 +495,7 @@ def test_split_pieces_share_parent_scan_grid_so_column_gaps_equal_fil(tmp_path) 
                 "nozzle": index + 1,
                 "color": "#000000",
                 "gcode_path": str(gcode_path),
+                "path_origin": origin_sink.get("path_origin"),
                 "split_group_id": "split-a",
                 "split_index": index,
                 "split_row": 1,

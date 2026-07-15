@@ -3451,8 +3451,12 @@ def generate_dynamic_gcode(
                 lead_in_direction=lead_in_direction or LEAD_IN_DIRECTION_LEFT,
                 lead_in_dispense=bool(record.get("lead_in", True)),
                 wall_sources=wall_sources if use_reference_motion else None,
+                origin_sink=(origin_sink := {}),
             )
             record["gcode_path"] = str(gcode_path)
+            # World anchor of the toolpath (kept OUT of the G-code file):
+            # Auto Align and the visualizations read it from the record.
+            record["path_origin"] = origin_sink.get("path_origin")
             messages.append(f"Shape {record['idx']}: wrote `{gcode_path.name}`.")
         except Exception as exc:
             messages.append(f"Shape {record['idx']}: failed ({exc}).")
@@ -3496,6 +3500,11 @@ def _parts_from_records(records: list[dict] | None) -> tuple[list[dict], list[st
         if not parsed.get("point_count"):
             messages.append(f"Shape {idx}: no G0/G1 moves found.")
             continue
+        # The toolpath's world anchor lives on the RECORD (not in the G-code
+        # file); legacy files that still carry a "; PathOrigin" comment keep
+        # working through the parser.
+        if parsed.get("path_origin") is None and record.get("path_origin"):
+            parsed["path_origin"] = tuple(record["path_origin"])
         nozzle = _record_nozzle_number(record, idx)
         parts.append({"idx": idx, "nozzle": nozzle, "color": record.get("color", _default_color(idx)), "parsed": parsed})
         messages.append(f"Shape {idx} (Nozzle {nozzle}): {parsed['point_count']} moves, {parsed.get('layer_count', 0)} layer(s).")
