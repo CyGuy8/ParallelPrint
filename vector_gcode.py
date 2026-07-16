@@ -353,7 +353,7 @@ def generate_vector_gcode(
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    gcode_path = output_dir / f"{shape_name}_SnakePath_gcode.txt"
+    gcode_path = output_dir / f"{shape_name}_gcode.txt"
     write_gcode_file(
         gcode_path,
         gcode_list,

@@ -4,6 +4,7 @@ import math
 import tempfile
 import time
 import warnings
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -2253,6 +2254,32 @@ def _gcode_dropdown_update(records: list[dict], selected: str | None = None, inc
     return gr.update(choices=choices, value=value)
 
 
+def _gcode_zip_update(records: list[dict] | None) -> dict[str, Any]:
+    """Bundle every generated G-code file into one ZIP for the Download All
+    button. Rebuilt wherever the individual download list is refreshed so the
+    two can never disagree; the button hides when there is nothing to bundle."""
+    paths = [
+        record.get("gcode_path")
+        for record in (records or [])
+        if record.get("gcode_path") and Path(record["gcode_path"]).exists()
+    ]
+    if not paths:
+        return gr.update(visible=False)
+    zip_path = Path(tempfile.mkdtemp(prefix="gcode_zip_")) / "all_shapes_gcode.zip"
+    used_names: set[str] = set()
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as bundle:
+        for path in paths:
+            arcname = Path(path).name
+            stem, suffix = Path(path).stem, Path(path).suffix
+            counter = 2
+            while arcname in used_names:
+                arcname = f"{stem}_{counter}{suffix}"
+                counter += 1
+            used_names.add(arcname)
+            bundle.write(path, arcname=arcname)
+    return gr.update(value=str(zip_path), visible=True)
+
+
 def _merge_file_paths(*file_groups: Any) -> list[str]:
     merged: list[str] = []
     seen: set[str] = set()
@@ -2288,6 +2315,7 @@ def sync_uploaded_shapes(
         _gcode_dropdown_update(next_records),
         _gcode_dropdown_update(next_records, include_upload=True),
         [record.get("gcode_path") for record in next_records if record.get("gcode_path")],
+        _gcode_zip_update(next_records),
     )
 
 
@@ -2322,6 +2350,7 @@ def _shape_delete_outputs(
         _gcode_dropdown_update(records),
         _gcode_dropdown_update(records, include_upload=True),
         [record.get("gcode_path") for record in records if record.get("gcode_path")],
+        _gcode_zip_update(records),
         float(last_delete_at or 0.0),
     )
 
@@ -2332,7 +2361,7 @@ def _shape_select_noop() -> tuple:
     lands late); echoing records/rows here raced the dimension normalizer's
     write-back — the stale echo clobbered the recomputed proportions on the
     first Keep Proportions edit and re-rendered the table mid-typing."""
-    return tuple(gr.skip() for _ in range(8))
+    return tuple(gr.skip() for _ in range(9))
 
 
 def delete_shape_from_settings(
@@ -2725,6 +2754,130 @@ def show_selected_model(
         record.get("target_y"),
         record.get("target_z"),
     )
+
+
+def _polygon_patch(polygon, **kwargs):
+    """A filled matplotlib patch for a shapely Polygon, holes included."""
+    from matplotlib.patches import PathPatch
+    from matplotlib.path import Path as MplPath
+
+    verts: list[tuple[float, float]] = []
+    codes: list[int] = []
+    for ring in [polygon.exterior, *polygon.interiors]:
+        coords = list(ring.coords)
+        if len(coords) < 3:
+            continue
+        verts.extend(coords)
+        codes.extend([MplPath.MOVETO] + [MplPath.LINETO] * (len(coords) - 2) + [MplPath.CLOSEPOLY])
+    return PathPatch(MplPath(verts, codes), **kwargs)
+
+
+def _layer_preview_message(message: str):
+    from matplotlib.figure import Figure
+
+    fig = Figure(figsize=(5.4, 5.0), dpi=100)
+    ax = fig.add_subplot(111)
+    ax.axis("off")
+    ax.text(0.5, 0.5, message, ha="center", va="center", wrap=True, fontsize=11, color="#666666")
+    return fig
+
+
+def update_layer_preview(
+    records: list[dict] | None,
+    selected: str | None,
+    settings_table: Any,
+    layer_value: float,
+) -> tuple:
+    """Slider + figure for the sliced-layer preview.
+
+    Draws the selected shape's layer polygons in its print color. Shapes on
+    the same nozzle are parts of one assembly, so their polygons at the same
+    Z are drawn too (dimmer) — this is where multi-material slicing and Flip
+    Z can be checked before generating any G-code.
+    """
+    from matplotlib.figure import Figure
+    from matplotlib.patches import Patch
+
+    records = _apply_shape_settings(list(records or []), settings_table)
+    pos = _selected_record_index(records, selected)
+    if pos < 0:
+        return gr.update(maximum=1, value=1), _layer_preview_message("Load a shape to preview its sliced layers.")
+    record = records[pos]
+    stack = record.get("layer_stack")
+    if stack is None or not getattr(stack, "layers", None):
+        return (
+            gr.update(maximum=1, value=1),
+            _layer_preview_message("Slice Shapes to see this shape's layer outlines."),
+        )
+
+    layer_count = len(stack.layers)
+    layer_index = max(1, min(layer_count, _coerce_int(layer_value, 1)))
+    z_value = stack.z_values[layer_index - 1]
+    half_layer = float(stack.layer_height or 0.8) / 2.0
+
+    nozzle = _record_nozzle_number(record, int(record.get("idx", pos + 1) or (pos + 1)))
+    drawn: list[tuple[dict, Any]] = []  # (record, MultiPolygon at ~z)
+    for other_pos, other in enumerate(records):
+        other_stack = other.get("layer_stack")
+        if other_stack is None or not getattr(other_stack, "layers", None) or other_pos == pos:
+            continue
+        if _record_nozzle_number(other, int(other.get("idx", other_pos + 1) or (other_pos + 1))) != nozzle:
+            continue
+        z_values = other_stack.z_values
+        nearest = min(range(len(z_values)), key=lambda k: abs(z_values[k] - z_value))
+        if abs(z_values[nearest] - z_value) <= half_layer:
+            drawn.append((other, other_stack.layers[nearest]))
+    drawn.append((record, stack.layers[layer_index - 1]))  # selected on top
+
+    fig = Figure(figsize=(5.4, 5.0), dpi=100)
+    ax = fig.add_subplot(111)
+    legend_handles = []
+    has_material = False
+    for member, layer in drawn:
+        is_selected = member is record
+        color = str(member.get("color") or _default_color(int(member.get("idx", 0) or 0)))
+        for polygon in getattr(layer, "geoms", []):
+            if polygon.is_empty:
+                continue
+            has_material = True
+            ax.add_patch(
+                _polygon_patch(
+                    polygon,
+                    facecolor=color,
+                    alpha=0.85 if is_selected else 0.45,
+                    edgecolor="#333333",
+                    linewidth=0.7,
+                )
+            )
+        if len(drawn) > 1:
+            legend_handles.append(
+                Patch(facecolor=color, alpha=0.85 if is_selected else 0.45, label=str(member.get("name") or f"Shape {member.get('idx')}"))
+            )
+
+    # Fixed frame across the whole stack (assembly bounds) so the view
+    # doesn't jump between layers.
+    xs: list[float] = []
+    ys: list[float] = []
+    for member, _layer in drawn:
+        bounds = member["layer_stack"].bounds
+        xs.extend((bounds[0][0], bounds[1][0]))
+        ys.extend((bounds[0][1], bounds[1][1]))
+    margin = max(1.0, 0.05 * max(max(xs) - min(xs), max(ys) - min(ys)))
+    ax.set_xlim(min(xs) - margin, max(xs) + margin)
+    ax.set_ylim(min(ys) - margin, max(ys) + margin)
+    ax.set_aspect("equal")
+    ax.grid(True, linewidth=0.3, alpha=0.4)
+    ax.set_xlabel("X (mm)")
+    ax.set_ylabel("Y (mm)")
+    name = str(record.get("name") or f"Shape {record.get('idx')}")
+    title = f"{name} — layer {layer_index}/{layer_count} (z = {z_value:.2f} mm)"
+    if not has_material:
+        title += "  [empty layer]"
+    ax.set_title(title, fontsize=10)
+    if legend_handles:
+        ax.legend(handles=legend_handles, fontsize=8, loc="upper right")
+    fig.tight_layout()
+    return gr.update(maximum=layer_count, value=layer_index), fig
 
 
 def _slice_params_snapshot(
@@ -3188,6 +3341,7 @@ def split_selected_shape_for_grid(
             _gcode_dropdown_update(next_records, include_upload=True),
             _dropdown_update(next_records, selected_value),
             status,
+            _gcode_zip_update(next_records),
         )
 
     if not records:
@@ -3369,30 +3523,23 @@ def _lead_in_assembly_extension(records: list[dict], direction: str | None) -> f
 def generate_dynamic_gcode(
     records: list[dict] | None,
     settings_table: Any,
-    all_g1: bool,
-    use_reference_motion: bool,
     raster_pattern: str | None,
     pressure_ramp_enabled: bool,
     lead_in_length: float,
     lead_in_clearance: float,
     lead_in_lines: float,
     lead_in_direction: str | None,
-    ref_layers: LayerStack | None,
     layer_height: float,
     fil_width: float,
     scale_mode: str | None,
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
     messages: list[str] = []
-    resliced = _ensure_records_sliced(records, layer_height, scale_mode, messages)
-    if use_reference_motion or resliced:
-        # Always rebuild with the CURRENT fil width: the reference stack's
-        # alignment snap grid must match the fil the G-code is generated with.
-        ref_layers = generate_dynamic_reference_stack(records, fil_width)
-    else:
-        # Still refresh group frames + seam-free contours: nozzle numbers may
-        # have been edited in the table since the last slice.
-        _stamp_multi_material_frames(records, fil_width)
+    _ensure_records_sliced(records, layer_height, scale_mode, messages)
+    # Shared reference motion is always on: every head traces the combined
+    # outline and dispenses only its own geometry. Rebuilt with the CURRENT
+    # fil width so the alignment snap grid matches this generation.
+    ref_layers = generate_dynamic_reference_stack(records, fil_width)
     contour_sources = _contour_tracing_sources(records)
     if contour_sources:
         enabled = ", ".join(f"Shape {source.owner_idx}" for source in contour_sources)
@@ -3424,8 +3571,8 @@ def generate_dynamic_gcode(
         if stack is None or not getattr(stack, "layers", None):
             messages.append(f"Shape {record['idx']}: skipped (no sliced layers).")
             continue
-        if use_reference_motion and ref_layers is None:
-            messages.append(f"Shape {record['idx']}: skipped (Reference motion selected, but no shapes are sliced).")
+        if ref_layers is None:
+            messages.append(f"Shape {record['idx']}: skipped (no combined reference outline; slice a shape first).")
             continue
         shape_name = str(record.get("name") or stack.name or f"shape_{record['idx']}").replace(" ", "_")
         try:
@@ -3438,8 +3585,11 @@ def generate_dynamic_gcode(
                 layer_height=float(layer_height),
                 fil_width=float(fil_width),
                 pressure_ramp_enabled=bool(pressure_ramp_enabled),
-                all_g1=bool(all_g1),
-                motion=ref_layers if use_reference_motion else None,
+                # Always one constant speed: every move is emitted as G1 (no
+                # G0 rapid travel); the valve commands still mark print vs
+                # travel.
+                all_g1=True,
+                motion=ref_layers,
                 raster_pattern=raster_pattern,
                 contour_sources=contour_sources,
                 active_contour_owner=int(record.get("idx", 0)),
@@ -3450,7 +3600,7 @@ def generate_dynamic_gcode(
                 lead_in_lines=max(1, _coerce_int(lead_in_lines, 3)),
                 lead_in_direction=lead_in_direction or LEAD_IN_DIRECTION_LEFT,
                 lead_in_dispense=bool(record.get("lead_in", True)),
-                wall_sources=wall_sources if use_reference_motion else None,
+                wall_sources=wall_sources,
                 origin_sink=(origin_sink := {}),
             )
             record["gcode_path"] = str(gcode_path)
@@ -3467,6 +3617,7 @@ def generate_dynamic_gcode(
         "\n".join(messages),
         _gcode_dropdown_update(records),
         _gcode_dropdown_update(records, include_upload=True),
+        _gcode_zip_update(records),
     )
 
 
@@ -3803,6 +3954,15 @@ def build_dynamic_demo() -> gr.Blocks:
                             camera_position=FRONT_CAMERA,
                             height=360,
                         )
+                    with gr.Column(scale=2, min_width=380):
+                        layer_preview_plot = gr.Plot(label="Sliced Layer Preview")
+                        layer_preview_slider = gr.Slider(
+                            label="Layer",
+                            minimum=1,
+                            maximum=1,
+                            step=1,
+                            value=1,
+                        )
                     with gr.Column(scale=1, min_width=300):
                         model_details = gr.Markdown("No model loaded.")
 
@@ -3813,13 +3973,9 @@ def build_dynamic_demo() -> gr.Blocks:
                 """
                 # Generate G-Code
                 Generate G-code for every sliced shape. Pressure, valve, nozzle, port, and color come from the Shape Settings table.
+                All shapes share one combined nozzle path (each dispenses only its own geometry), so parallel heads always stay in sync.
                 """
             )
-            gcode_use_ref_motion = gr.Checkbox(
-                label="Use combined reference outline for motion (all shapes share one nozzle path; each dispenses only its own geometry).",
-                value=True,
-            )
-            gcode_all_g1 = gr.Checkbox(label="Move at one constant speed (no fast travel moves)", value=True)
             gcode_pressure_ramp_enabled = gr.Checkbox(label="Increase Pressure Each Layer", value=True)
             gcode_raster_pattern = gr.Dropdown(
                 label="Raster Pattern",
@@ -3840,7 +3996,15 @@ def build_dynamic_demo() -> gr.Blocks:
                         allow_custom_value=False,
                     )
             gcode_button = gr.Button("Generate G-Code", variant="primary")
-            gcode_downloads = gr.File(label="Download G-Code Files", file_count="multiple", interactive=False, elem_classes=["gcode-download"])
+            with gr.Row():
+                with gr.Column(scale=4):
+                    gcode_downloads = gr.File(label="Download G-Code Files", file_count="multiple", interactive=False, elem_classes=["gcode-download"])
+                with gr.Column(scale=1, min_width=200):
+                    gcode_download_all = gr.DownloadButton(
+                        "Download All (.zip)",
+                        variant="secondary",
+                        visible=False,
+                    )
             gcode_status = gr.Markdown("")
             with gr.Row():
                 gcode_text_source = gr.Dropdown(label="Preview G-Code", choices=[], value=None, allow_custom_value=False)
@@ -3970,7 +4134,7 @@ def build_dynamic_demo() -> gr.Blocks:
             nozzle_grid_use_individual_spacing,
         ]
 
-        shape_sync_outputs = [shape_records, shape_settings, selected_shape, gcode_text_source, gcode_source, gcode_downloads]
+        shape_sync_outputs = [shape_records, shape_settings, selected_shape, gcode_text_source, gcode_source, gcode_downloads, gcode_download_all]
         stl_upload.change(fn=sync_uploaded_shapes, inputs=[stl_upload, shape_records, shape_settings], outputs=shape_sync_outputs).then(
             fn=lambda records: _dropdown_update(records),
             inputs=[shape_records],
@@ -4053,6 +4217,14 @@ def build_dynamic_demo() -> gr.Blocks:
         selected_shape.change(fn=show_selected_model, inputs=preview_inputs, outputs=[model_viewer, model_details])
         refresh_preview_button.click(fn=show_selected_model, inputs=preview_inputs, outputs=[model_viewer, model_details])
         model_opacity.change(fn=show_selected_model, inputs=preview_inputs, outputs=[model_viewer, model_details])
+        # Sliced-layer preview. The slider uses .release only: the handler
+        # writes the slider back (clamped max/value), and a .change wiring
+        # would re-fire on that programmatic write.
+        layer_preview_inputs = [shape_records, selected_shape, shape_settings, layer_preview_slider]
+        layer_preview_outputs = [layer_preview_slider, layer_preview_plot]
+        selected_shape.change(fn=update_layer_preview, inputs=layer_preview_inputs, outputs=layer_preview_outputs)
+        refresh_preview_button.click(fn=update_layer_preview, inputs=layer_preview_inputs, outputs=layer_preview_outputs)
+        layer_preview_slider.release(fn=update_layer_preview, inputs=layer_preview_inputs, outputs=layer_preview_outputs)
         scale_mode.change(
             fn=normalize_shape_dimensions_for_mode,
             inputs=[shape_records, shape_settings, scale_mode],
@@ -4077,6 +4249,10 @@ def build_dynamic_demo() -> gr.Blocks:
             fn=generate_dynamic_layer_stacks,
             inputs=[shape_records, shape_settings, layer_height, scale_mode, fil_width],
             outputs=[shape_records, slicer_status, ref_layers],
+        ).then(
+            fn=update_layer_preview,
+            inputs=layer_preview_inputs,
+            outputs=layer_preview_outputs,
         ).then(
             fn=lambda records: _dropdown_update(records),
             inputs=[shape_records],
@@ -4115,6 +4291,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 gcode_source,
                 split_source,
                 split_status,
+                gcode_download_all,
             ],
         ).then(
             fn=generate_dynamic_reference_stack,
@@ -4132,20 +4309,17 @@ def build_dynamic_demo() -> gr.Blocks:
             inputs=[
                 shape_records,
                 shape_settings,
-                gcode_all_g1,
-                gcode_use_ref_motion,
                 gcode_raster_pattern,
                 gcode_pressure_ramp_enabled,
                 gcode_lead_in_length,
                 gcode_lead_in_clearance,
                 gcode_lead_in_lines,
                 gcode_lead_in_direction,
-                ref_layers,
                 layer_height,
                 fil_width,
                 scale_mode,
             ],
-            outputs=[shape_records, ref_layers, gcode_downloads, gcode_status, gcode_text_source, gcode_source],
+            outputs=[shape_records, ref_layers, gcode_downloads, gcode_status, gcode_text_source, gcode_source, gcode_download_all],
         ).then(
             fn=load_selected_gcode_text,
             inputs=[shape_records, gcode_text_source],

@@ -723,7 +723,7 @@ def test_non_delete_cell_selection_touches_nothing() -> None:
 
     outputs = delete_shape_from_settings(records, _shape_settings_rows(records), 0.0, Event())
 
-    assert len(outputs) == 8
+    assert len(outputs) == 9
     assert all(not isinstance(value, list) for value in outputs)
     assert not isinstance(outputs[1], list)  # records State untouched
 
@@ -1099,6 +1099,84 @@ def test_apply_bulk_bool_selection_sets_a_whole_column() -> None:
     color_pos = SHAPE_SETTINGS_HEADERS.index("Color")
     refused, _rows4 = apply_bulk_bool_selection(cleared, rows2, f"{color_pos}|1")
     assert refused[0].get("color") == cleared[0].get("color")
+
+
+def test_download_all_zip_bundles_gcode_files_by_shape_name(tmp_path) -> None:
+    import zipfile
+
+    from app import _gcode_zip_update
+
+    first = tmp_path / "circle_gcode.txt"
+    first.write_text("G91\n")
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    duplicate = other_dir / "circle_gcode.txt"
+    duplicate.write_text("G91\n")
+    square = tmp_path / "square_gcode.txt"
+    square.write_text("G91\n")
+
+    update = _gcode_zip_update(
+        [
+            {"idx": 1, "gcode_path": str(first)},
+            {"idx": 2, "gcode_path": str(duplicate)},
+            {"idx": 3, "gcode_path": str(square)},
+            {"idx": 4, "gcode_path": None},
+        ]
+    )
+    assert update["visible"] is True
+    with zipfile.ZipFile(update["value"]) as bundle:
+        assert sorted(bundle.namelist()) == [
+            "circle_gcode.txt",
+            "circle_gcode_2.txt",
+            "square_gcode.txt",
+        ]
+
+    # Nothing generated yet: the button hides instead of offering an empty zip.
+    hidden = _gcode_zip_update([{"idx": 1, "gcode_path": None}])
+    assert hidden["visible"] is False
+
+
+def test_layer_preview_draws_the_selection_and_its_nozzle_group() -> None:
+    from shapely.geometry import MultiPolygon, box
+
+    from app import update_layer_preview
+    from stl_slicer import LayerStack
+
+    def _preview_stack(name: str, poly) -> LayerStack:
+        return LayerStack(
+            layers=[MultiPolygon([poly]), MultiPolygon([poly])],
+            z_values=[0.4, 1.2],
+            bounds=((0.0, 0.0, 0.0), (10.0, 10.0, 1.6)),
+            layer_height=0.8,
+            name=name,
+        )
+
+    records = [
+        {"idx": 1, "name": "base", "stl_path": "base.stl", "nozzle": 1, "color": "#ff0000",
+         "layer_stack": _preview_stack("base", box(0.0, 0.0, 10.0, 10.0))},
+        {"idx": 2, "name": "stripe", "stl_path": "stripe.stl", "nozzle": 1, "color": "#0000ff",
+         "layer_stack": _preview_stack("stripe", box(2.0, 2.0, 8.0, 8.0))},
+        {"idx": 3, "name": "solo", "stl_path": "solo.stl", "nozzle": 2, "color": "#00ff00",
+         "layer_stack": _preview_stack("solo", box(0.0, 0.0, 5.0, 5.0))},
+    ]
+
+    # Selected shape plus its same-nozzle assembly sibling are both drawn.
+    slider, fig = update_layer_preview(records, "1: base", None, 2)
+    assert slider["maximum"] == 2
+    assert slider["value"] == 2
+    assert len(fig.axes[0].patches) == 2
+
+    # A shape alone on its nozzle draws only itself; out-of-range slider
+    # values clamp to the layer count.
+    slider_solo, fig_solo = update_layer_preview(records, "3: solo", None, 99)
+    assert slider_solo["value"] == 2
+    assert len(fig_solo.axes[0].patches) == 1
+
+    # Unsliced shape: slider resets, figure carries the hint (no patches).
+    unsliced = [{"idx": 1, "name": "raw", "stl_path": "raw.stl", "nozzle": 1, "color": "#ff0000", "layer_stack": None}]
+    slider_reset, fig_hint = update_layer_preview(unsliced, "1: raw", None, 5)
+    assert slider_reset["maximum"] == 1
+    assert not fig_hint.axes[0].patches
 
 
 def test_load_sample_shapes_respects_the_selected_set() -> None:

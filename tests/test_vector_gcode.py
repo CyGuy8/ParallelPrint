@@ -176,6 +176,21 @@ def test_slanted_shape_gcode_round_trips_through_the_viewer(tmp_path) -> None:
             assert -1.0 <= y <= 21.0
 
 
+def test_gcode_file_is_named_after_the_shape(tmp_path) -> None:
+    gcode_path = generate_vector_gcode(
+        _stack(box(0.0, 0.0, 1.0, 1.0)),
+        shape_name="Simple_Circle",
+        pressure=25,
+        valve=7,
+        port=3,
+        fil_width=1.0,
+        origin_sink=(origin_sink := {}),
+        output_dir=tmp_path,
+    )
+
+    assert gcode_path.name == "Simple_Circle_gcode.txt"
+
+
 def test_gcode_header_writes_presets_before_initial_aux_commands(tmp_path) -> None:
     gcode_path = generate_vector_gcode(
         _stack(box(0.0, 0.0, 1.0, 1.0)),
