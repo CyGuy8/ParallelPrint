@@ -50,15 +50,15 @@ Then open the local Gradio URL in your browser, upload STL files or load the bun
 - Shows a sliced-layer preview in the Selected Shape Preview accordion (layer slider through the shape's polygon outlines, drawn in its print color; assembly parts sharing the nozzle are drawn together so multi-material slicing and Flip Z can be checked before generating G-code)
 - Splits one sliced shape's geometry into an editable row/column grid for multi-nozzle printing of one large shape
 - Converts sliced layers into G-code files with pressure, valve, nozzle, port, and infill % settings per shape from the Shape Settings table
+- **Pressure is a port property** (one pressure regulator per serial port): shapes sharing a Port always share one pressure — editing one shape's pressure updates every shape on that port, moving a shape onto a port adopts that port's pressure, and newly added shapes join at their port's existing pressure
 - **Infill %** per shape skips dispensing on evenly-distributed raster lines (rings/revolutions for spiral patterns) — at 50% every other line prints — while the motion path stays exactly the same, so parallel shapes with different infill still share one print path
 - Appends a shape outline contour after each enabled shape layer by tracing that layer's polygon boundary
 - Offers a choice of raster pattern for G-code generation; all shapes always share one combined reference outline for motion (one nozzle path; each dispenses only its own geometry), and every move is emitted as `G1` at one constant speed (no `G0` rapid travel)
 - Re-slices shapes automatically during G-code generation when their slices are missing or stale, so "upload, then Generate G-Code" works in one click
-- Calculates X/Y nozzle spacing from a grid layout (columns/rows plus gaps), with an optional per-connection Advanced Grid Spacing table, then visualizes the resulting nozzle layout
+- Calculates X/Y nozzle spacing from a grid layout (columns/rows plus gaps) in the Visualization tab's Nozzle Spacing accordion, with an optional per-connection Advanced Grid Spacing table, then visualizes the resulting nozzle layout
 - Previews selected generated G-code inline
-- Visualizes generated or uploaded G-code tool paths, with the source selectable from any active generated shape or an uploaded file
-- Renders the tool path as a fast line plot or an animated 3D tube plot (play/pause, speed, scrub, frame-step, nozzle marker)
-- Plots the generated shapes using the configured nozzle spacing and animates them printing in parallel, with a server-side GIF export of that animation
+- One Visualization tab that defaults to the parallel print of every generated shape (configured nozzle spacing, animated, with a server-side GIF export), and can switch to a single tool path from any generated shape or an uploaded G-code file
+- Renders as a fast line plot or an animated 3D tube plot (play/pause, speed, scrub, frame-step, nozzle marker); print colors come from the Shape Settings table (uploads render orange, travel grey)
 - Each shape's plot color is set with one click on a palette chip embedded in the Shape Settings **Color** column (Orange, Blue, Green, Red, Purple, Pink, Teal, Yellow, White, Black) — the cell shows the current color's name and highlights its chip
 
 ## Behavior and Implementation Notes
@@ -124,18 +124,18 @@ When parsing G-code for visualization, the app decides print vs travel as follow
 
 The parser also handles standard slicer G-code: single-axis and Z-only moves, axes in any order, and `F`/`E` tokens (feed rate, extrusion) are ignored for geometry.
 
-### G-code Visualization
+### Visualization
 
-The G-code visualization tab renders generated shape G-code or an uploaded `.txt`, `.gcode`, or `.nc` file. It parses `G0`/`G1` movement lines, supports relative (`G91`) and absolute (`G90`) positioning, and offers two render modes:
+The Visualization tab has one source selector. The default, **Parallel print (all shapes)**, plots every generated shape's G-code at once using the spacing configured in the tab's own Nozzle Spacing accordion, each in its Shape Settings color. Shape Settings maps each STL to a nozzle number, so multiple shapes can share one nozzle offset while valves remain independent; the animation advances all parts on a shared cumulative-path-length timeline, so a shorter part finishes first.
 
-- **Line Plot** — fast thin scatter lines (print and travel), with color/opacity controls.
+Selecting a single shape (or **Upload G-Code file** for a `.txt`, `.gcode`, or `.nc` file) switches to a single-tool-path view. The parser handles `G0`/`G1` movement lines and relative (`G91`) / absolute (`G90`) positioning. Colors are fixed: a generated shape prints in its Shape Settings color, an uploaded file prints in orange, and travel is always grey (opacity sliders control how visible each is).
+
+Both views offer two render modes:
+
+- **Line Plot** — fast thin scatter lines (print and travel).
 - **Tube Plot with Animation** — mm-width filament tubes (circular, capped, lit) with a client-side build animation (play/pause, speed, scrub, frame-step) and a moving nozzle marker. Filament/travel widths automatically follow the slicer's Filament/Line Width and its quarter.
 
-### Parallel Printing Visualization
-
-The fourth tab plots the generated shapes' G-code at once using the nozzle spacing configured on the Generate G-Code tab, each in its own color. Shape Settings maps each STL to a nozzle number, so multiple shapes can share one nozzle offset while valves remain independent. Like the visualization tab it has a fast **Line Plot** and an animated **Tube Plot**; the animation advances all parts on a shared cumulative-path-length timeline, so a shorter part finishes first.
-
-It can also **export the animation as a GIF**, rendered server-side with Matplotlib (the `Agg` CPU backend — no WebGL, no headless browser, and no `ffmpeg`, so it works locally and on Hugging Face). The GIF is line-style with faint grey travel and white, black-outlined nozzle markers drawn on top; controls cover duration, frames per second, elevation/azimuth viewing angle, and travel opacity (0 hides travel).
+The parallel view can also **export the animation as a GIF**, rendered server-side with Matplotlib (the `Agg` CPU backend — no WebGL, no headless browser, and no `ffmpeg`, so it works locally and on Hugging Face). The GIF is line-style with faint grey travel and white, black-outlined nozzle markers drawn on top; controls cover duration, frames per second, elevation/azimuth viewing angle, and travel opacity (0 hides travel).
 
 ## Dependency Updates
 

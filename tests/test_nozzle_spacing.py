@@ -1006,6 +1006,78 @@ def test_joining_a_nozzle_group_adopts_the_group_scale() -> None:
     assert updated2[2]["target_x"] == 45.0
 
 
+def test_pressure_edit_propagates_to_shapes_sharing_the_port() -> None:
+    from app import SCALE_MODE_TARGET_DIMENSIONS
+
+    # Shapes 1+2 share port 1 (one regulator); shape 3 is alone on port 2.
+    records = [
+        _mm_member(1, 1, 40.0, 20.0, 10.0),
+        _mm_member(2, 2, 20.0, 20.0, 10.0),
+        _mm_member(3, 3, 30.0, 30.0, 30.0),
+    ]
+    records[2]["port"] = 2
+    records[2]["pressure"] = 40.0
+    rows = _shape_settings_rows(records)
+    pressure_pos = SHAPE_SETTINGS_HEADERS.index("Pressure (psi)")
+    rows[0][pressure_pos] = 32.0
+
+    updated, table_out = normalize_shape_dimensions_for_mode(
+        records, rows, SCALE_MODE_TARGET_DIMENSIONS
+    )
+
+    assert updated[0]["pressure"] == 32.0
+    assert updated[1]["pressure"] == 32.0  # port-mate follows
+    assert updated[2]["pressure"] == 40.0  # other port untouched
+    assert isinstance(table_out, list)  # propagation must be written back
+
+    # The echo of that write-back is a converged no-op.
+    echoed = _shape_settings_rows(updated)
+    updated2, table_out2 = normalize_shape_dimensions_for_mode(
+        updated, echoed, SCALE_MODE_TARGET_DIMENSIONS
+    )
+    assert not isinstance(table_out2, list)
+    assert updated2[1]["pressure"] == 32.0
+
+
+def test_moving_a_shape_onto_a_port_adopts_that_ports_pressure() -> None:
+    from app import SCALE_MODE_TARGET_DIMENSIONS
+
+    first = _mm_member(1, 1, 40.0, 20.0, 10.0)
+    second = _mm_member(2, 2, 20.0, 20.0, 10.0)
+    mover = _mm_member(3, 3, 30.0, 30.0, 30.0)
+    first["pressure"] = 32.0
+    second["pressure"] = 32.0
+    mover["port"] = 2
+    mover["pressure"] = 40.0
+
+    records = [first, second, mover]
+    rows = _shape_settings_rows(records)
+    port_pos = SHAPE_SETTINGS_HEADERS.index("Port")
+    rows[2][port_pos] = 1  # mover joins port 1
+
+    updated, table_out = normalize_shape_dimensions_for_mode(
+        records, rows, SCALE_MODE_TARGET_DIMENSIONS
+    )
+
+    assert updated[2]["port"] == 1
+    assert updated[2]["pressure"] == 32.0  # newcomer adopts the port pressure
+    assert updated[0]["pressure"] == 32.0  # incumbents unchanged
+    assert isinstance(table_out, list)
+
+
+def test_new_shapes_adopt_the_existing_port_pressure() -> None:
+    from app import _records_from_files
+
+    previous = _records_from_files(["first.stl"], None)
+    previous[0]["pressure"] = 40.0
+
+    records = _records_from_files(["first.stl", "second.stl"], previous)
+
+    assert records[0]["pressure"] == 40.0
+    assert records[1]["port"] == records[0]["port"]
+    assert records[1]["pressure"] == 40.0  # same port -> same regulator
+
+
 def test_split_pieces_are_never_rescaled_by_keep_proportions() -> None:
     # Regression: split pieces inherit the parent's original_* dims while
     # their targets are the CELL sizes; a table echo in Keep Proportions

@@ -1292,6 +1292,12 @@ def load_single_model(
 
 
 GCODE_SOURCE_UPLOAD = "Upload G-Code file"
+GCODE_SOURCE_PARALLEL = "Parallel print (all shapes)"
+
+# Fixed toolpath-view colors: print color comes from the shape's table color
+# (uploads default to orange); travel is always grey.
+TOOLPATH_UPLOAD_PRINT_COLOR = "#ff7f0e"
+TOOLPATH_TRAVEL_COLOR = "#969696"
 
 
 PARALLEL_COLOR_CHOICES = [
@@ -1739,6 +1745,17 @@ def _records_from_files(files: Any, previous_records: list[dict] | None = None) 
         default_x, default_y, default_z = _default_target_extents_for_stl(path)
         nozzle = _record_nozzle_number(previous, index) if previous else _next_unused_nozzle(used_nozzles)
         used_nozzles.add(nozzle)
+        # Pressure is a port property (one regulator per serial port): a new
+        # shape adopts the pressure other shapes already use on its port.
+        pressure = previous.get("pressure")
+        if pressure is None:
+            port = _coerce_int(previous.get("port"), 1)
+            port_mates = [
+                record
+                for record in (previous_records or [])
+                if _coerce_int(record.get("port"), 1) == port
+            ]
+            pressure = port_mates[0].get("pressure", 25.0) if port_mates else 25.0
         records.append({
             "idx": index,
             "name": name,
@@ -1750,7 +1767,7 @@ def _records_from_files(files: Any, previous_records: list[dict] | None = None) 
             "target_y": previous.get("target_y", default_y),
             "target_z": previous.get("target_z", default_z),
             "last_scaled_axis": previous.get("last_scaled_axis", "target_x"),
-            "pressure": previous.get("pressure", 25.0),
+            "pressure": pressure,
             "valve": previous.get("valve", 4),
             "nozzle": nozzle,
             "port": previous.get("port", 1),
@@ -2249,7 +2266,9 @@ def _dropdown_update(records: list[dict], selected: str | None = None) -> dict[s
 def _gcode_dropdown_update(records: list[dict], selected: str | None = None, include_upload: bool = False) -> dict[str, Any]:
     choices = [_shape_choice(record) for record in records if record.get("gcode_path")]
     if include_upload:
-        choices.append(GCODE_SOURCE_UPLOAD)
+        # The visualization source radio: the parallel view leads and is the
+        # default; single shapes and the upload option follow.
+        choices = [GCODE_SOURCE_PARALLEL, *choices, GCODE_SOURCE_UPLOAD]
     value = selected if selected in choices else (choices[0] if choices else None)
     return gr.update(choices=choices, value=value)
 
@@ -2507,6 +2526,123 @@ def _last_edited_nozzles(records: list[dict] | None, settings_table: Any) -> set
     return changed
 
 
+def _last_edited_pressures(records: list[dict] | None, settings_table: Any) -> dict[int, float]:
+    """Record idx -> new pressure for rows whose Pressure cell differs from
+    the record — i.e. pressures the user just edited in the table."""
+    rows = _normalise_rows(settings_table)
+    previous_by_idx: dict[int, dict] = {}
+    for record in records or []:
+        try:
+            previous_by_idx[int(record.get("idx", 0))] = record
+        except (TypeError, ValueError):
+            continue
+
+    pressure_pos = SHAPE_SETTINGS_HEADERS.index("Pressure (psi)")
+    edited: dict[int, float] = {}
+    for row in rows:
+        try:
+            idx = int(float(row[0]))
+        except (IndexError, TypeError, ValueError):
+            continue
+        previous = previous_by_idx.get(idx)
+        if not previous or len(row) <= pressure_pos:
+            continue
+        old_pressure = _coerce_float(previous.get("pressure"), 25.0)
+        new_pressure = _coerce_float(row[pressure_pos], old_pressure)
+        if not math.isclose(new_pressure, old_pressure, rel_tol=0.0, abs_tol=1e-9):
+            edited[idx] = new_pressure
+    return edited
+
+
+def _last_edited_ports(records: list[dict] | None, settings_table: Any) -> set[int]:
+    """Record idx whose Port cell differs from the record — i.e. shapes the
+    user just moved onto a (possibly new) port via the table."""
+    rows = _normalise_rows(settings_table)
+    previous_by_idx: dict[int, dict] = {}
+    for record in records or []:
+        try:
+            previous_by_idx[int(record.get("idx", 0))] = record
+        except (TypeError, ValueError):
+            continue
+
+    port_pos = SHAPE_SETTINGS_HEADERS.index("Port")
+    changed: set[int] = set()
+    for row in rows:
+        try:
+            idx = int(float(row[0]))
+        except (IndexError, TypeError, ValueError):
+            continue
+        previous = previous_by_idx.get(idx)
+        if not previous or len(row) <= port_pos:
+            continue
+        old_port = _coerce_int(previous.get("port"), 1)
+        new_port = _coerce_int(row[port_pos], old_port)
+        if new_port != old_port:
+            changed.add(idx)
+    return changed
+
+
+def _sync_port_pressures(
+    records: list[dict],
+    edited_pressures: dict[int, float],
+    joined_idx: set[int] | None = None,
+) -> list[dict]:
+    """Sync pressures across shapes sharing a serial Port.
+
+    Pressure is a PORT property — one regulator per serial port — so every
+    shape on a port must carry the same pressure. The source value must be
+    unambiguous: the pressure the user just edited (all edits agreeing), or
+    — when a shape just JOINED the group by a port edit — the incumbent
+    members' shared pressure, which the newcomer adopts. Groups already in
+    sync, or with no clear source (e.g. stale .change echoes that flag
+    conflicting members at once), are left untouched, so the event storm
+    converges instead of ping-ponging.
+    """
+    joined_idx = joined_idx or set()
+    by_port: dict[int, list[dict]] = {}
+    for record in records:
+        by_port.setdefault(_coerce_int(record.get("port"), 1), []).append(record)
+
+    for members in by_port.values():
+        if len(members) < 2:
+            continue
+        pressures = [_coerce_float(member.get("pressure"), 25.0) for member in members]
+        if all(math.isclose(p, pressures[0], rel_tol=0.0, abs_tol=1e-9) for p in pressures[1:]):
+            continue  # port group already in sync
+
+        edited_values = {
+            round(edited_pressures[int(member.get("idx", 0))], 9)
+            for member in members
+            if int(member.get("idx", 0)) in edited_pressures
+        }
+        incumbents = [
+            member for member in members if int(member.get("idx", 0)) not in joined_idx
+        ]
+        newcomers = [
+            member for member in members if int(member.get("idx", 0)) in joined_idx
+        ]
+        if len(edited_values) == 1:
+            value = next(iter(edited_values))
+        elif not edited_values and newcomers and incumbents:
+            incumbent_pressures = [
+                _coerce_float(member.get("pressure"), 25.0) for member in incumbents
+            ]
+            if not all(
+                math.isclose(p, incumbent_pressures[0], rel_tol=0.0, abs_tol=1e-9)
+                for p in incumbent_pressures[1:]
+            ):
+                continue
+            # A port edit pulled newcomers into the group: they adopt the
+            # incumbents' shared pressure.
+            value = incumbent_pressures[0]
+        else:
+            continue  # ambiguous (stale echo): do not guess
+
+        for member in members:
+            member["pressure"] = value
+    return records
+
+
 def _record_scale_factors(record: dict) -> tuple[float, float, float] | None:
     """Per-axis target/original factors, or None when they can't be computed."""
     try:
@@ -2602,7 +2738,8 @@ def normalize_shape_dimensions_for_mode(
     shape's other dimensions from the edited axis. In BOTH modes, a
     dimension edit on a multi-material group member (shapes sharing a
     nozzle) propagates its scale factors to the whole group, so assemblies
-    stay proportional as one unit.
+    stay proportional as one unit — and a pressure edit propagates to every
+    shape sharing the same serial Port (one pressure regulator per port).
 
     Wired to the table's .change event, WHICH ALSO FIRES FOR OUR OWN
     WRITE-BACK (Gradio's Dataframe does not emit .input for cell edits at
@@ -2613,6 +2750,8 @@ def normalize_shape_dimensions_for_mode(
     """
     edited_axes = _last_edited_target_axes(records, settings_table)
     joined_idx = _last_edited_nozzles(records, settings_table)
+    edited_pressures = _last_edited_pressures(records, settings_table)
+    port_joined_idx = _last_edited_ports(records, settings_table)
     records = _apply_shape_settings(records or [], settings_table)
     if _normalize_scale_mode(scale_mode) != SCALE_MODE_UNIFORM_FACTOR:
         normalized = [dict(record) for record in records]
@@ -2621,6 +2760,7 @@ def normalize_shape_dimensions_for_mode(
             if idx in edited_axes:
                 record["last_scaled_axis"] = edited_axes[idx]
         normalized = _propagate_group_scale_factors(normalized, edited_axes, set(), joined_idx)
+        normalized = _sync_port_pressures(normalized, edited_pressures, port_joined_idx)
         changed = any(
             not math.isclose(
                 float(before.get(key) or 0.0),
@@ -2629,7 +2769,7 @@ def normalize_shape_dimensions_for_mode(
                 abs_tol=1e-9,
             )
             for before, after in zip(records, normalized)
-            for key in TARGET_DIMENSION_KEYS
+            for key in (*TARGET_DIMENSION_KEYS, "pressure")
         )
         if not changed and not _bool_cells_need_rewrite(settings_table):
             return normalized, gr.skip()
@@ -2714,10 +2854,11 @@ def normalize_shape_dimensions_for_mode(
     normalized = _propagate_group_scale_factors(
         normalized, edited_axes, recomputed_idx, joined_idx
     )
+    normalized = _sync_port_pressures(normalized, edited_pressures, port_joined_idx)
 
     # Idempotence guard (breaks the .change write-back cascade): only write
-    # the table when a dimension actually changed — or when the checkbox
-    # columns need a canonical re-render after a header "select all".
+    # the table when a dimension or pressure actually changed — or when the
+    # checkbox columns need a canonical re-render after a header "select all".
     changed = any(
         not math.isclose(
             float(before.get(key) or 0.0),
@@ -2726,7 +2867,7 @@ def normalize_shape_dimensions_for_mode(
             abs_tol=1e-9,
         )
         for before, after in zip(records, normalized)
-        for key in TARGET_DIMENSION_KEYS
+        for key in (*TARGET_DIMENSION_KEYS, "pressure")
     )
     if not changed and not _bool_cells_need_rewrite(settings_table):
         return normalized, gr.skip()
@@ -2737,7 +2878,6 @@ def show_selected_model(
     records: list[dict] | None,
     selected: str | None,
     settings_table: Any,
-    opacity: float,
     scale_mode: str | None,
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
@@ -2747,7 +2887,7 @@ def show_selected_model(
     record = records[pos]
     return load_single_model(
         record.get("stl_path"),
-        opacity,
+        False,  # full opacity (the 75%-opacity option was removed)
         True,
         scale_mode,
         record.get("target_x"),
@@ -3692,19 +3832,23 @@ def render_dynamic_toolpath(
     records: list[dict] | None,
     travel_opacity: float,
     print_opacity: float,
-    travel_color: str,
-    print_color: str,
     print_width: float,
     travel_width: float,
     tube: bool = True,
 ) -> tuple[Any, str, dict]:
+    # Print color comes from the shape's table Color (uploads default to
+    # orange); travel is always grey. No per-view color options.
+    travel_color = TOOLPATH_TRAVEL_COLOR
+    print_color = TOOLPATH_UPLOAD_PRINT_COLOR
     if source == GCODE_SOURCE_UPLOAD:
         path = uploaded_path
         label = "uploaded file"
     else:
         pos = _selected_record_index(records or [], source)
-        path = (records or [])[pos].get("gcode_path") if pos >= 0 else None
+        record = (records or [])[pos] if pos >= 0 else {}
+        path = record.get("gcode_path")
         label = source or "selected shape"
+        print_color = str(record.get("color") or print_color)
     if not path:
         return None, f"No G-code available for {label}.", {}
     try:
@@ -3880,7 +4024,6 @@ def build_dynamic_demo() -> gr.Blocks:
                     )
                     sync_uploads_button = gr.Button("Sync Uploaded STLs", variant="secondary", size="sm")
                     reset_dimensions_button = gr.Button("Reset Dimensions", variant="secondary", size="sm")
-                    model_opacity = gr.Checkbox(label="Use 75% 3D Model Opacity", value=False)
                     scale_mode = gr.Radio(
                         choices=[SCALE_MODE_TARGET_DIMENSIONS, SCALE_MODE_UNIFORM_FACTOR],
                         value=SCALE_MODE_TARGET_DIMENSIONS,
@@ -4011,6 +4154,23 @@ def build_dynamic_demo() -> gr.Blocks:
                 refresh_gcode_text_button = gr.Button("Refresh G-Code Preview", variant="secondary", size="sm")
             gcode_text = gr.Code(label="Selected G-Code", language=None, lines=18, max_lines=18, interactive=False, elem_classes=["gcode-view"])
 
+        with gr.Tab("Visualization"):
+            gr.Markdown(
+                "### Print Visualization\n"
+                "Defaults to the parallel print of every generated shape, laid out with the "
+                "spacing from the Nozzle Spacing accordion below. Pick a single shape (or "
+                "upload a G-code file) to inspect one tool path — colors come from the Shape "
+                "Settings table."
+            )
+            with gr.Row():
+                gcode_source = gr.Radio(
+                    choices=[GCODE_SOURCE_PARALLEL, GCODE_SOURCE_UPLOAD],
+                    value=GCODE_SOURCE_PARALLEL,
+                    label="What to visualize",
+                )
+                with gr.Column(elem_id="gcode-upload-col"):
+                    gcode_upload = gr.File(label="Upload G-Code", file_types=[".txt", ".gcode", ".nc"], interactive=True, height=110)
+
             with gr.Accordion("Nozzle Spacing", open=False, elem_classes=["settings-accordion"]):
                 with gr.Group():
                     with gr.Row():
@@ -4048,80 +4208,56 @@ def build_dynamic_demo() -> gr.Blocks:
                     with gr.Column(scale=1, min_width=260):
                         nozzle_spacing_status = gr.Markdown("Generate G-code, then visualize nozzle spacing.")
 
-        with gr.Tab("G-Code Visualization"):
-            gr.Markdown("### 3D Tool-Path Viewer")
-            with gr.Row():
-                gcode_source = gr.Radio(choices=[GCODE_SOURCE_UPLOAD], value=GCODE_SOURCE_UPLOAD, label="G-Code source")
-                with gr.Column(elem_id="gcode-upload-col"):
-                    gcode_upload = gr.File(label="Upload G-Code", file_types=[".txt", ".gcode", ".nc"], interactive=True, height=110)
+            # Parallel view (the default).
+            with gr.Column(visible=True) as parallel_section:
+                with gr.Row():
+                    with gr.Column(scale=1, min_width=340):
+                        pp_travel_opacity = gr.Slider(label="Travel opacity (0 = hidden)", minimum=0.0, maximum=1.0, value=0.2, step=0.05)
+                        parallel_line_button = gr.Button("Render Parallel Print - Line Plot", variant="primary")
+                        parallel_render_button = gr.Button("Render Parallel Print - Tube Plot with Animation", variant="primary")
+                        gr.Markdown("&#9888;&#65039; Building multiple tube plots can take a while for high-resolution models.", elem_id="parallel-render-warning")
+                        parallel_anim_controls = gr.HTML(PARALLEL_CONTROLS_HTML, visible=False)
+                        with gr.Row(visible=False) as pp_width_row:
+                            pp_filament_width = gr.Slider(label="Filament width (mm)", minimum=0.1, maximum=3.0, value=0.8, step=0.05, min_width=150)
+                            pp_travel_width = gr.Slider(label="Travel width (mm)", minimum=0.05, maximum=3.0, value=0.2, step=0.05, min_width=150)
+                        parallel_status = gr.Markdown("")
+                        with gr.Group(visible=False) as pp_export_group:
+                            gr.Markdown("**Export animation (GIF)** - a server-side line animation of the parallel print.")
+                            with gr.Row():
+                                pp_gif_duration = gr.Slider(label="Duration (s)", minimum=2.0, maximum=20.0, value=6.0, step=1.0, min_width=150)
+                                pp_gif_fps = gr.Slider(label="Frames per second", minimum=5, maximum=30, value=10, step=1, min_width=150)
+                            with gr.Row():
+                                pp_elev = gr.Slider(label="Elevation angle", minimum=0, maximum=90, value=22, step=1, min_width=150)
+                                pp_azim = gr.Slider(label="Azimuth angle", minimum=-180, maximum=180, value=-60, step=5, min_width=150)
+                            pp_gif_travel_opacity = gr.Slider(label="Travel opacity in GIF (0 = hidden)", minimum=0.0, maximum=1.0, value=0.15, step=0.05)
+                            pp_export_button = gr.Button("Export Animation as GIF", variant="primary")
+                            pp_gif_file = gr.File(label="Download GIF", interactive=False)
+                    with gr.Column(scale=3, min_width=500):
+                        parallel_plot = gr.Plot(label="Parallel Tool Paths", elem_id="parallel_plot")
 
-            with gr.Row():
-                with gr.Column(scale=1, min_width=340):
-                    render_line_button = gr.Button("Render Tool Path - Line Plot", variant="primary")
-                    render_tube_button = gr.Button("Render Tool Path - Tube Plot with Animation", variant="primary")
-                    gr.Markdown(
-                        "&#9888;&#65039; For high-resolution models (small layer heights), the tube plot can take a while to build and render.",
-                        elem_id="tube-render-warning",
-                    )
-                    anim_controls = gr.HTML(TOOLPATH_CONTROLS_HTML, visible=False)
-                    with gr.Row():
-                        travel_opacity_slider = gr.Slider(label="Travel (G0) opacity", minimum=0.0, maximum=1.0, value=0.2, step=0.05, min_width=150)
-                        print_opacity_slider = gr.Slider(label="Print (G1) opacity", minimum=0.0, maximum=1.0, value=1.0, step=0.05, min_width=150)
-                    with gr.Row():
-                        travel_color_picker = gr.Dropdown(
-                            label="Travel (G0) color",
-                            choices=[("Grey", "#969696"), ("Orange", "#ff7f0e"), ("Green", "#2ca02c"), ("Red", "#d62728"), ("Purple", "#9467bd"), ("Pink", "#e377c2"), ("Black", "#000000"), ("White", "#ffffff")],
-                            value="#969696",
-                            allow_custom_value=False,
-                            min_width=150,
+            # Single tool path view (a generated shape or an uploaded file).
+            with gr.Column(visible=False) as single_section:
+                with gr.Row():
+                    with gr.Column(scale=1, min_width=340):
+                        with gr.Row():
+                            travel_opacity_slider = gr.Slider(label="Travel (G0) opacity", minimum=0.0, maximum=1.0, value=0.2, step=0.05, min_width=150)
+                            print_opacity_slider = gr.Slider(label="Print (G1) opacity", minimum=0.0, maximum=1.0, value=1.0, step=0.05, min_width=150)
+                        render_line_button = gr.Button("Render Tool Path - Line Plot", variant="primary")
+                        render_tube_button = gr.Button("Render Tool Path - Tube Plot with Animation", variant="primary")
+                        gr.Markdown(
+                            "&#9888;&#65039; For high-resolution models (small layer heights), the tube plot can take a while to build and render.",
+                            elem_id="tube-render-warning",
                         )
-                        print_color_picker = gr.Dropdown(
-                            label="Print (G1) color",
-                            choices=[("Blue", "#1f77b4"), ("Orange", "#ff7f0e"), ("Green", "#2ca02c"), ("Red", "#d62728"), ("Purple", "#9467bd"), ("Pink", "#e377c2"), ("Black", "#000000"), ("White", "#ffffff")],
-                            value="#ff7f0e",
-                            allow_custom_value=False,
-                            min_width=150,
-                        )
-                    with gr.Row(visible=False) as width_row:
-                        travel_width_slider = gr.Slider(label="Travel width (mm)", minimum=0.05, maximum=1.2, value=0.2, step=0.05, min_width=150)
-                        print_width_slider = gr.Slider(label="Filament width (mm)", minimum=0.1, maximum=1.2, value=0.8, step=0.05, min_width=150)
-                    toolpath_status = gr.Markdown("")
-                with gr.Column(scale=3, min_width=500):
-                    toolpath_plot = gr.Plot(label="Tool Path", elem_id="toolpath_plot")
+                        anim_controls = gr.HTML(TOOLPATH_CONTROLS_HTML, visible=False)
+                        with gr.Row(visible=False) as width_row:
+                            travel_width_slider = gr.Slider(label="Travel width (mm)", minimum=0.05, maximum=1.2, value=0.2, step=0.05, min_width=150)
+                            print_width_slider = gr.Slider(label="Filament width (mm)", minimum=0.1, maximum=1.2, value=0.8, step=0.05, min_width=150)
+                        toolpath_status = gr.Markdown("")
+                    with gr.Column(scale=3, min_width=500):
+                        toolpath_plot = gr.Plot(label="Tool Path", elem_id="toolpath_plot")
 
             parsed_state = gr.State({})
             render_mode = gr.State("tube")
-
-        with gr.Tab("Parallel Printing Visualization"):
-            gr.Markdown(
-                "### Parallel Printing Visualization\n"
-                "Plots all generated shapes using the nozzle spacing configured on the Generate G-Code tab."
-            )
-            with gr.Row():
-                with gr.Column(scale=1, min_width=340):
-                    parallel_line_button = gr.Button("Render Parallel Print - Line Plot", variant="primary")
-                    parallel_render_button = gr.Button("Render Parallel Print - Tube Plot with Animation", variant="primary")
-                    gr.Markdown("&#9888;&#65039; Building multiple tube plots can take a while for high-resolution models.", elem_id="parallel-render-warning")
-                    parallel_anim_controls = gr.HTML(PARALLEL_CONTROLS_HTML, visible=False)
-                    pp_travel_opacity = gr.Slider(label="Travel opacity (0 = hidden)", minimum=0.0, maximum=1.0, value=0.2, step=0.05)
-                    with gr.Row(visible=False) as pp_width_row:
-                        pp_filament_width = gr.Slider(label="Filament width (mm)", minimum=0.1, maximum=3.0, value=0.8, step=0.05, min_width=150)
-                        pp_travel_width = gr.Slider(label="Travel width (mm)", minimum=0.05, maximum=3.0, value=0.2, step=0.05, min_width=150)
-                    parallel_status = gr.Markdown("")
-                    with gr.Group(visible=False) as pp_export_group:
-                        gr.Markdown("**Export animation (GIF)** - a server-side line animation of the parallel print.")
-                        with gr.Row():
-                            pp_gif_duration = gr.Slider(label="Duration (s)", minimum=2.0, maximum=20.0, value=6.0, step=1.0, min_width=150)
-                            pp_gif_fps = gr.Slider(label="Frames per second", minimum=5, maximum=30, value=10, step=1, min_width=150)
-                        with gr.Row():
-                            pp_elev = gr.Slider(label="Elevation angle", minimum=0, maximum=90, value=22, step=1, min_width=150)
-                            pp_azim = gr.Slider(label="Azimuth angle", minimum=-180, maximum=180, value=-60, step=5, min_width=150)
-                        pp_gif_travel_opacity = gr.Slider(label="Travel opacity in GIF (0 = hidden)", minimum=0.0, maximum=1.0, value=0.15, step=0.05)
-                        pp_export_button = gr.Button("Export Animation as GIF", variant="primary")
-                        pp_gif_file = gr.File(label="Download GIF", interactive=False)
-                with gr.Column(scale=3, min_width=500):
-                    parallel_plot = gr.Plot(label="Parallel Tool Paths", elem_id="parallel_plot")
-
             parallel_mode = gr.State("tube")
 
         grid_spacing_refresh_inputs = [
@@ -4197,7 +4333,7 @@ def build_dynamic_demo() -> gr.Blocks:
             queue=False,
         )
 
-        preview_inputs = [shape_records, selected_shape, shape_settings, model_opacity, scale_mode]
+        preview_inputs = [shape_records, selected_shape, shape_settings, scale_mode]
         # .change is the ONLY event the Dataframe emits for cell edits (it has
         # no working .input) — and it also fires for the normalizer's own
         # write-back. The infinite/minute-long cascade is prevented inside
@@ -4216,7 +4352,6 @@ def build_dynamic_demo() -> gr.Blocks:
         )
         selected_shape.change(fn=show_selected_model, inputs=preview_inputs, outputs=[model_viewer, model_details])
         refresh_preview_button.click(fn=show_selected_model, inputs=preview_inputs, outputs=[model_viewer, model_details])
-        model_opacity.change(fn=show_selected_model, inputs=preview_inputs, outputs=[model_viewer, model_details])
         # Sliced-layer preview. The slider uses .release only: the handler
         # writes the slider back (clamped max/value), and a .change wiring
         # would re-fire on that programmatic write.
@@ -4400,14 +4535,23 @@ def build_dynamic_demo() -> gr.Blocks:
                 return [];
             }""",
         )
+        # The source radio also decides which view is shown: the parallel
+        # print (default) or the single-toolpath view for one shape / upload.
+        gcode_source.change(
+            fn=lambda source: (
+                gr.update(visible=source == GCODE_SOURCE_PARALLEL),
+                gr.update(visible=source != GCODE_SOURCE_PARALLEL),
+            ),
+            inputs=[gcode_source],
+            outputs=[parallel_section, single_section],
+            queue=False,
+        )
         render_inputs = [
             gcode_source,
             gcode_upload,
             shape_records,
             travel_opacity_slider,
             print_opacity_slider,
-            travel_color_picker,
-            print_color_picker,
             print_width_slider,
             travel_width_slider,
         ]
