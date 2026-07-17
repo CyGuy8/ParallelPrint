@@ -766,6 +766,12 @@ def test_group_split_splits_all_materials_on_one_shared_grid() -> None:
         _record(1, "bottom", _material(box(0.0, 0.0, 20.0, 5.0), "bottom")),
         _record(2, "top", _material(box(0.0, 5.0, 20.0, 10.0), "top")),
     ]
+    # Mark the stacks as freshly sliced for the split's auto-slice step (the
+    # fixture stl paths don't exist, so a re-slice attempt would wipe them).
+    from app import _slice_params_snapshot
+
+    for record in records:
+        record["slice_params"] = _slice_params_snapshot(record, 0.8, None, None)
 
     outputs = split_selected_shape_for_grid(
         records,

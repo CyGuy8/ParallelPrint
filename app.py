@@ -2947,7 +2947,7 @@ def update_layer_preview(
     if stack is None or not getattr(stack, "layers", None):
         return (
             gr.update(maximum=1, value=1),
-            _layer_preview_message("Slice Shapes to see this shape's layer outlines."),
+            _layer_preview_message("Generate G-Code (or split) to slice this shape and see its layer outlines."),
         )
 
     layer_count = len(stack.layers)
@@ -3291,9 +3291,10 @@ def generate_dynamic_reference_stack(
 
 
 SPLIT_STATUS_DEFAULT = (
-    "Slice a shape, then split it for multi-nozzle printing. Shapes that share "
-    "a nozzle number are one multi-material assembly: selecting any of them "
-    "splits the **whole group** together as one shape."
+    "Pick a shape to split for multi-nozzle printing - shapes are sliced "
+    "automatically when you split. Shapes that share a nozzle number are one "
+    "multi-material assembly: selecting any of them splits the **whole "
+    "group** together as one shape."
 )
 
 
@@ -3353,8 +3354,8 @@ def _split_group_records(
         return _outputs(
             records,
             selected,
-            f"Split failed: shape(s) on nozzle {group_nozzle} have no sliced layers yet - "
-            "press Slice Shapes first so the group shares one Z grid.",
+            f"Split failed: shape(s) on nozzle {group_nozzle} could not be sliced - "
+            "check their STLs.",
         )
     stacks = [member["layer_stack"] for member in group_members]
     layer_counts = {len(stack.layers) for stack in stacks}
@@ -3364,7 +3365,7 @@ def _split_group_records(
             records,
             selected,
             f"Split failed: the shapes on nozzle {group_nozzle} were sliced on different "
-            "Z grids - press Slice Shapes to re-slice the group together.",
+            "Z grids - edit a dimension (or nozzle) so the group re-slices together.",
         )
 
     # Stamp group frames + seam-free contours so pieces inherit contour
@@ -3468,10 +3469,20 @@ def split_selected_shape_for_grid(
     starting_nozzle: float,
     starting_valve: float,
     fil_width: float,
+    layer_height: float = 0.8,
+    scale_mode: str | None = None,
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
+    # One-button flow: shapes are sliced (or re-sliced when their settings
+    # changed) straight from the table here, so splitting never needs a
+    # separate slicing step.
+    slice_messages: list[str] = []
+    if records:
+        _ensure_records_sliced(records, float(layer_height or 0.8), scale_mode, slice_messages)
 
     def _outputs(next_records: list[dict], selected_value: str | None, status: str) -> tuple:
+        if slice_messages:
+            status = "  \n".join([*slice_messages, status])
         return (
             next_records,
             _shape_settings_rows(next_records),
@@ -3485,7 +3496,7 @@ def split_selected_shape_for_grid(
         )
 
     if not records:
-        return _outputs(records, None, "Slice a shape before splitting it.")
+        return _outputs(records, None, "Add a shape before splitting it.")
 
     pos = _selected_record_index(records, selected)
     if pos < 0:
@@ -3496,7 +3507,7 @@ def split_selected_shape_for_grid(
         return _outputs(
             records,
             selected,
-            f"Split failed: Shape {source.get('idx', pos + 1)} has no sliced layers yet - press Slice Shapes first.",
+            f"Split failed: Shape {source.get('idx', pos + 1)} could not be sliced - check its STL.",
         )
 
     split_column_count = max(1, _coerce_int(columns, 2))
@@ -3781,7 +3792,7 @@ def _parts_from_records(records: list[dict] | None) -> tuple[list[dict], list[st
         path = record.get("gcode_path")
         idx = int(record.get("idx", len(parts) + 1))
         if not path:
-            messages.append(f"Shape {idx}: no G-code (generate it on the Generate G-Code tab).")
+            messages.append(f"Shape {idx}: no G-code (press Generate G-Code on the Shapes & G-Code tab).")
             continue
         try:
             parsed = parse_gcode_path(Path(path).read_text())
@@ -3907,7 +3918,7 @@ def render_dynamic_parallel(
     records = _apply_shape_settings(records or [], settings_table)
     parts, messages = _parts_from_records(records)
     if not parts:
-        return None, "No shape G-code available. Generate G-code on the Generate G-Code tab first."
+        return None, "No shape G-code available. Press Generate G-Code on the Shapes & G-Code tab first."
     offsets, spacings = _resolve_nozzle_grid_layout(
         parts,
         columns,
@@ -3998,11 +4009,11 @@ def build_dynamic_demo() -> gr.Blocks:
         last_shape_delete_at = gr.State(0.0)
         ref_layers = gr.State(None)
 
-        with gr.Tab("Shapes & Slicing"):
+        with gr.Tab("Shapes & G-Code"):
             gr.Markdown(
                 """
-                # Shapes & Slicing
-                Upload any number of STL files, edit per-shape dimensions and print settings in the table, then slice each shape into per-layer outlines.
+                # Shapes & G-Code
+                Upload any number of STL files, edit per-shape dimensions and print settings in the table, then press **Generate G-Code** below - every shape is sliced automatically as part of generation (and before a split).
                 Pick each shape's plot color straight from the dropdown in the **Color** column.
                 """
             )
@@ -4068,7 +4079,6 @@ def build_dynamic_demo() -> gr.Blocks:
             with gr.Row():
                 layer_height = gr.Number(label="Layer Height (mm)", value=0.8, minimum=0.0001, step=0.01)
                 fil_width = gr.Number(label="Filament/Line Width (mm)", value=0.8, minimum=0.0001, step=0.01)
-                generate_button = gr.Button("Slice Shapes", variant="primary")
 
             with gr.Accordion("Multi-Nozzle Split", open=False, elem_classes=["settings-accordion"]):
                 with gr.Row():
@@ -4109,13 +4119,11 @@ def build_dynamic_demo() -> gr.Blocks:
                     with gr.Column(scale=1, min_width=300):
                         model_details = gr.Markdown("No model loaded.")
 
-            slicer_status = gr.Markdown("")
-
-        with gr.Tab("Generate G-Code"):
             gr.Markdown(
                 """
-                # Generate G-Code
-                Generate G-code for every sliced shape. Pressure, valve, nozzle, port, and color come from the Shape Settings table.
+                ---
+                ### Generate G-Code
+                One button slices every shape from the current table settings and writes its G-code. Pressure, valve, nozzle, port, and color come from the Shape Settings table.
                 All shapes share one combined nozzle path (each dispenses only its own geometry), so parallel heads always stay in sync.
                 """
             )
@@ -4380,21 +4388,6 @@ def build_dynamic_demo() -> gr.Blocks:
             outputs=[model_viewer, model_details],
         )
 
-        generate_button.click(
-            fn=generate_dynamic_layer_stacks,
-            inputs=[shape_records, shape_settings, layer_height, scale_mode, fil_width],
-            outputs=[shape_records, slicer_status, ref_layers],
-        ).then(
-            fn=update_layer_preview,
-            inputs=layer_preview_inputs,
-            outputs=layer_preview_outputs,
-        ).then(
-            fn=lambda records: _dropdown_update(records),
-            inputs=[shape_records],
-            outputs=[split_source],
-            queue=False,
-        )
-
         split_refresh_sources.click(fn=lambda records: _dropdown_update(records), inputs=[shape_records], outputs=[split_source], queue=False)
         # .input (user selections only): programmatic dropdown refills after a
         # split must not overwrite the split result message.
@@ -4416,6 +4409,8 @@ def build_dynamic_demo() -> gr.Blocks:
                 split_start_nozzle,
                 split_start_valve,
                 fil_width,
+                layer_height,
+                scale_mode,
             ],
             outputs=[
                 shape_records,
@@ -4432,6 +4427,10 @@ def build_dynamic_demo() -> gr.Blocks:
             fn=generate_dynamic_reference_stack,
             inputs=[shape_records, fil_width],
             outputs=[ref_layers],
+        ).then(
+            fn=update_layer_preview,
+            inputs=layer_preview_inputs,
+            outputs=layer_preview_outputs,
         ).then(
             fn=_grid_spacing_table_update,
             inputs=grid_spacing_refresh_inputs,
@@ -4459,6 +4458,17 @@ def build_dynamic_demo() -> gr.Blocks:
             fn=load_selected_gcode_text,
             inputs=[shape_records, gcode_text_source],
             outputs=[gcode_text],
+        ).then(
+            # Generation slices the shapes, so refresh everything that
+            # depends on the sliced stacks (the Slice Shapes button is gone).
+            fn=update_layer_preview,
+            inputs=layer_preview_inputs,
+            outputs=layer_preview_outputs,
+        ).then(
+            fn=lambda records: _dropdown_update(records),
+            inputs=[shape_records],
+            outputs=[split_source],
+            queue=False,
         )
         gcode_text_source.change(fn=load_selected_gcode_text, inputs=[shape_records, gcode_text_source], outputs=[gcode_text])
         refresh_gcode_text_button.click(fn=load_selected_gcode_text, inputs=[shape_records, gcode_text_source], outputs=[gcode_text])

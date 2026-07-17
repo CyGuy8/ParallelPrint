@@ -33,7 +33,7 @@ uv run gradio app.py
 
 When `app.py` changes, Gradio will automatically rerun the file and refresh the demo.
 
-Then open the local Gradio URL in your browser, upload STL files or load the bundled samples, and slice the shapes.
+Then open the local Gradio URL in your browser, upload STL files or load the bundled samples, and press **Generate G-Code**.
 
 ## What the app does
 
@@ -54,7 +54,7 @@ Then open the local Gradio URL in your browser, upload STL files or load the bun
 - **Infill %** per shape skips dispensing on evenly-distributed raster lines (rings/revolutions for spiral patterns) — at 50% every other line prints — while the motion path stays exactly the same, so parallel shapes with different infill still share one print path
 - Appends a shape outline contour after each enabled shape layer by tracing that layer's polygon boundary
 - Offers a choice of raster pattern for G-code generation; all shapes always share one combined reference outline for motion (one nozzle path; each dispenses only its own geometry), and every move is emitted as `G1` at one constant speed (no `G0` rapid travel)
-- Re-slices shapes automatically during G-code generation when their slices are missing or stale, so "upload, then Generate G-Code" works in one click
+- Slicing is automatic: **Generate G-Code** slices every shape (fresh or stale) before writing G-code, and **Split Selected Shape into Grid Pieces** slices before splitting — "upload, then Generate G-Code" works in one click with no separate slice step
 - Calculates X/Y nozzle spacing from a grid layout (columns/rows plus gaps) in the Visualization tab's Nozzle Spacing accordion, with an optional per-connection Advanced Grid Spacing table, then visualizes the resulting nozzle layout
 - Previews selected generated G-code inline
 - One Visualization tab that defaults to the parallel print of every generated shape (configured nozzle spacing, animated, with a server-side GIF export), and can switch to a single tool path from any generated shape or an uploaded G-code file
@@ -69,7 +69,7 @@ Slicing uses `trimesh` cross-sections composed into shapely polygons (`slice_stl
 
 ### Reference Layer Union
 
-When you click **Slice Shapes**, the app automatically unions the sliced shapes layer-by-layer into a combined reference layer set (used for shared-motion G-code).
+Whenever shapes are sliced (automatically, during G-code generation or a split), the app unions the sliced shapes layer-by-layer into a combined reference layer set (used for shared-motion G-code).
 
 - Shapes are aligned by centering each shape's XY bounding box on a common center before the union.
 - Alignment is centered placement (in exact millimetres), not bottom-left anchoring.
@@ -89,11 +89,11 @@ For a multi-material object exported as separate STLs (one per material), give e
 
 ### Multi-Nozzle Split
 
-The **Multi-Nozzle Split** accordion on the **Shapes & Slicing** tab can split one sliced shape into a grid of print-ready piece stacks. Choose a source shape that has been sliced, set the number of columns and rows, choose the starting nozzle and valve numbers, then click **Split Selected Shape into Grid Pieces**.
+The **Multi-Nozzle Split** accordion on the **Shapes & G-Code** tab can split one shape into a grid of print-ready piece stacks. Choose a source shape, set the number of columns and rows, choose the starting nozzle and valve numbers, then click **Split Selected Shape into Grid Pieces** — the shapes are sliced automatically first if needed.
 
 - Each layer's geometry is clipped against equal-size grid cells, so every piece keeps exact vector outlines.
 - The selected shape is replaced in Shape Settings by one generated record per grid cell, named by row and column.
-- Nozzle and valve numbers are assigned sequentially from the starting values, and the **Generate G-Code** tab can generate separate G-code for each piece.
+- Nozzle and valve numbers are assigned sequentially from the starting values, and **Generate G-Code** produces separate G-code for each piece.
 - **Overlapping Layers** alternates the interior cut lines by one filament width per layer so neighbouring pieces interlock.
 - **Multi-material assemblies split as one shape**: if the selected shape shares its nozzle with other shapes, the whole group is split together — every material is clipped by the same cell grid over the group's combined bounds. Pieces are emitted cell by cell: each cell's pieces share a nozzle (so every cell is itself a multi-material group, keeping the alignment and seam-free contour behavior), each piece gets its own valve, and cells where a material has no geometry are skipped. Auto Align works on the result like any other split.
 
