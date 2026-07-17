@@ -47,7 +47,7 @@ Then open the local Gradio URL in your browser, upload STL files or load the bun
 - Slices each shape into per-layer vector outlines held in memory (no intermediate image files)
 - Shapes that share a **nozzle number** are treated automatically as one multi-material assembly: sliced on one shared Z grid and kept exactly where they were modeled, while shapes alone on their nozzle behave as ordinary independent parts
 - Automatically unions the sliced shapes into a combined reference layer set whenever shapes are sliced
-- Shows a sliced-layer preview in the Selected Shape Preview accordion (layer slider through the shape's polygon outlines, drawn in its print color; assembly parts sharing the nozzle are drawn together so multi-material slicing and Flip Z can be checked before generating G-code)
+- Shows a sliced-layer preview in the Selected Shape Preview accordion (layer slider through the shape's polygon outlines, drawn in its print color; assembly parts sharing the nozzle are drawn together so multi-material slicing can be checked before generating G-code)
 - Splits one sliced shape's geometry into an editable row/column grid for multi-nozzle printing of one large shape
 - Converts sliced layers into G-code files with pressure, valve, nozzle, port, and infill % settings per shape from the Shape Settings table
 - **Pressure is a port property** (one pressure regulator per serial port): shapes sharing a Port always share one pressure — editing one shape's pressure updates every shape on that port, moving a shape onto a port adopts that port's pressure, and newly added shapes join at their port's existing pressure
@@ -85,7 +85,6 @@ For a multi-material object exported as separate STLs (one per material), give e
 - Motion is always the combined reference outline, so all heads share one synchronized path while each dispenses only its own part.
 - Nozzle renumbering in the table takes effect on the next slice or G-code generation — groups are re-detected automatically.
 - **Dimension edits scale the whole assembly**: changing a dimension of one group member applies the same scale factor (target ÷ original, per axis) to every shape on that nozzle, in both scaling modes — in Keep Proportions one edit rescales every member proportionally; in Independent X/Y/Z the edited axis's factor propagates to the group. Factors (not absolute values) keep differently-sized parts proportional to each other, and group members are scaled about the assembly's shared corner so the parts stay assembled at any size.
-- **Flip Z** (per-shape checkbox) prints a shape the other way up by mirroring it about its Z midplane. Checking it on any assembly member flips the **whole group** about the group's shared midplane, so the assembly stays together — useful when a multi-material model is authored with its display face down (e.g. the detail layer would otherwise print first instead of last).
 
 ### Multi-Nozzle Split
 

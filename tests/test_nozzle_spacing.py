@@ -111,7 +111,7 @@ def test_shape_settings_round_trip_contour_tracing_column() -> None:
 
     rows = _shape_settings_rows(records)
     assert SHAPE_SETTINGS_HEADERS[6:9] == ["Valve", "Nozzle", "Port"]
-    assert SHAPE_SETTINGS_HEADERS[-4:] == ["Contour Tracing", "Lead In", "Flip Z", "Delete"]
+    assert SHAPE_SETTINGS_HEADERS[-3:] == ["Contour Tracing", "Lead In", "Delete"]
     contour_pos = SHAPE_SETTINGS_HEADERS.index("Contour Tracing")
     lead_in_pos = SHAPE_SETTINGS_HEADERS.index("Lead In")
     assert rows[0][6:9] == [4, 1, 1]
@@ -875,7 +875,7 @@ def test_keep_proportions_is_stale_echo_proof() -> None:
     rows[0][3] = 50.0
     updated, table_out = normalize_shape_dimensions_for_mode(records, rows, SCALE_MODE_UNIFORM_FACTOR)
     assert updated[0]["target_x"] == 50.0
-    assert updated[0]["target_z"] == 43.301273
+    assert updated[0]["target_z"] == 43.3  # tenths grid (originals round too)
     assert isinstance(table_out, list)  # table written
 
     # 2) A stale PRE-EDIT echo arrives while records already hold the scaled
@@ -889,7 +889,7 @@ def test_keep_proportions_is_stale_echo_proof() -> None:
     updated3, table_out3 = normalize_shape_dimensions_for_mode(updated, scaled_rows, SCALE_MODE_UNIFORM_FACTOR)
     assert not isinstance(table_out3, list)
     assert updated3[0]["target_x"] == 50.0
-    assert updated3[0]["target_z"] == 43.301273
+    assert updated3[0]["target_z"] == 43.3
 
 
 def _mm_member(idx: int, nozzle: int, ox: float, oy: float, oz: float) -> dict:
@@ -1010,6 +1010,36 @@ def test_joining_a_nozzle_group_adopts_the_group_scale() -> None:
     )
     assert not isinstance(table_out2, list)
     assert updated2[2]["target_x"] == 45.0
+
+
+def test_table_dimensions_display_and_store_to_the_tenths_place() -> None:
+    from app import SCALE_MODE_TARGET_DIMENSIONS
+
+    # Headers shrank: "Target X (mm)" -> "X (mm)".
+    assert SHAPE_SETTINGS_HEADERS[2:5] == ["X (mm)", "Y (mm)", "Z (mm)"]
+
+    record = _mm_member(1, 1, 38.1, 38.1, 33.0)
+    record["target_z"] = 32.99557  # legacy noisy value from a mesh extent
+    rows = _shape_settings_rows([record])
+    assert rows[0][2:5] == [38.1, 38.1, 33.0]
+
+    # The echo of the rounded display converges: the stored value snaps to
+    # the displayed tenths and no further table rewrite happens.
+    updated, table_out = normalize_shape_dimensions_for_mode(
+        [record], rows, SCALE_MODE_TARGET_DIMENSIONS
+    )
+    assert updated[0]["target_z"] == 33.0
+    assert not isinstance(table_out, list)
+
+    # Keep Proportions recomputes land on the tenths grid too.
+    updated[0]["last_scaled_axis"] = "target_x"
+    rows2 = _shape_settings_rows(updated)
+    rows2[0][2] = 50.0
+    updated2, _out = normalize_shape_dimensions_for_mode(
+        updated, rows2, SCALE_MODE_UNIFORM_FACTOR
+    )
+    for key in ("target_x", "target_y", "target_z"):
+        assert updated2[0][key] == round(updated2[0][key], 1)
 
 
 def test_pressure_edit_propagates_to_shapes_sharing_the_port() -> None:
@@ -1159,20 +1189,20 @@ def test_apply_bulk_bool_selection_sets_a_whole_column() -> None:
         _mm_member(2, 2, 10.0, 10.0, 10.0),
         _mm_member(3, 3, 10.0, 10.0, 10.0),
     ]
-    flip_pos = SHAPE_SETTINGS_HEADERS.index("Flip Z")
     lead_pos = SHAPE_SETTINGS_HEADERS.index("Lead In")
+    contour_pos = SHAPE_SETTINGS_HEADERS.index("Contour Tracing")
 
-    updated, rows = apply_bulk_bool_selection(records, None, f"{flip_pos}|1")
-    assert all(record["flip_z"] is True for record in updated)
-    assert all(record.get("lead_in") is not True for record in updated)  # no bleed
-    assert all(row[flip_pos] is True for row in rows)
-    assert all(row[lead_pos] is False for row in rows)
+    updated, rows = apply_bulk_bool_selection(records, None, f"{lead_pos}|1")
+    assert all(record["lead_in"] is True for record in updated)
+    assert all(record.get("contour_tracing") is not True for record in updated)  # no bleed
+    assert all(row[lead_pos] is True for row in rows)
+    assert all(row[contour_pos] is False for row in rows)
 
     # Unchecking clears the whole column; junk payloads change nothing.
-    cleared, rows2 = apply_bulk_bool_selection(updated, rows, f"{flip_pos}|0")
-    assert all(record["flip_z"] is False for record in cleared)
+    cleared, rows2 = apply_bulk_bool_selection(updated, rows, f"{lead_pos}|0")
+    assert all(record["lead_in"] is False for record in cleared)
     same, _rows3 = apply_bulk_bool_selection(cleared, rows2, "garbage")
-    assert all(record["flip_z"] is False for record in same)
+    assert all(record["lead_in"] is False for record in same)
     # Non-bool columns are refused.
     color_pos = SHAPE_SETTINGS_HEADERS.index("Color")
     refused, _rows4 = apply_bulk_bool_selection(cleared, rows2, f"{color_pos}|1")

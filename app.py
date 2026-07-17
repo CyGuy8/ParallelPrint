@@ -92,7 +92,11 @@ APP_CSS = """
     display: flex;
     align-items: center;
     gap: 6px;
-    min-width: 170px;
+    min-width: 92px;
+}
+.pp-color-select {
+    width: 100%;
+    min-width: 0;
 }
 .pp-color-current {
     display: inline-block;
@@ -252,6 +256,22 @@ APP_CSS = """
 #shape-settings-table table tbody tr td:last-child textarea,
 #shape-settings-table [role="gridcell"]:nth-child(12n) textarea {
     display: none !important;
+}
+
+/* Narrower columns: header labels ("Pressure (psi)", "Contour Tracing", ...)
+   wrap to two lines instead of forcing single-line column widths. */
+#shape-settings-table thead th,
+#shape-settings-table thead th button,
+#shape-settings-table thead th span {
+    white-space: normal !important;
+    overflow-wrap: break-word;
+    line-height: 1.15;
+}
+#shape-settings-table thead th {
+    text-align: center;
+    vertical-align: middle;
+    padding-left: 0.2rem !important;
+    padding-right: 0.2rem !important;
 }
 
 #toolpath-anim-controls {
@@ -1586,9 +1606,9 @@ def _format_nozzle_spacing_status(
 SHAPE_SETTINGS_HEADERS = [
     "Shape",
     "STL",
-    "Target X (mm)",
-    "Target Y (mm)",
-    "Target Z (mm)",
+    "X (mm)",
+    "Y (mm)",
+    "Z (mm)",
     "Pressure (psi)",
     "Valve",
     "Nozzle",
@@ -1597,7 +1617,6 @@ SHAPE_SETTINGS_HEADERS = [
     "Infill %",
     "Contour Tracing",
     "Lead In",
-    "Flip Z",
     "Delete",
 ]
 SHAPE_SETTINGS_DATATYPES = [
@@ -1612,7 +1631,6 @@ SHAPE_SETTINGS_DATATYPES = [
     "number",
     "markdown",
     "number",
-    "bool",
     "bool",
     "bool",
     "str",
@@ -1760,12 +1778,14 @@ def _records_from_files(files: Any, previous_records: list[dict] | None = None) 
             "idx": index,
             "name": name,
             "stl_path": path,
-            "original_x": previous.get("original_x", default_x),
-            "original_y": previous.get("original_y", default_y),
-            "original_z": previous.get("original_z", default_z),
-            "target_x": previous.get("target_x", default_x),
-            "target_y": previous.get("target_y", default_y),
-            "target_z": previous.get("target_z", default_z),
+            # Dimensions live on a 0.1 mm grid (originals included, so a
+            # pristine row's target/original ratios are exactly 1).
+            "original_x": round(_coerce_float(previous.get("original_x"), default_x), 1),
+            "original_y": round(_coerce_float(previous.get("original_y"), default_y), 1),
+            "original_z": round(_coerce_float(previous.get("original_z"), default_z), 1),
+            "target_x": round(_coerce_float(previous.get("target_x"), default_x), 1),
+            "target_y": round(_coerce_float(previous.get("target_y"), default_y), 1),
+            "target_z": round(_coerce_float(previous.get("target_z"), default_z), 1),
             "last_scaled_axis": previous.get("last_scaled_axis", "target_x"),
             "pressure": pressure,
             "valve": previous.get("valve", 4),
@@ -1791,14 +1811,33 @@ def _reindex_shape_records(records: list[dict]) -> list[dict]:
     return reindexed
 
 
+def _round_targets_to_tenths(record: dict) -> dict:
+    """Snap a record's dimensions (targets AND originals) to the 0.1 mm grid.
+
+    Table dimensions are DISPLAYED to the tenths place, and the table's
+    .change echo re-applies whatever is displayed — so the stored values
+    must round identically or every echo would look like a fresh edit and
+    the convergence guards would ping-pong. Originals round too: a pristine
+    row's target/original ratios must be exactly 1, or legacy noisy extents
+    (e.g. 32.99557) would break the odd-one-out edit anchoring."""
+    for key in (*TARGET_DIMENSION_KEYS, "original_x", "original_y", "original_z"):
+        try:
+            value = float(record.get(key))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            record[key] = round(value, 1)
+    return record
+
+
 def _shape_settings_rows(records: list[dict]) -> list[list[Any]]:
     return [
         [
             record["idx"],
             record["name"],
-            record.get("target_x", DEFAULT_TARGET_EXTENTS[0]),
-            record.get("target_y", DEFAULT_TARGET_EXTENTS[1]),
-            record.get("target_z", DEFAULT_TARGET_EXTENTS[2]),
+            round(_coerce_float(record.get("target_x"), DEFAULT_TARGET_EXTENTS[0]), 1),
+            round(_coerce_float(record.get("target_y"), DEFAULT_TARGET_EXTENTS[1]), 1),
+            round(_coerce_float(record.get("target_z"), DEFAULT_TARGET_EXTENTS[2]), 1),
             record.get("pressure", 25.0),
             record.get("valve", 4),
             _record_nozzle_number(record, int(record["idx"])),
@@ -1807,7 +1846,6 @@ def _shape_settings_rows(records: list[dict]) -> list[list[Any]]:
             _coerce_float(record.get("infill", 100.0), 100.0),
             bool(record.get("contour_tracing", False)),
             bool(record.get("lead_in", False)),
-            bool(record.get("flip_z", False)),
             "Delete",
         ]
         for record in records
@@ -1883,13 +1921,6 @@ def _apply_shape_settings(records: list[dict], settings_table: Any) -> list[dict
                 copy["lead_in"] = _coerce_bool(row[lead_in_pos], bool(copy.get("lead_in", False)))
             except IndexError:
                 copy["lead_in"] = bool(copy.get("lead_in", False))
-            flip_pos = lead_in_pos + 1
-            # Parse only when the Flip Z column is present (Delete follows it);
-            # an old-format row would otherwise coerce the "Delete" cell.
-            if len(row) > flip_pos + 1:
-                copy["flip_z"] = _coerce_bool(row[flip_pos], bool(copy.get("flip_z", False)))
-            else:
-                copy["flip_z"] = bool(copy.get("flip_z", False))
         updated.append(copy)
     return updated
 
@@ -1916,7 +1947,10 @@ def _last_edited_target_axes(records: list[dict] | None, settings_table: Any) ->
         for key, pos in zip(TARGET_DIMENSION_KEYS, (2, 3, 4)):
             try:
                 new_value = float(row[pos])
-                old_value = float(previous.get(key))
+                # The table displays tenths, so an edit is a deviation from
+                # what was DISPLAYED — comparing against an unrounded stored
+                # value would flag phantom edits on legacy noisy records.
+                old_value = round(float(previous.get(key)), 1)
             except (IndexError, TypeError, ValueError):
                 continue
             if not math.isclose(new_value, old_value, rel_tol=1e-9, abs_tol=1e-9):
@@ -2432,9 +2466,12 @@ def reset_shape_dimensions(records: list[dict] | None, settings_table: Any | Non
         original_z = copy.get("original_z")
         if original_x is None or original_y is None or original_z is None:
             original_x, original_y, original_z = _default_target_extents_for_stl(str(copy.get("stl_path", "")))
-            copy["original_x"] = original_x
-            copy["original_y"] = original_y
-            copy["original_z"] = original_z
+        original_x = round(float(original_x), 1)
+        original_y = round(float(original_y), 1)
+        original_z = round(float(original_z), 1)
+        copy["original_x"] = original_x
+        copy["original_y"] = original_y
+        copy["original_z"] = original_z
         copy["target_x"] = original_x
         copy["target_y"] = original_y
         copy["target_z"] = original_z
@@ -2446,7 +2483,6 @@ def reset_shape_dimensions(records: list[dict] | None, settings_table: Any | Non
 BULK_BOOL_COLUMNS = {
     "Contour Tracing": "contour_tracing",
     "Lead In": "lead_in",
-    "Flip Z": "flip_z",
 }
 
 
@@ -2488,7 +2524,7 @@ def _bool_cells_need_rewrite(settings_table: Any) -> bool:
     """
     rows = _normalise_rows(settings_table)
     contour_pos = SHAPE_SETTINGS_HEADERS.index("Contour Tracing")
-    bool_positions = (contour_pos, contour_pos + 1, contour_pos + 2)
+    bool_positions = (contour_pos, contour_pos + 1)
     for row in rows:
         if len(row) < len(SHAPE_SETTINGS_HEADERS):
             continue
@@ -2721,7 +2757,7 @@ def _propagate_group_scale_factors(
                 continue
             for axis, factor in zip(("x", "y", "z"), source_factors):
                 member[f"target_{axis}"] = round(
-                    float(member[f"original_{axis}"]) * factor, 6
+                    float(member[f"original_{axis}"]) * factor, 1
                 )
             member["last_scaled_axis"] = source.get(
                 "last_scaled_axis", member.get("last_scaled_axis")
@@ -2759,6 +2795,8 @@ def normalize_shape_dimensions_for_mode(
             idx = int(record.get("idx", 0))
             if idx in edited_axes:
                 record["last_scaled_axis"] = edited_axes[idx]
+            if record.get("stl_path"):
+                _round_targets_to_tenths(record)
         normalized = _propagate_group_scale_factors(normalized, edited_axes, set(), joined_idx)
         normalized = _sync_port_pressures(normalized, edited_pressures, port_joined_idx)
         changed = any(
@@ -2786,6 +2824,7 @@ def normalize_shape_dimensions_for_mode(
             # Piece dimensions are informational — never rescale them.
             normalized.append(copy)
             continue
+        _round_targets_to_tenths(copy)
         originals = np.asarray([
             copy.get("original_x"),
             copy.get("original_y"),
@@ -2845,9 +2884,9 @@ def normalize_shape_dimensions_for_mode(
         scale = float(targets[anchor_index] / originals[anchor_index])
         copy["last_scaled_axis"] = TARGET_DIMENSION_KEYS[anchor_index]
         scaled = originals * scale
-        copy["target_x"] = round(float(scaled[0]), 6)
-        copy["target_y"] = round(float(scaled[1]), 6)
-        copy["target_z"] = round(float(scaled[2]), 6)
+        copy["target_x"] = round(float(scaled[0]), 1)
+        copy["target_y"] = round(float(scaled[1]), 1)
+        copy["target_z"] = round(float(scaled[2]), 1)
         recomputed_idx.add(idx)
         normalized.append(copy)
 
@@ -2932,8 +2971,8 @@ def update_layer_preview(
 
     Draws the selected shape's layer polygons in its print color. Shapes on
     the same nozzle are parts of one assembly, so their polygons at the same
-    Z are drawn too (dimmer) — this is where multi-material slicing and Flip
-    Z can be checked before generating any G-code.
+    Z are drawn too (dimmer) — this is where multi-material slicing can be
+    checked before generating any G-code.
     """
     from matplotlib.figure import Figure
     from matplotlib.patches import Patch
@@ -3024,11 +3063,10 @@ def _slice_params_snapshot(
     record: dict,
     layer_height: float,
     scale_mode: str | None,
-    slice_plan: tuple[list[float], tuple[float, float, float], float | None] | None = None,
+    slice_plan: tuple[list[float], tuple[float, float, float]] | None = None,
 ) -> dict:
     z_levels = slice_plan[0] if slice_plan else None
     anchor = slice_plan[1] if slice_plan else None
-    z_flip_mid = slice_plan[2] if slice_plan else None
     return {
         "layer_height": float(layer_height),
         "scale_mode": _normalize_scale_mode(scale_mode),
@@ -3040,8 +3078,6 @@ def _slice_params_snapshot(
         # correctly marks every part's slices stale.
         "z_grid": (round(z_levels[0], 6), len(z_levels)) if z_levels else None,
         "scale_anchor": tuple(round(v, 6) for v in anchor) if anchor else None,
-        "flip_z": bool(record.get("flip_z", False)),
-        "z_flip_mid": round(z_flip_mid, 6) if z_flip_mid is not None else None,
     }
 
 
@@ -3110,17 +3146,14 @@ def _multi_material_slice_plan(
     records: list[dict],
     layer_height: float,
     scale_mode: str | None,
-) -> tuple[list[float], tuple[float, float, float], float | None] | None:
-    """(shared Z grid, shared scale anchor, Z-flip midplane) for one group.
+) -> tuple[list[float], tuple[float, float, float]] | None:
+    """(shared Z grid, shared scale anchor) for one multi-material group.
 
     Group members must slice on the SAME planes so a part that starts
     higher gets empty lower layers instead of having its first material
     layer treated as layer 0 — and any target-dimension scaling must happen
     about ONE shared point (the group's combined un-scaled corner), or
     same-factor scaling would still shift the parts relative to each other.
-    When any member has Flip Z checked, the WHOLE assembly mirrors about
-    the group's combined Z midplane (so it stays assembled, just printed
-    the other way up); the midplane is returned, else None.
     """
     loaded: list[tuple[Any, tuple[float, float, float]]] = []
     corner = [math.inf, math.inf, math.inf]
@@ -3158,10 +3191,7 @@ def _multi_material_slice_plan(
         z_hi = max(z_hi, float(scaled.bounds[1][2]))
     if not math.isfinite(z_lo) or not math.isfinite(z_hi):
         return None
-    # Mirroring about the group midplane preserves the group's Z range, so
-    # the shared grid stays valid for the flipped assembly.
-    z_flip_mid = (z_lo + z_hi) / 2.0 if any(r.get("flip_z") for r in records) else None
-    return calculate_z_levels(z_lo, z_hi, float(layer_height)), anchor, z_flip_mid
+    return calculate_z_levels(z_lo, z_hi, float(layer_height)), anchor
 
 
 def _slice_record(
@@ -3169,7 +3199,7 @@ def _slice_record(
     layer_height: float,
     scale_mode: str | None,
     progress_callback=None,
-    slice_plan: tuple[list[float], tuple[float, float, float], float | None] | None = None,
+    slice_plan: tuple[list[float], tuple[float, float, float]] | None = None,
 ) -> LayerStack:
     stl_path = record["stl_path"]
     mesh = load_mesh(stl_path)
@@ -3181,10 +3211,6 @@ def _slice_record(
         record.get("target_y"),
         record.get("target_z"),
     )
-    # Group members flip together about the group midplane (any member's
-    # Flip Z flips the whole assembly); solo shapes flip about their own.
-    z_flip_mid = slice_plan[2] if slice_plan else None
-    flip_z = (z_flip_mid is not None) if slice_plan else bool(record.get("flip_z", False))
     stack = slice_stl_to_layers(
         stl_path,
         layer_height=float(layer_height),
@@ -3193,8 +3219,6 @@ def _slice_record(
         name=str(record.get("name") or Path(stl_path).stem),
         z_levels=slice_plan[0] if slice_plan else None,
         scale_anchor=slice_plan[1] if slice_plan else None,
-        flip_z=flip_z,
-        z_flip_mid=z_flip_mid,
     )
     record["layer_stack"] = stack
     record["slice_params"] = _slice_params_snapshot(record, layer_height, scale_mode, slice_plan)
@@ -3223,8 +3247,6 @@ def _group_z_levels_by_record(
                 f"Multi-material group (nozzle {nozzle}): {names} — sliced on one "
                 f"shared Z grid ({len(z_levels)} layers), positions locked together."
             )
-            if plan[2] is not None:
-                note += " Flip Z is set: the whole assembly prints mirrored top-to-bottom."
             messages.append(note)
     return plan_by_record
 
@@ -3414,8 +3436,8 @@ def _split_group_records(
             piece_record.update({
                 "name": f"{member_name} - R{row_index}C{col_index}",
                 "stl_path": None,
-                "target_x": (piece_x_max - piece_x_min) or member.get("target_x", DEFAULT_TARGET_EXTENTS[0]),
-                "target_y": (piece_y_max - piece_y_min) or member.get("target_y", DEFAULT_TARGET_EXTENTS[1]),
+                "target_x": round((piece_x_max - piece_x_min) or member.get("target_x", DEFAULT_TARGET_EXTENTS[0]), 1),
+                "target_y": round((piece_y_max - piece_y_min) or member.get("target_y", DEFAULT_TARGET_EXTENTS[1]), 1),
                 "nozzle": first_nozzle + cell,
                 "valve": valve_cursor,
                 "split_group_id": split_group_id,
@@ -4075,6 +4097,24 @@ def build_dynamic_demo() -> gr.Blocks:
                 static_columns=[SHAPE_SETTINGS_HEADERS.index("Color")],
                 label="Shape Settings",
                 elem_id="shape-settings-table",
+                # Narrow fixed widths; two-word headers ("Pressure (psi)",
+                # "Contour Tracing", ...) wrap to two lines via CSS.
+                column_widths=[
+                    "52px",   # Shape
+                    "170px",  # STL
+                    "62px",   # X (mm)
+                    "62px",   # Y (mm)
+                    "62px",   # Z (mm)
+                    "76px",   # Pressure (psi)
+                    "56px",   # Valve
+                    "60px",   # Nozzle
+                    "52px",   # Port
+                    "104px",  # Color
+                    "58px",   # Infill %
+                    "78px",   # Contour Tracing
+                    "58px",   # Lead In
+                    "60px",   # Delete
+                ],
             )
             with gr.Row():
                 layer_height = gr.Number(label="Layer Height (mm)", value=0.8, minimum=0.0001, step=0.01)
