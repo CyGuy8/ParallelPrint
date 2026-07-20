@@ -46,6 +46,9 @@ Then open the local Gradio URL in your browser, upload STL files or load the bun
 - Lets you choose layer height and filament/line width
 - Slices each shape into per-layer vector outlines held in memory (no intermediate image files)
 - Shapes that share a **nozzle number** are treated automatically as one multi-material assembly: sliced on one shared Z grid and kept exactly where they were modeled, while shapes alone on their nozzle behave as ordinary independent parts
+- Nozzle groups are visible right in the table: rows sharing a nozzle get a shared tint and accent stripe, and a summary under the table names each assembly ("Nozzle 1: red_base + black_stripes print as one assembly")
+- Valve safety check: valve cells used by more than one shape turn red with a warning under the table — shapes sharing a valve dispense simultaneously, which is almost never intended. New shapes default to their own unused valve number
+- Port groups are marked too: shapes sharing a Port get a matching underline on their Pressure and Port cells and a summary line ("Port 1: A + B share one pressure regulator (25 psi)") — one regulator per serial port is why their pressures stay in sync
 - Automatically unions the sliced shapes into a combined reference layer set whenever shapes are sliced
 - Shows a sliced-layer preview in the Selected Shape Preview accordion (layer slider through the shape's polygon outlines, drawn in its print color; assembly parts sharing the nozzle are drawn together so multi-material slicing can be checked before generating G-code)
 - Splits one sliced shape's geometry into an editable row/column grid for multi-nozzle printing of one large shape
@@ -59,6 +62,7 @@ Then open the local Gradio URL in your browser, upload STL files or load the bun
 - Previews selected generated G-code inline
 - One Visualization tab that defaults to the parallel print of every generated shape (configured nozzle spacing, animated, with a server-side GIF export), and can switch to a single tool path from any generated shape or an uploaded G-code file
 - Renders as a fast line plot or an animated 3D tube plot (play/pause, speed, scrub, frame-step, nozzle marker); print colors come from the Shape Settings table (uploads render orange, travel grey)
+- Estimates print time from an inputted **Nozzle Speed (mm/s)**: every move runs at one constant speed, so time = tool-path length ÷ speed — shown with the path length in the render status for both the parallel view (longest head's path; all heads move together) and the single-tool-path view
 - Each shape's plot color is set with one click on a palette chip embedded in the Shape Settings **Color** column (Orange, Blue, Green, Red, Purple, Pink, Teal, Yellow, White, Black) — the cell shows the current color's name and highlights its chip
 
 ## Behavior and Implementation Notes

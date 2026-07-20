@@ -313,6 +313,41 @@ def test_sample_reload_appends_next_nozzle_set() -> None:
     assert [record["nozzle"] for record in second_load] == [1, 2, 3, 4, 5, 6]
 
 
+def test_print_time_estimate_from_path_length_and_speed() -> None:
+    from app import _parsed_path_length, _print_time_estimate
+
+    parsed = {
+        "print_segments": [[(0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 5.0, 0.0)]],
+        "travel_segments": [[(10.0, 5.0, 0.0), (10.0, 5.0, 2.0)]],
+    }
+    assert _parsed_path_length(parsed) == 17.0
+
+    assert _print_time_estimate(17.0, 1.0) == "17 s"
+    assert _print_time_estimate(150.0, 1.0) == "2 min 30 s"
+    assert _print_time_estimate(3600.0, 1.0) == "1 h 00 min"
+    assert _print_time_estimate(29532.0, 10.0) == "49 min 13 s"
+    # No estimate without a usable speed or path.
+    assert _print_time_estimate(100.0, 0) is None
+    assert _print_time_estimate(100.0, None) is None
+    assert _print_time_estimate(0.0, 5.0) is None
+
+
+def test_new_shapes_default_to_unique_valves() -> None:
+    # Shapes sharing a valve dispense together, so defaults must not collide.
+    first_load = _records_from_files(["a.stl", "b.stl", "c.stl"])
+    assert [record["valve"] for record in first_load] == [4, 5, 6]
+
+    # Re-syncing keeps the assigned valves.
+    resync = _records_from_files(["a.stl", "b.stl", "c.stl"], first_load)
+    assert [record["valve"] for record in resync] == [4, 5, 6]
+
+    # User-set valves survive, and new shapes take the smallest unused number.
+    first_load[0]["valve"] = 9
+    more = _records_from_files(["a.stl", "d.stl"], first_load)
+    assert more[0]["valve"] == 9
+    assert more[1]["valve"] == 4
+
+
 def _split_piece_records(
     tmp_path,
     columns: int = 2,

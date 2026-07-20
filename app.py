@@ -258,13 +258,41 @@ APP_CSS = """
     display: none !important;
 }
 
+/* Nozzle-group summary under the Shape Settings table (filled client-side). */
+#pp-group-note {
+    padding: 0.4rem 0.3rem 0.1rem;
+    font-size: 0.85rem;
+    line-height: 1.55;
+    color: var(--body-text-color);
+}
+.pp-group-line {
+    display: block;
+}
+.pp-group-chip {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    margin-right: 6px;
+}
+.pp-valve-warning {
+    color: #dc2626;
+}
+.pp-port-line {
+    color: var(--body-text-color-subdued);
+}
+
 /* Narrower columns: header labels ("Pressure (psi)", "Contour Tracing", ...)
-   wrap to two lines instead of forcing single-line column widths. */
+   wrap to two lines instead of forcing single-line column widths. Wrapping
+   happens ONLY at spaces — words never break mid-word (columns grow to fit
+   their longest word instead), whatever font the host renders with. */
 #shape-settings-table thead th,
 #shape-settings-table thead th button,
 #shape-settings-table thead th span {
     white-space: normal !important;
-    overflow-wrap: break-word;
+    overflow-wrap: normal !important;
+    word-break: keep-all !important;
+    hyphens: none;
     line-height: 1.15;
 }
 #shape-settings-table thead th {
@@ -522,6 +550,176 @@ APP_HEAD = """
         document.addEventListener('DOMContentLoaded', start);
     } else {
         start();
+    }
+})();
+</script>
+<script>
+// Nozzle-group highlighting: shapes sharing a nozzle number print as ONE
+// multi-material assembly, so their rows get a shared tint + accent stripe,
+// and a summary under the table names each assembly. Valve cells used by
+// more than one shape turn red (they would dispense simultaneously).
+// Pure presentation, recomputed from the rendered table on every re-render.
+(function () {
+    var NAME_COL = 1, PRESSURE_COL = 5, VALVE_COL = 6, NOZZLE_COL = 7, PORT_COL = 8, COLUMNS = 14;
+    var TINTS = ['rgba(31,119,180,0.10)', 'rgba(255,127,14,0.12)', 'rgba(44,160,44,0.10)', 'rgba(148,103,189,0.12)', 'rgba(23,190,207,0.12)'];
+    var EDGES = ['#1f77b4', '#ff7f0e', '#2ca02c', '#9467bd', '#17becf'];
+    var PORT_EDGES = ['#64748b', '#0ea5e9', '#f59e0b', '#10b981'];
+    function cellNumber(td) {
+        var text = ((td && td.textContent) || '').replace(/[^0-9.\\-]/g, '');
+        if (!text) return null;
+        var value = parseFloat(text);
+        return isNaN(value) ? null : Math.round(value);
+    }
+    function cellName(td) {
+        return ((td && td.textContent) || '').replace(/\\u22ee/g, '').trim();
+    }
+    function refresh() {
+        var container = document.getElementById('shape-settings-table');
+        if (!container) return;
+        // The component renders rows in TWO tables (one wrapped in the
+        // drag-drop <button>, one outside), splitting or DUPLICATING rows
+        // between them — and the outer table can hold a stale leftover of a
+        // previous render. Counting raw rows duplicated group names and
+        // flagged phantom valve conflicts, so rows are deduplicated by
+        // their Shape number, preferring the button-wrapped (live) copy;
+        // every copy still gets styled.
+        var byIdx = {};
+        var entries = [];
+        Array.prototype.slice.call(container.querySelectorAll('table tbody tr')).forEach(function (tr) {
+            var tds = tr.querySelectorAll('td');
+            for (var i = 0; i < tds.length; i++) {
+                tds[i].style.background = '';
+                if (i === 0 || i === PRESSURE_COL || i === PORT_COL) tds[i].style.boxShadow = '';
+                if (i === VALVE_COL || i === PRESSURE_COL || i === PORT_COL) tds[i].removeAttribute('title');
+            }
+            tr.removeAttribute('title');
+            if (tds.length < COLUMNS) return;
+            var idx = cellNumber(tds[0]);
+            if (idx === null) return;
+            var fromLive = !!tr.closest('button');
+            var entry = byIdx[idx];
+            if (!entry) {
+                entry = byIdx[idx] = {
+                    name: cellName(tds[NAME_COL]),
+                    nozzle: cellNumber(tds[NOZZLE_COL]),
+                    valve: cellNumber(tds[VALVE_COL]),
+                    port: cellNumber(tds[PORT_COL]),
+                    pressure: cellName(tds[PRESSURE_COL]),
+                    fromLive: fromLive,
+                    copies: []
+                };
+                entries.push(entry);
+            } else if (fromLive && !entry.fromLive) {
+                entry.name = cellName(tds[NAME_COL]);
+                entry.nozzle = cellNumber(tds[NOZZLE_COL]);
+                entry.valve = cellNumber(tds[VALVE_COL]);
+                entry.port = cellNumber(tds[PORT_COL]);
+                entry.pressure = cellName(tds[PRESSURE_COL]);
+                entry.fromLive = true;
+            }
+            entry.copies.push({tr: tr, tds: tds});
+        });
+        var byNozzle = {}, byValve = {}, byPort = {};
+        entries.forEach(function (entry) {
+            if (entry.nozzle !== null) (byNozzle[entry.nozzle] = byNozzle[entry.nozzle] || []).push(entry);
+            if (entry.valve !== null) (byValve[entry.valve] = byValve[entry.valve] || []).push(entry);
+            if (entry.port !== null) (byPort[entry.port] = byPort[entry.port] || []).push(entry);
+        });
+        var summary = [];
+        var groupNozzles = Object.keys(byNozzle).filter(function (n) { return byNozzle[n].length > 1; });
+        groupNozzles.sort(function (a, b) { return a - b; });
+        groupNozzles.forEach(function (nozzle, gi) {
+            var tint = TINTS[gi % TINTS.length];
+            var edge = EDGES[gi % EDGES.length];
+            var names = [];
+            byNozzle[nozzle].forEach(function (entry) {
+                entry.copies.forEach(function (copy) {
+                    for (var i = 0; i < copy.tds.length; i++) copy.tds[i].style.background = tint;
+                    copy.tds[0].style.boxShadow = 'inset 3px 0 0 ' + edge;
+                    copy.tr.title = 'Nozzle ' + nozzle + ': these shapes print as one multi-material assembly';
+                });
+                if (entry.name) names.push(entry.name);
+            });
+            summary.push(
+                '<span class="pp-group-line"><span class="pp-group-chip" style="background:' + edge + '"></span>' +
+                'Nozzle ' + nozzle + ': <b>' + names.join(' + ') + '</b> print as one assembly</span>'
+            );
+        });
+        // Port groups: pressure is a PORT property (one regulator per serial
+        // port), so shapes sharing a Port always share one pressure. Marked
+        // subtly - an underline on the Pressure + Port cells - since the row
+        // backgrounds belong to the nozzle assemblies.
+        Object.keys(byPort).filter(function (p) { return byPort[p].length > 1; }).sort(function (a, b) { return a - b; }).forEach(function (port, pi) {
+            var edge = PORT_EDGES[pi % PORT_EDGES.length];
+            var names = [];
+            var pressure = null;
+            byPort[port].forEach(function (entry) {
+                entry.copies.forEach(function (copy) {
+                    [PRESSURE_COL, PORT_COL].forEach(function (col) {
+                        copy.tds[col].style.boxShadow = 'inset 0 -2px 0 ' + edge;
+                        copy.tds[col].title = 'Port ' + port + ': one pressure regulator - these shapes share one pressure';
+                    });
+                });
+                if (entry.name) names.push(entry.name);
+                if (pressure === null && entry.pressure) pressure = entry.pressure;
+            });
+            summary.push(
+                '<span class="pp-group-line pp-port-line"><span class="pp-group-chip" style="background:' + edge + '"></span>' +
+                'Port ' + port + ': <b>' + names.join(' + ') + '</b> share one pressure regulator' +
+                (pressure ? ' (' + pressure + ' psi)' : '') + '</span>'
+            );
+        });
+        Object.keys(byValve).filter(function (v) { return byValve[v].length > 1; }).sort(function (a, b) { return a - b; }).forEach(function (valve) {
+            var names = [];
+            byValve[valve].forEach(function (entry) {
+                entry.copies.forEach(function (copy) {
+                    var td = copy.tds[VALVE_COL];
+                    td.style.background = 'rgba(220,38,38,0.22)';
+                    td.title = 'Valve ' + valve + ' is used by more than one shape - they would dispense together';
+                });
+                if (entry.name) names.push(entry.name);
+            });
+            summary.push(
+                '<span class="pp-group-line pp-valve-warning">&#9888;&#65039; Valve ' + valve + ' is shared by <b>' +
+                names.join('</b> and <b>') + '</b> - they would dispense at the same time. Give each shape its own valve.</span>'
+            );
+        });
+        var note = document.getElementById('pp-group-note');
+        if (!note) {
+            note = document.createElement('div');
+            note.id = 'pp-group-note';
+            container.appendChild(note);
+        }
+        var html = summary.join('');
+        // Only touch the DOM when the content changed: the observer watches
+        // childList, so an unconditional innerHTML write would loop forever.
+        if (note.__ppHtml !== html) {
+            note.__ppHtml = html;
+            note.innerHTML = html;
+        }
+        note.style.display = html ? '' : 'none';
+    }
+    var scheduled = false;
+    function schedule() {
+        if (scheduled) return;
+        scheduled = true;
+        // setTimeout, not requestAnimationFrame: rAF never fires in hidden
+        // tabs, which would leave the table unstyled after a background
+        // refresh (and breaks headless testing).
+        setTimeout(function () { scheduled = false; refresh(); }, 50);
+    }
+    function arm() {
+        // Observe the BODY, not the table container: Gradio replaces the
+        // container node when it hydrates, which would orphan the observer.
+        // Style writes are attribute mutations and the note rewrite is
+        // guarded, so observing childList/characterData cannot loop.
+        new MutationObserver(schedule).observe(document.body, {childList: true, subtree: true, characterData: true});
+        schedule();
+    }
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', arm);
+    } else {
+        arm();
     }
 })();
 </script>
@@ -1750,11 +1948,24 @@ def _next_unused_nozzle(used_nozzles: set[int]) -> int:
     return nozzle
 
 
+def _next_unused_valve(used_valves: set[int]) -> int:
+    """New shapes default to their own valve (numbering starts at the
+    historical default, 4): shapes sharing a valve dispense simultaneously,
+    which is almost never intended."""
+    valve = 4
+    while valve in used_valves:
+        valve += 1
+    return valve
+
+
 def _records_from_files(files: Any, previous_records: list[dict] | None = None) -> list[dict]:
     previous_by_path: dict[str | None, list[dict]] = {}
     for record in previous_records or []:
         previous_by_path.setdefault(record.get("stl_path"), []).append(record)
     used_nozzles: set[int] = set()
+    used_valves: set[int] = {
+        _coerce_int(record.get("valve"), 0) for record in (previous_records or [])
+    }
     records: list[dict] = []
     for index, path in enumerate(_uploaded_file_paths(files), start=1):
         previous_queue = previous_by_path.get(path) or []
@@ -1763,6 +1974,10 @@ def _records_from_files(files: Any, previous_records: list[dict] | None = None) 
         default_x, default_y, default_z = _default_target_extents_for_stl(path)
         nozzle = _record_nozzle_number(previous, index) if previous else _next_unused_nozzle(used_nozzles)
         used_nozzles.add(nozzle)
+        valve = _coerce_int(previous.get("valve"), 0) if previous else 0
+        if valve <= 0:
+            valve = _next_unused_valve(used_valves)
+        used_valves.add(valve)
         # Pressure is a port property (one regulator per serial port): a new
         # shape adopts the pressure other shapes already use on its port.
         pressure = previous.get("pressure")
@@ -1788,7 +2003,7 @@ def _records_from_files(files: Any, previous_records: list[dict] | None = None) 
             "target_z": round(_coerce_float(previous.get("target_z"), default_z), 1),
             "last_scaled_axis": previous.get("last_scaled_axis", "target_x"),
             "pressure": pressure,
-            "valve": previous.get("valve", 4),
+            "valve": valve,
             "nozzle": nozzle,
             "port": previous.get("port", 1),
             "color": previous.get("color", _default_color(index)),
@@ -3835,6 +4050,33 @@ def _parts_from_records(records: list[dict] | None) -> tuple[list[dict], list[st
     return parts, messages
 
 
+def _parsed_path_length(parsed: dict) -> float:
+    """Total tool-path length (print + travel) of a parsed G-code file, mm."""
+    total = 0.0
+    for key in ("print_segments", "travel_segments"):
+        for segment in parsed.get(key) or []:
+            for start, end in zip(segment, segment[1:]):
+                total += math.dist(start, end)
+    return total
+
+
+def _print_time_estimate(length_mm: float, nozzle_speed: Any) -> str | None:
+    """Human-readable print duration at a constant nozzle speed, or None.
+
+    Every move is emitted as G1 at one constant speed, so time is simply
+    path length / speed (valve switching is assumed instantaneous)."""
+    speed = _coerce_float(nozzle_speed, 0.0)
+    if speed <= 0.0 or length_mm <= 0.0:
+        return None
+    hours, remainder = divmod(int(round(length_mm / speed)), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours} h {minutes:02d} min"
+    if minutes:
+        return f"{minutes} min {seconds:02d} s"
+    return f"{seconds} s"
+
+
 def render_dynamic_nozzle_spacing(
     records: list[dict] | None,
     columns: Any,
@@ -3867,6 +4109,7 @@ def render_dynamic_toolpath(
     print_opacity: float,
     print_width: float,
     travel_width: float,
+    nozzle_speed: Any = None,
     tube: bool = True,
 ) -> tuple[Any, str, dict]:
     # Print color comes from the shape's table Color (uploads default to
@@ -3901,11 +4144,19 @@ def render_dynamic_toolpath(
         tube=tube,
     )
     (x_min, y_min, z_min), (x_max, y_max, z_max) = parsed["bounds"]
-    return figure, (
+    status = (
         f"**{parsed['point_count']} moves parsed** - {len(parsed['print_segments'])} print segment(s), "
         f"{len(parsed['travel_segments'])} travel segment(s).  \n"
         f"Bounds: X [{x_min:.2f}, {x_max:.2f}], Y [{y_min:.2f}, {y_max:.2f}], Z [{z_min:.2f}, {z_max:.2f}] mm."
-    ), parsed
+    )
+    path_length = _parsed_path_length(parsed)
+    estimate = _print_time_estimate(path_length, nozzle_speed)
+    if estimate:
+        status += (
+            f"  \nPath length {path_length:,.0f} mm - estimated print time at "
+            f"{_coerce_float(nozzle_speed, 0.0):g} mm/s: **{estimate}**."
+        )
+    return figure, status, parsed
 
 
 def render_dynamic_toolpath_lines(*args: Any) -> tuple[Any, str, dict, str, dict[str, Any], dict[str, Any]]:
@@ -3935,6 +4186,7 @@ def render_dynamic_parallel(
     row_spacing: Any,
     use_grid_individual_spacing: bool,
     grid_spacing_table: Any,
+    nozzle_speed: Any = None,
     tube: bool = True,
 ) -> tuple[Any, str]:
     records = _apply_shape_settings(records or [], settings_table)
@@ -3958,6 +4210,15 @@ def render_dynamic_parallel(
         travel_opacity=float(travel_opacity),
         tube=tube,
     )
+    # All heads share one motion path, so the print takes as long as the
+    # longest part's tool path at the constant nozzle speed.
+    longest = max(_parsed_path_length(part["parsed"]) for part in parts)
+    estimate = _print_time_estimate(longest, nozzle_speed)
+    if estimate:
+        messages.append(
+            f"Estimated print time at {_coerce_float(nozzle_speed, 0.0):g} mm/s: **{estimate}** "
+            f"({longest:,.0f} mm per nozzle; all heads move together)."
+        )
     messages.append(_format_nozzle_spacing_status(parts, offsets, spacings))
     return figure, "  \n".join(messages)
 
@@ -4105,13 +4366,13 @@ def build_dynamic_demo() -> gr.Blocks:
                     "62px",   # X (mm)
                     "62px",   # Y (mm)
                     "62px",   # Z (mm)
-                    "76px",   # Pressure (psi)
+                    "86px",   # Pressure (psi)
                     "56px",   # Valve
                     "60px",   # Nozzle
                     "52px",   # Port
                     "104px",  # Color
-                    "58px",   # Infill %
-                    "78px",   # Contour Tracing
+                    "62px",   # Infill %
+                    "86px",   # Contour Tracing
                     "58px",   # Lead In
                     "60px",   # Delete
                 ],
@@ -4216,6 +4477,14 @@ def build_dynamic_demo() -> gr.Blocks:
                     value=GCODE_SOURCE_PARALLEL,
                     label="What to visualize",
                 )
+                with gr.Column(scale=0, min_width=180):
+                    viz_nozzle_speed = gr.Number(
+                        label="Nozzle Speed (mm/s)",
+                        value=10.0,
+                        minimum=0.01,
+                        step=0.5,
+                        info="Used for the print time estimate.",
+                    )
                 with gr.Column(elem_id="gcode-upload-col"):
                     gcode_upload = gr.File(label="Upload G-Code", file_types=[".txt", ".gcode", ".nc"], interactive=True, height=110)
 
@@ -4604,6 +4873,7 @@ def build_dynamic_demo() -> gr.Blocks:
             print_opacity_slider,
             print_width_slider,
             travel_width_slider,
+            viz_nozzle_speed,
         ]
         render_line_button.click(fn=render_dynamic_toolpath_lines, inputs=render_inputs, outputs=[toolpath_plot, toolpath_status, parsed_state, render_mode, anim_controls, width_row])
         render_tube_button.click(fn=render_dynamic_toolpath_tubes, inputs=render_inputs, outputs=[toolpath_plot, toolpath_status, parsed_state, render_mode, anim_controls, width_row])
@@ -4642,6 +4912,7 @@ def build_dynamic_demo() -> gr.Blocks:
             nozzle_grid_row_spacing,
             nozzle_grid_use_individual_spacing,
             nozzle_grid_spacing_table,
+            viz_nozzle_speed,
         ]
         parallel_outputs = [parallel_plot, parallel_status, parallel_mode, parallel_anim_controls, pp_width_row, pp_export_group]
         parallel_line_button.click(fn=render_dynamic_parallel_lines, inputs=parallel_render_inputs, outputs=parallel_outputs)
