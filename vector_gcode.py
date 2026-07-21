@@ -75,15 +75,17 @@ def _togglepress() -> str:
 
 
 def _setpress_cmd(port: str, pressure: float, start: bool) -> str:
+    # {preset} marks pressure setup for the Aerotech host runtime: presets
+    # execute at the controller's START signal, before the initial toggles.
     if start:
-        return f"\n\r{port}.write(eval(setpress({pressure:g})))"
+        return f"\n\r{{preset}}{port}.write(eval(setpress({pressure:g})))"
     insert = ""
     return f"\n\r{insert}{port}.write({_setpress(pressure)})"
 
 
 def _toggle_cmd(port: str, start: bool) -> str:
     if start:
-        return f"\n\r{port}.write(eval(togglepress()))"
+        return f"\n\r{{preset}}{port}.write(eval(togglepress()))"
     insert = ""
     return f"\n\r{insert}{port}.write({_togglepress()})"
 
@@ -195,6 +197,7 @@ def generate_vector_gcode(
     contour_sources: list[ContourSource] | None = None,
     active_contour_owner: int | None = None,
     infill: float = 1.0,
+    motion_infill_fractions: list[float] | None = None,
     increase_pressure_per_layer: float = 0.1,
     pressure_ramp_enabled: bool = True,
     all_g1: bool = False,
@@ -220,6 +223,11 @@ def generate_vector_gcode(
     the Circle Spiral under shared motion: every shape's own wall radius
     joins the ONE shared ring set, so each shape keeps a smooth complete
     outer circle. Pass the SAME list to every shape's generation call.
+
+    `motion_infill_fractions` lists EVERY shape's infill fraction (again the
+    same list for every call): raster lines/rings that no head dispenses on
+    are dropped from the shared motion instead of swept valve-off. When
+    omitted, this shape's own fraction bounds its motion.
     """
     if shape is None or not shape.layers:
         raise ValueError("The shape has no sliced layers to generate G-code from.")
@@ -315,6 +323,11 @@ def generate_vector_gcode(
         infill_fraction=max(0.0, min(1.0, float(infill))),
         extra_wall_radii=extra_wall_radii,
         ring_center=ring_center,
+        motion_infill_fractions=(
+            [max(0.0, min(1.0, float(fraction))) for fraction in motion_infill_fractions]
+            if motion_infill_fractions is not None
+            else None
+        ),
     )
 
     # World anchor: the toolpath origin expressed in the shape's own frame.

@@ -3941,6 +3941,16 @@ def generate_dynamic_gcode(
         if record.get("layer_stack") is not None
         and getattr(record["layer_stack"], "scan_frame", None) is None
     ]
+    # Infill motion optimization: raster lines/rings that NO head dispenses
+    # on are dropped from the shared motion (e.g. every shape at 50% halves
+    # the path). Same list for every shape, so the shared motion stays in
+    # sync across heads.
+    motion_infill_fractions = [
+        _coerce_float(record.get("infill", 100.0), 100.0) / 100.0
+        for record in records
+        if record.get("layer_stack") is not None
+        and getattr(record["layer_stack"], "layers", None)
+    ]
     # Lead-in is driven entirely by the per-shape "Lead In" column: the
     # purge motion exists whenever any shape dispenses it (all heads must
     # share the motion), and each shape's own flag gates its valve.
@@ -3982,6 +3992,7 @@ def generate_dynamic_gcode(
                 contour_sources=contour_sources,
                 active_contour_owner=int(record.get("idx", 0)),
                 infill=_coerce_float(record.get("infill", 100.0), 100.0) / 100.0,
+                motion_infill_fractions=motion_infill_fractions,
                 lead_in_enabled=bool(lead_in_enabled),
                 lead_in_length=float(lead_in_length),
                 lead_in_clearance=effective_lead_in_clearance,
@@ -4060,6 +4071,16 @@ def _parsed_path_length(parsed: dict) -> float:
     return total
 
 
+def _format_duration(total_seconds: float) -> str:
+    hours, remainder = divmod(int(round(total_seconds)), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours} h {minutes:02d} min"
+    if minutes:
+        return f"{minutes} min {seconds:02d} s"
+    return f"{seconds} s"
+
+
 def _print_time_estimate(length_mm: float, nozzle_speed: Any) -> str | None:
     """Human-readable print duration at a constant nozzle speed, or None.
 
@@ -4068,13 +4089,7 @@ def _print_time_estimate(length_mm: float, nozzle_speed: Any) -> str | None:
     speed = _coerce_float(nozzle_speed, 0.0)
     if speed <= 0.0 or length_mm <= 0.0:
         return None
-    hours, remainder = divmod(int(round(length_mm / speed)), 3600)
-    minutes, seconds = divmod(remainder, 60)
-    if hours:
-        return f"{hours} h {minutes:02d} min"
-    if minutes:
-        return f"{minutes} min {seconds:02d} s"
-    return f"{seconds} s"
+    return _format_duration(length_mm / speed)
 
 
 def render_dynamic_nozzle_spacing(

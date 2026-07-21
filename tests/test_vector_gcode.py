@@ -214,8 +214,9 @@ def test_gcode_header_writes_presets_before_initial_aux_commands(tmp_path) -> No
     # (the toolpath's world anchor is returned via origin_sink instead).
     assert not any("PathOrigin" in line for line in lines)
     assert lines[1] == "{aux_command}WAGO_ValveCommands(7, 0)"
-    assert lines[2] == "serialPort3.write(eval(setpress(25)))"
-    assert lines[3] == "serialPort3.write(eval(togglepress()))"
+    # {preset} marks pressure setup for the Aerotech host runtime.
+    assert lines[2] == "{preset}serialPort3.write(eval(setpress(25)))"
+    assert lines[3] == "{preset}serialPort3.write(eval(togglepress()))"
     assert lines[4].startswith("{aux_command}WAGO_ValveCommands(")
     assert lines[5].startswith("{aux_command}WAGO_ValveCommands(")
 
@@ -863,7 +864,7 @@ def _print_length(moves: list[dict]) -> float:
     )
 
 
-def test_half_infill_skips_alternate_lines_but_keeps_the_same_path(tmp_path) -> None:
+def test_half_infill_skips_alternate_lines_and_their_motion(tmp_path) -> None:
     layer = box(0.0, 0.0, 4.0, 4.0)
     stack = _stack(layer, layer)
 
@@ -884,17 +885,18 @@ def test_half_infill_skips_alternate_lines_but_keeps_the_same_path(tmp_path) -> 
     full = _generate(1.0, "full")
     half = _generate(0.5, "half")
 
-    # Identical motion: same final position and same total traversed length.
-    assert full[-1]["end"] == half[-1]["end"]
-    assert abs(_total_length(full) - _total_length(half)) < 1e-6
+    # A solo shape's motion skips the lines it never prints: the path
+    # shrinks instead of sweeping dead lines valve-off.
+    assert _total_length(half) < _total_length(full)
 
-    # Half the lines dispense: 2 of the 4 sweeps per layer print.
+    # Half the lines dispense: 2 of the 4 sweeps per layer print, and the
+    # sweeps only visit those 2 scanlines (one fil apart x2).
     assert abs(_print_length(half) - _print_length(full) / 2) < 1e-6
-
-    # The printing sweeps sit on alternating scanlines (one fil apart x2).
+    half_rows = sorted({round(m["start"][1], 6) for m in half if m["start"][2] == 0.0 and m["start"][1] == m["end"][1]})
     half_print_rows = sorted({round(m["start"][1], 6) for m in half if m["color"] == 255 and m["start"][2] == 0.0})
     assert len(half_print_rows) == 2
     assert abs((half_print_rows[1] - half_print_rows[0]) - 2.0) < 1e-9
+    assert set(half_rows) == set(half_print_rows)
 
 
 def test_infill_selection_is_shared_across_reference_motion(tmp_path) -> None:
@@ -919,10 +921,64 @@ def test_infill_selection_is_shared_across_reference_motion(tmp_path) -> None:
     sparse = _generate(small, 0.5, "sparse")
     dense = _generate(big, 1.0, "dense")
 
-    # Different infill per shape, one shared motion path.
+    # Different infill per shape, one shared motion path (without a
+    # motion_infill_fractions list, shared motion is never restricted).
     assert sparse[-1]["end"] == dense[-1]["end"]
     assert abs(_total_length(sparse) - _total_length(dense)) < 1e-6
     assert 0 < _print_length(sparse) < _print_length(dense)
+
+
+def test_shared_motion_skips_lines_no_head_prints(tmp_path) -> None:
+    layer = box(0.0, 0.0, 4.0, 4.0)
+    first = _stack(layer, name="first")
+    second = _stack(layer, name="second")
+    reference = build_reference_stack([first, second])
+
+    def _generate(stack: LayerStack, infill: float, fractions, label: str):
+        path = generate_vector_gcode(
+            stack,
+            shape_name=label,
+            pressure=25,
+            valve=7,
+            port=3,
+            fil_width=1.0,
+            motion=reference,
+            infill=infill,
+            motion_infill_fractions=fractions,
+            output_dir=tmp_path / label,
+        )
+        return _moves_with_colors(path.read_text())
+
+    # Both shapes at 50%: the union skips every other line, so the shared
+    # motion halves — and stays IDENTICAL across heads.
+    half_a = _generate(first, 0.5, [0.5, 0.5], "half_a")
+    half_b = _generate(second, 0.5, [0.5, 0.5], "half_b")
+    assert [(m["start"], m["end"]) for m in half_a] == [
+        (m["start"], m["end"]) for m in half_b
+    ]
+    full_a = _generate(first, 1.0, [1.0, 1.0], "full_a")
+    assert _total_length(half_a) < _total_length(full_a)
+    rows_half = {round(m["start"][1], 6) for m in half_a if m["start"][1] == m["end"][1]}
+    rows_full = {round(m["start"][1], 6) for m in full_a if m["start"][1] == m["end"][1]}
+    assert len(rows_half) == 2 and len(rows_full) == 4
+
+    # Mixed 50% + 75%: a line survives if EITHER pattern prints it (only
+    # lines both skip drop out). 50% keeps odd k, 75% skips k=0 (mod 4):
+    # of the 4 grid lines, only k=0 drops.
+    # (Move SPLIT points differ per head — each splits at its own valve
+    # transitions — so compare the path itself: length, end, and rows.)
+    mixed_a = _generate(first, 0.5, [0.5, 0.75], "mixed_a")
+    mixed_b = _generate(second, 0.75, [0.5, 0.75], "mixed_b")
+    assert abs(_total_length(mixed_a) - _total_length(mixed_b)) < 1e-6
+    assert mixed_a[-1]["end"] == mixed_b[-1]["end"]
+    rows_mixed = {round(m["start"][1], 6) for m in mixed_a if m["start"][1] == m["end"][1]}
+    assert rows_mixed == {round(m["start"][1], 6) for m in mixed_b if m["start"][1] == m["end"][1]}
+    assert len(rows_mixed) == 3
+
+    # Any head at 100% keeps every line in the motion.
+    dense = _generate(first, 0.5, [0.5, 1.0], "dense_pair")
+    rows_dense = {round(m["start"][1], 6) for m in dense if m["start"][1] == m["end"][1]}
+    assert len(rows_dense) == 4
 
 
 def test_spiral_infill_skips_rings_and_keeps_the_path(tmp_path) -> None:
@@ -943,15 +999,27 @@ def test_spiral_infill_skips_rings_and_keeps_the_path(tmp_path) -> None:
         )
         return _moves_with_colors(path.read_text())
 
-    for pattern in (RASTER_PATTERN_RECTANGULAR_SPIRAL, RASTER_PATTERN_CIRCLE_SPIRAL):
-        full = _generate(pattern, 1.0, f"{pattern}-full".replace(" ", "_"))
-        half = _generate(pattern, 0.5, f"{pattern}-half".replace(" ", "_"))
-        # Identical path within the writer's micron-level delta rounding
-        # (segment split points differ, so the rounding accumulates
-        # differently by up to ~1 um over tens of thousands of moves).
-        assert math.dist(full[-1]["end"], half[-1]["end"]) < 1e-4, pattern
-        assert abs(_total_length(full) - _total_length(half)) < 1e-3, pattern
-        assert 0 < _print_length(half) < _print_length(full), pattern
+    # Rectangular spiral: the continuous walk is kept (a skipped loop would
+    # break the spiral into disconnected rectangles), so the motion stays
+    # identical within the writer's micron-level delta rounding.
+    full = _generate(RASTER_PATTERN_RECTANGULAR_SPIRAL, 1.0, "rect-full")
+    half = _generate(RASTER_PATTERN_RECTANGULAR_SPIRAL, 0.5, "rect-half")
+    assert math.dist(full[-1]["end"], half[-1]["end"]) < 1e-4
+    assert abs(_total_length(full) - _total_length(half)) < 1e-3
+    assert 0 < _print_length(half) < _print_length(full)
+
+    # Circle spiral: rings a solo shape never prints drop out of the motion
+    # (the perimeter wall always stays and always dispenses).
+    full = _generate(RASTER_PATTERN_CIRCLE_SPIRAL, 1.0, "circle-full")
+    half = _generate(RASTER_PATTERN_CIRCLE_SPIRAL, 0.5, "circle-half")
+    assert _total_length(half) < _total_length(full)
+    assert 0 < _print_length(half) < _print_length(full)
+    wall_radius = max(
+        math.hypot((m["start"][0] + m["end"][0]) / 2 - 3.0, (m["start"][1] + m["end"][1]) / 2 - 3.0)
+        for m in half
+        if m["color"] == 255
+    )
+    assert wall_radius > 2.0  # the outer wall is still printed
 
 
 def test_layer_contour_loops_follow_polygon_rings() -> None:

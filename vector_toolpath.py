@@ -328,6 +328,30 @@ def _infill_line_keep(fraction: float):
     return keep
 
 
+def _combined_infill_keep(fractions):
+    """Union infill gate over every shape sharing the motion; None = keep all.
+
+    A grid line is traversed iff ANY shape's infill pattern dispenses on it —
+    lines nobody prints are dropped from the MOTION entirely instead of being
+    swept valve-off (e.g. every shape at 50% infill halves the path). Every
+    shape must be given the same fraction list so the shared motion stays
+    identical across heads.
+    """
+    keeps = []
+    for fraction in fractions or []:
+        keep = _infill_line_keep(fraction)
+        if keep is None:
+            return None  # someone prints every line: no motion line can drop
+        keeps.append(keep)
+    if not keeps:
+        return None
+
+    def keep_any(line_index: int) -> bool:
+        return any(keep(line_index) for keep in keeps)
+
+    return keep_any
+
+
 def _scan_anchor(lo: float, hi: float, fil_width: float) -> float:
     """First scanline position of the centred grid spanning [lo, hi].
 
@@ -386,6 +410,7 @@ def _axis_raster_segments(
     start_forward: bool = True,
     scan_anchor: float | None = None,
     infill_keep=None,
+    motion_keep=None,
 ) -> list[Seg]:
     """Snake raster of `motion`, dispensing only inside `valve`.
 
@@ -395,7 +420,9 @@ def _axis_raster_segments(
     valve-settle travel buffer before and after. `scan_anchor` pins the
     scanlines to a global grid (see `_scan_coords`). `infill_keep(k)` gates
     dispensing per grid line for partial infill: skipped lines are still
-    swept, just with the valve closed, so the motion never changes.
+    swept with the valve closed. `motion_keep(k)` drops a grid line from the
+    MOTION entirely — used when NO shape sharing the motion dispenses there
+    (the union of every head's infill pattern), so nobody sweeps dead lines.
     """
     if motion is None or motion.is_empty:
         return []
@@ -428,6 +455,9 @@ def _axis_raster_segments(
     segments: list[Seg] = []
     sweep_number = 0
     for coord in coords:
+        line_index = int(round((coord - index_base) / fil_width))
+        if motion_keep is not None and not motion_keep(line_index):
+            continue  # no head prints this line: drop it from the motion
         probe = min(max(coord, probe_lo), probe_hi)
         motion_runs = _chord_runs(motion, axis, probe)
         if not motion_runs:
@@ -435,9 +465,7 @@ def _axis_raster_segments(
 
         sweep_lo = motion_runs[0][0]
         sweep_hi = motion_runs[-1][1]
-        if infill_keep is not None and not infill_keep(
-            int(round((coord - index_base) / fil_width))
-        ):
+        if infill_keep is not None and not infill_keep(line_index):
             valve_runs: list[tuple[float, float]] = []
         else:
             valve_runs = []
@@ -500,10 +528,17 @@ def _oriented_axis_raster_segments(
     prefer_default: bool = False,
     scan_anchor: float | None = None,
     infill_keep=None,
+    motion_keep=None,
 ) -> list[Seg]:
     """Pick the raster orientation whose start is nearest the current position."""
     default_segments = _axis_raster_segments(
-        motion, valve, fil_width, axis, scan_anchor=scan_anchor, infill_keep=infill_keep
+        motion,
+        valve,
+        fil_width,
+        axis,
+        scan_anchor=scan_anchor,
+        infill_keep=infill_keep,
+        motion_keep=motion_keep,
     )
     if prefer_default or not default_segments:
         return default_segments
@@ -520,6 +555,7 @@ def _oriented_axis_raster_segments(
                 start_forward=start_forward,
                 scan_anchor=scan_anchor,
                 infill_keep=infill_keep,
+                motion_keep=motion_keep,
             )
             if segments and segments not in candidates:
                 candidates.append(segments)
@@ -545,6 +581,7 @@ def _rotated_raster_segments(
     prefer_default: bool,
     frame: tuple[float, float, float, float],
     infill_keep=None,
+    motion_keep=None,
 ) -> list[Seg]:
     """Snake raster at an arbitrary angle, reusing the axis raster machinery.
 
@@ -588,6 +625,7 @@ def _rotated_raster_segments(
         prefer_default=prefer_default,
         scan_anchor=anchor,
         infill_keep=infill_keep,
+        motion_keep=motion_keep,
     )
 
     theta_back = math.radians(angle_degrees)
@@ -1340,6 +1378,7 @@ def plan_layer_moves(
     infill_fraction: float = 1.0,
     extra_wall_radii: list[list[float]] | None = None,
     ring_center: tuple[float, float] | None = None,
+    motion_infill_fractions: list[float] | None = None,
 ) -> tuple[list[dict], tuple[float, float]]:
     """Assemble per-layer segments into a relative move list for all patterns.
 
@@ -1348,8 +1387,14 @@ def plan_layer_moves(
     rotation pivot for diagonal layers.
 
     `infill_fraction` < 1 skips dispensing on evenly-distributed lines (grid
-    lines for axis rasters, rings/revolutions for spirals) while the motion
-    path stays exactly the same as at 100% infill.
+    lines for axis rasters, rings for the circle spiral). Lines that NO head
+    prints are dropped from the motion entirely: `motion_infill_fractions`
+    lists every shape sharing the motion (pass the SAME list to every shape,
+    or the shared paths diverge). When omitted, a SOLO shape's own fraction
+    bounds its motion, while shared motion is never restricted (the other
+    heads' infill is unknown). The rectangular spiral keeps its full
+    continuous walk (a skipped loop would break the spiral into
+    disconnected rectangles).
 
     Returns the move list and the toolpath origin — the world position the
     relative moves start from (the first segment start of the first non-empty
@@ -1357,6 +1402,12 @@ def plan_layer_moves(
     """
     raster_pattern = _normalize_raster_pattern(raster_pattern)
     infill_keep = _infill_line_keep(infill_fraction)
+    if motion_infill_fractions is not None:
+        motion_keep = _combined_infill_keep(motion_infill_fractions)
+    elif shared_motion:
+        motion_keep = None
+    else:
+        motion_keep = infill_keep
     if scan_frame is not None:
         anchor_x = _scan_anchor(scan_frame[0], scan_frame[2], fil_width)
         anchor_y = _scan_anchor(scan_frame[1], scan_frame[3], fil_width)
@@ -1412,6 +1463,16 @@ def plan_layer_moves(
                         continue  # near-duplicate wall/ring
                     radii.append(radius)
                 wall_radii = tuple(sorted(set(wall_radii) | set(extra_walls), reverse=True))
+
+            if motion_keep is not None:
+                # Rings NO head dispenses on drop out of the motion (walls
+                # always print, so they always stay).
+                radii = [
+                    radius
+                    for radius in radii
+                    if any(abs(radius - wall) <= fil_width * 0.25 for wall in wall_radii)
+                    or motion_keep(max(0, int(round(radius / fil_width - 0.5))))
+                ]
 
             points = _circle_rings_polyline(center_x, center_y, radii, fil_width)
             if layer_number % 2 == 1:
@@ -1486,6 +1547,7 @@ def plan_layer_moves(
                 prefer_default=not raster_origin_initialized,
                 frame=frame,
                 infill_keep=infill_keep,
+                motion_keep=motion_keep,
             )
         else:
             raster_axis = _raster_axis_for_pattern(raster_pattern, layer_number)
@@ -1502,6 +1564,7 @@ def plan_layer_moves(
                 prefer_default=not raster_origin_initialized,
                 scan_anchor=axis_anchor,
                 infill_keep=infill_keep,
+                motion_keep=motion_keep,
             )
 
         if not segments:
