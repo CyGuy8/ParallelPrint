@@ -313,6 +313,155 @@ def test_sample_reload_appends_next_nozzle_set() -> None:
     assert [record["nozzle"] for record in second_load] == [1, 2, 3, 4, 5, 6]
 
 
+def test_assign_unique_valves_keeps_first_and_reassigns_duplicates() -> None:
+    from app import assign_unique_valves
+
+    records = [
+        _mm_member(1, 1, 10.0, 10.0, 10.0),
+        _mm_member(2, 2, 10.0, 10.0, 10.0),
+        _mm_member(3, 3, 10.0, 10.0, 10.0),
+        _mm_member(4, 4, 10.0, 10.0, 10.0),
+    ]
+    records[0]["valve"] = 4
+    records[1]["valve"] = 4  # duplicate: must move
+    records[2]["valve"] = 5  # unique: must stay
+    records[3]["valve"] = 0  # unset: must be assigned
+
+    updated, rows = assign_unique_valves(records, None)
+    valves = [record["valve"] for record in updated]
+    assert valves[0] == 4  # first occurrence keeps its number
+    assert valves[2] == 5
+    assert len(set(valves)) == 4
+    assert all(valve >= 4 for valve in valves)
+    valve_pos = SHAPE_SETTINGS_HEADERS.index("Valve")
+    assert [row[valve_pos] for row in rows] == valves
+
+
+def test_undo_split_unwinds_multiple_splits() -> None:
+    from shapely.geometry import MultiPolygon, box
+
+    from app import _slice_params_snapshot, split_selected_shape_for_grid, undo_last_split
+    from stl_slicer import LayerStack
+
+    stack = LayerStack(
+        layers=[MultiPolygon([box(0.0, 0.0, 20.0, 10.0)])],
+        z_values=[0.4],
+        bounds=((0.0, 0.0, 0.0), (20.0, 10.0, 0.8)),
+        layer_height=0.8,
+        name="solo",
+    )
+    record = _mm_member(1, 1, 20.0, 10.0, 0.8)
+    record["name"] = "solo"
+    record["layer_stack"] = stack
+    record["slice_params"] = _slice_params_snapshot(record, 0.8, None, None)
+
+    # Split once, then split one of the pieces: the undo stack grows.
+    first = split_selected_shape_for_grid([record], None, None, 2, 1, False, 5, 9, 1.0)
+    pieces = first[0]
+    stack_one = first[-1]
+    assert len(pieces) == 2
+    assert isinstance(stack_one, list) and len(stack_one) == 1
+
+    second = split_selected_shape_for_grid(
+        pieces, None, None, 2, 1, False, 7, 11, 1.0, 0.8, None, stack_one
+    )
+    stack_two = second[-1]
+    assert len(stack_two) == 2
+
+    # Undo pops one split at a time, newest first.
+    undo_one = undo_last_split(stack_two)
+    assert [r["name"] for r in undo_one[0]] == [r["name"] for r in pieces]
+    assert "1 earlier split" in undo_one[7]
+    assert len(undo_one[-1]) == 1
+
+    undo_two = undo_last_split(undo_one[-1])
+    assert [r["name"] for r in undo_two[0]] == ["solo"]
+    assert undo_two[0][0]["layer_stack"] is stack
+    assert undo_two[-1] is None  # fully unwound
+
+    # Nothing to undo: every data output is skipped.
+    empty = undo_last_split(None)
+    assert not isinstance(empty[0], list)
+
+
+def test_generation_gives_pressure_ownership_to_one_shape_per_port() -> None:
+    from pathlib import Path
+
+    from shapely.geometry import MultiPolygon, box
+
+    from app import generate_dynamic_gcode
+    from stl_slicer import LayerStack
+
+    def _record(idx: int, port: int, valve: int) -> dict:
+        stack = LayerStack(
+            layers=[MultiPolygon([box(0.0, 0.0, 5.0, 5.0)])],
+            z_values=[0.4],
+            bounds=((0.0, 0.0, 0.0), (5.0, 5.0, 0.8)),
+            layer_height=0.8,
+            name=f"p{idx}",
+        )
+        return {
+            "idx": idx, "name": f"p{idx}", "stl_path": None,
+            "target_x": 5.0, "target_y": 5.0, "target_z": 0.8,
+            "pressure": 25.0, "valve": valve, "nozzle": idx, "port": port,
+            "color": "#111111", "infill": 100.0, "layer_stack": stack,
+        }
+
+    # Shapes 1+2 share port 1 (one regulator); shape 3 is alone on port 2.
+    records = [_record(1, 1, 4), _record(2, 1, 5), _record(3, 2, 6)]
+    out = generate_dynamic_gcode(
+        records, None, "X-direction raster", True, 5.0, 5.0, 3, "Left", 0.8, 0.8, None
+    )
+    texts = [Path(record["gcode_path"]).read_text() for record in out[0]]
+
+    assert "setpress" in texts[0] and "togglepress" in texts[0]
+    # The port-mate's file carries NO pressure commands at all.
+    assert "serialPort" not in texts[1]
+    # A shape on its own port owns its regulator.
+    assert "setpress" in texts[2] and "serialPort2" in texts[2]
+    # Valve control stays per shape in every file.
+    assert "WAGO_ValveCommands(5, 1)" in texts[1]
+
+
+def test_gcode_staleness_banner_flags_edits_after_generation() -> None:
+    from app import (
+        GCODE_STALE_MESSAGE,
+        _gcode_settings_snapshot,
+        check_gcode_staleness,
+    )
+
+    settings_args = ("X-direction raster", True, 5.0, 5.0, 3, "Left", 0.8, 0.8, None)
+    record = _mm_member(1, 1, 20.0, 10.0, 5.0)
+    record["gcode_path"] = "fake_gcode.txt"
+    record["gcode_snapshot"] = _gcode_settings_snapshot(record, *settings_args)
+    records = [record]
+    rows = _shape_settings_rows(records)
+
+    # Untouched settings: no banner.
+    assert check_gcode_staleness(records, rows, *settings_args) == ""
+
+    # Editing a table cell (pressure) makes the file stale.
+    pressure_pos = SHAPE_SETTINGS_HEADERS.index("Pressure (psi)")
+    edited = _shape_settings_rows(records)
+    edited[0][pressure_pos] = 40.0
+    assert check_gcode_staleness(records, edited, *settings_args) == GCODE_STALE_MESSAGE
+
+    # Changing a generation option (raster pattern) is stale too.
+    changed = ("Circle Spiral raster", *settings_args[1:])
+    assert check_gcode_staleness(records, rows, *changed) == GCODE_STALE_MESSAGE
+
+    # A shape added after generation (no G-code yet) is stale.
+    with_new = [record, _mm_member(2, 2, 10.0, 10.0, 10.0)]
+    assert (
+        check_gcode_staleness(with_new, _shape_settings_rows(with_new), *settings_args)
+        == GCODE_STALE_MESSAGE
+    )
+
+    # Nothing generated at all: nothing can be stale.
+    fresh = [_mm_member(1, 1, 10.0, 10.0, 10.0)]
+    assert check_gcode_staleness(fresh, _shape_settings_rows(fresh), *settings_args) == ""
+
+
 def test_print_time_estimate_from_path_length_and_speed() -> None:
     from app import _parsed_path_length, _print_time_estimate
 

@@ -282,6 +282,12 @@ APP_CSS = """
     color: var(--body-text-color-subdued);
 }
 
+/* Stale-G-code warning above the Generate button. */
+#gcode-stale-banner p {
+    color: #b45309;
+    font-weight: 500;
+}
+
 /* Narrower columns: header labels ("Pressure (psi)", "Contour Tracing", ...)
    wrap to two lines instead of forcing single-line column widths. Wrapping
    happens ONLY at spaces — words never break mid-word (columns grow to fit
@@ -2013,6 +2019,11 @@ def _records_from_files(files: Any, previous_records: list[dict] | None = None) 
             "layer_stack": previous.get("layer_stack"),
             "slice_params": previous.get("slice_params"),
             "gcode_path": previous.get("gcode_path"),
+            # Carried through a re-sync: the toolpath's world anchor (Auto
+            # Align and the visualizations read it) and the generation
+            # fingerprint (the stale-G-code banner compares against it).
+            "path_origin": previous.get("path_origin"),
+            "gcode_snapshot": previous.get("gcode_snapshot"),
         })
     return records
 
@@ -3708,6 +3719,7 @@ def split_selected_shape_for_grid(
     fil_width: float,
     layer_height: float = 0.8,
     scale_mode: str | None = None,
+    undo_stack: list[list[dict]] | None = None,
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
     # One-button flow: shapes are sliced (or re-sliced when their settings
@@ -3716,6 +3728,11 @@ def split_selected_shape_for_grid(
     slice_messages: list[str] = []
     if records:
         _ensure_records_sliced(records, float(layer_height or 0.8), scale_mode, slice_messages)
+    # Undo stack: each split PUSHES its pre-split records (sliced), and Undo
+    # Split pops them one at a time (capped to the last 10 splits). Pushed
+    # only when a split actually happened — every failure path returns the
+    # ORIGINAL `records` list object, detected by identity.
+    next_undo_stack = [*(undo_stack or []), [dict(record) for record in records]][-10:]
 
     def _outputs(next_records: list[dict], selected_value: str | None, status: str) -> tuple:
         if slice_messages:
@@ -3730,6 +3747,7 @@ def split_selected_shape_for_grid(
             _dropdown_update(next_records, selected_value),
             status,
             _gcode_zip_update(next_records),
+            next_undo_stack if next_records is not records else gr.skip(),
         )
 
     if not records:
@@ -3908,6 +3926,160 @@ def _lead_in_assembly_extension(records: list[dict], direction: str | None) -> f
     return extension
 
 
+def refresh_parallel_on_tab_select(mode: str | None, *args: Any) -> tuple:
+    """Re-send the parallel LINE plot when the Visualization tab is opened.
+
+    The generate chain renders the parallel view into the hidden tab, where
+    Gradio's Plot component doesn't mount the figure — re-issuing it on tab
+    select makes it appear. Tube renders are skipped: the user made those
+    while ON the tab (already mounted), and they are expensive to redo.
+    """
+    if mode != "line":
+        return gr.skip(), gr.skip()
+    return render_dynamic_parallel(*args, tube=False)
+
+
+def undo_last_split(undo_stack: list[list[dict]] | None) -> tuple:
+    """Restore the shapes as they were before the most recent split.
+
+    The undo slot is a STACK of pre-split snapshots (one per split, newest
+    last), so repeated splits can be unwound one at a time."""
+    stack = list(undo_stack or [])
+    if not stack:
+        return (
+            *(gr.skip() for _ in range(7)),
+            "Nothing to undo: no split has been made yet.",
+            gr.skip(),
+            gr.skip(),
+        )
+    snapshot = stack.pop()
+    records = [dict(record) for record in snapshot]
+    status = "Undid the last split: restored the shapes as they were before it."
+    if stack:
+        plural = "s" if len(stack) != 1 else ""
+        status += f" ({len(stack)} earlier split{plural} can still be undone.)"
+    return (
+        records,
+        _shape_settings_rows(records),
+        _dropdown_update(records),
+        [record.get("gcode_path") for record in records if record.get("gcode_path")],
+        _gcode_dropdown_update(records),
+        _gcode_dropdown_update(records, include_upload=True),
+        _dropdown_update(records),
+        status,
+        _gcode_zip_update(records),
+        stack or None,
+    )
+
+
+def _gcode_settings_snapshot(
+    record: dict,
+    raster_pattern: str | None,
+    pressure_ramp_enabled: bool,
+    lead_in_length: float,
+    lead_in_clearance: float,
+    lead_in_lines: float,
+    lead_in_direction: str | None,
+    layer_height: float,
+    fil_width: float,
+    scale_mode: str | None,
+) -> dict:
+    """Fingerprint of every setting that shapes this record's G-code.
+
+    Stamped on the record at generation time; the staleness banner compares
+    it against the CURRENT table/options so outdated files are never
+    downloaded or printed unnoticed. Color is excluded (it never reaches
+    the G-code)."""
+    return {
+        "targets": tuple(
+            round(_coerce_float(record.get(key), 0.0), 6) for key in TARGET_DIMENSION_KEYS
+        ),
+        "pressure": round(_coerce_float(record.get("pressure"), 25.0), 6),
+        "valve": _coerce_int(record.get("valve"), 4),
+        "port": _coerce_int(record.get("port"), 1),
+        "nozzle": _record_nozzle_number(record, int(record.get("idx", 1) or 1)),
+        "infill": round(_coerce_float(record.get("infill"), 100.0), 6),
+        "contour_tracing": bool(record.get("contour_tracing")),
+        "lead_in": bool(record.get("lead_in")),
+        "raster_pattern": str(raster_pattern or ""),
+        "pressure_ramp": bool(pressure_ramp_enabled),
+        "lead_in_params": (
+            round(_coerce_float(lead_in_length, 5.0), 6),
+            round(_coerce_float(lead_in_clearance, 5.0), 6),
+            _coerce_int(lead_in_lines, 3),
+            str(lead_in_direction or ""),
+        ),
+        "layer_height": round(_coerce_float(layer_height, 0.8), 6),
+        "fil_width": round(_coerce_float(fil_width, 0.8), 6),
+        "scale_mode": _normalize_scale_mode(scale_mode),
+    }
+
+
+GCODE_STALE_MESSAGE = (
+    "&#9888;&#65039; **Settings changed since this G-code was generated** — "
+    "press Generate G-Code again before downloading, visualizing, or printing."
+)
+
+
+def check_gcode_staleness(
+    records: list[dict] | None,
+    settings_table: Any,
+    raster_pattern: str | None,
+    pressure_ramp_enabled: bool,
+    lead_in_length: float,
+    lead_in_clearance: float,
+    lead_in_lines: float,
+    lead_in_direction: str | None,
+    layer_height: float,
+    fil_width: float,
+    scale_mode: str | None,
+) -> str:
+    """Warning banner text when generated G-code no longer matches the settings."""
+    records = _apply_shape_settings(records or [], settings_table)
+    if not any(record.get("gcode_path") for record in records):
+        return ""  # nothing generated yet: nothing can be stale
+    snapshot_args = (
+        raster_pattern,
+        pressure_ramp_enabled,
+        lead_in_length,
+        lead_in_clearance,
+        lead_in_lines,
+        lead_in_direction,
+        layer_height,
+        fil_width,
+        scale_mode,
+    )
+    for record in records:
+        if not record.get("gcode_path"):
+            # A shape added after the last generation has no file at all.
+            return GCODE_STALE_MESSAGE
+        if record.get("gcode_snapshot") != _gcode_settings_snapshot(record, *snapshot_args):
+            return GCODE_STALE_MESSAGE
+    return ""
+
+
+def assign_unique_valves(
+    records: list[dict] | None, settings_table: Any
+) -> tuple[list[dict], list[list[Any]]]:
+    """Give every shape its own valve: first come keeps its number, later
+    duplicates (and unset valves) move to the smallest unused number."""
+    records = _apply_shape_settings(records or [], settings_table)
+    updated = [dict(record) for record in records]
+    claimed: set[int] = set()
+    reassign: list[dict] = []
+    for record in updated:
+        valve = _coerce_int(record.get("valve"), 0)
+        if valve > 0 and valve not in claimed:
+            claimed.add(valve)
+        else:
+            reassign.append(record)
+    for record in reassign:
+        valve = _next_unused_valve(claimed)
+        record["valve"] = valve
+        claimed.add(valve)
+    return updated, _shape_settings_rows(updated)
+
+
 def generate_dynamic_gcode(
     records: list[dict] | None,
     settings_table: Any,
@@ -3920,6 +4092,7 @@ def generate_dynamic_gcode(
     layer_height: float,
     fil_width: float,
     scale_mode: str | None,
+    nozzle_speed: Any = None,
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
     messages: list[str] = []
@@ -3964,6 +4137,11 @@ def generate_dynamic_gcode(
                 f"Lead-in clearance extended by {lead_in_extension:.1f} mm so every "
                 "nozzle's purge patch lands clear of the split assembly."
             )
+    # The pressure regulator is a PORT device: when shapes share a serial
+    # port, exactly ONE of their files owns the pressure commands (preset,
+    # toggle, per-layer ramp) — the print host compiles every file onto one
+    # timeline and duplicated toggles would flip the regulator on/off/on.
+    ports_owned: set[int] = set()
     for record in records:
         stack = record.get("layer_stack")
         if stack is None or not getattr(stack, "layers", None):
@@ -3973,6 +4151,8 @@ def generate_dynamic_gcode(
             messages.append(f"Shape {record['idx']}: skipped (no combined reference outline; slice a shape first).")
             continue
         shape_name = str(record.get("name") or stack.name or f"shape_{record['idx']}").replace(" ", "_")
+        port_number = _coerce_int(record.get("port"), 1)
+        owns_port_pressure = port_number not in ports_owned
         try:
             gcode_path = generate_vector_gcode(
                 stack,
@@ -3993,6 +4173,7 @@ def generate_dynamic_gcode(
                 active_contour_owner=int(record.get("idx", 0)),
                 infill=_coerce_float(record.get("infill", 100.0), 100.0) / 100.0,
                 motion_infill_fractions=motion_infill_fractions,
+                emit_pressure_commands=owns_port_pressure,
                 lead_in_enabled=bool(lead_in_enabled),
                 lead_in_length=float(lead_in_length),
                 lead_in_clearance=effective_lead_in_clearance,
@@ -4002,17 +4183,48 @@ def generate_dynamic_gcode(
                 wall_sources=wall_sources,
                 origin_sink=(origin_sink := {}),
             )
+            ports_owned.add(port_number)
             record["gcode_path"] = str(gcode_path)
             # World anchor of the toolpath (kept OUT of the G-code file):
             # Auto Align and the visualizations read it from the record.
             record["path_origin"] = origin_sink.get("path_origin")
+            # Fingerprint the settings this file was generated with, so the
+            # staleness banner can flag later edits.
+            record["gcode_snapshot"] = _gcode_settings_snapshot(
+                record,
+                raster_pattern,
+                pressure_ramp_enabled,
+                lead_in_length,
+                lead_in_clearance,
+                lead_in_lines,
+                lead_in_direction,
+                layer_height,
+                fil_width,
+                scale_mode,
+            )
             messages.append(f"Shape {record['idx']}: wrote `{gcode_path.name}`.")
         except Exception as exc:
             messages.append(f"Shape {record['idx']}: failed ({exc}).")
+
+    generated_paths = [record.get("gcode_path") for record in records if record.get("gcode_path")]
+    if generated_paths:
+        # All heads share one motion path, so one file's length is the job's.
+        try:
+            shared_length = _parsed_path_length(parse_gcode_path(Path(generated_paths[0]).read_text()))
+        except OSError:
+            shared_length = 0.0
+        speed = _coerce_float(nozzle_speed, 0.0) or 10.0
+        estimate = _print_time_estimate(shared_length, speed)
+        if estimate:
+            messages.insert(
+                0,
+                f"**Print path {shared_length:,.0f} mm — about {estimate} at {speed:g} mm/s** "
+                "(constant speed; the Visualization tab's Nozzle Speed sets the rate).",
+            )
     return (
         records,
         ref_layers,
-        [record.get("gcode_path") for record in records if record.get("gcode_path")],
+        generated_paths,
         "\n".join(messages),
         _gcode_dropdown_update(records),
         _gcode_dropdown_update(records, include_upload=True),
@@ -4333,6 +4545,7 @@ def build_dynamic_demo() -> gr.Blocks:
                     )
                     sync_uploads_button = gr.Button("Sync Uploaded STLs", variant="secondary", size="sm")
                     reset_dimensions_button = gr.Button("Reset Dimensions", variant="secondary", size="sm")
+                    assign_valves_button = gr.Button("Assign Unique Valves", variant="secondary", size="sm")
                     scale_mode = gr.Radio(
                         choices=[SCALE_MODE_TARGET_DIMENSIONS, SCALE_MODE_UNIFORM_FACTOR],
                         value=SCALE_MODE_TARGET_DIMENSIONS,
@@ -4406,8 +4619,11 @@ def build_dynamic_demo() -> gr.Blocks:
                     split_start_nozzle = gr.Number(label="Starting Nozzle", value=1, minimum=1, step=1)
                     split_start_valve = gr.Number(label="Starting Valve", value=4, minimum=1, step=1)
                 split_overlapping_layers = gr.Checkbox(label="Overlapping Layers", value=False)
-                split_button = gr.Button("Split Selected Shape into Grid Pieces", variant="primary")
+                with gr.Row():
+                    split_button = gr.Button("Split Selected Shape into Grid Pieces", variant="primary", scale=3)
+                    split_undo_button = gr.Button("Undo Split", variant="secondary", size="sm", scale=1, min_width=110)
                 split_status = gr.Markdown(SPLIT_STATUS_DEFAULT)
+                split_undo = gr.State(None)
 
             with gr.Accordion("Selected Shape Preview", open=False, elem_classes=["settings-accordion"]):
                 with gr.Row():
@@ -4462,6 +4678,7 @@ def build_dynamic_demo() -> gr.Blocks:
                         value=LEAD_IN_DIRECTION_LEFT,
                         allow_custom_value=False,
                     )
+            gcode_stale_banner = gr.Markdown("", elem_id="gcode-stale-banner")
             gcode_button = gr.Button("Generate G-Code", variant="primary")
             with gr.Row():
                 with gr.Column(scale=4):
@@ -4478,7 +4695,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 refresh_gcode_text_button = gr.Button("Refresh G-Code Preview", variant="secondary", size="sm")
             gcode_text = gr.Code(label="Selected G-Code", language=None, lines=18, max_lines=18, interactive=False, elem_classes=["gcode-view"])
 
-        with gr.Tab("Visualization"):
+        with gr.Tab("Visualization") as viz_tab:
             gr.Markdown(
                 "### Print Visualization\n"
                 "Defaults to the parallel print of every generated shape, laid out with the "
@@ -4735,6 +4952,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 fil_width,
                 layer_height,
                 scale_mode,
+                split_undo,
             ],
             outputs=[
                 shape_records,
@@ -4746,6 +4964,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 split_source,
                 split_status,
                 gcode_download_all,
+                split_undo,
             ],
         ).then(
             fn=generate_dynamic_reference_stack,
@@ -4761,6 +4980,100 @@ def build_dynamic_demo() -> gr.Blocks:
             outputs=[nozzle_grid_spacing_table],
             queue=False,
         )
+        split_undo_button.click(
+            fn=undo_last_split,
+            inputs=[split_undo],
+            outputs=[
+                shape_records,
+                shape_settings,
+                selected_shape,
+                gcode_downloads,
+                gcode_text_source,
+                gcode_source,
+                split_source,
+                split_status,
+                gcode_download_all,
+                split_undo,
+            ],
+        ).then(
+            fn=generate_dynamic_reference_stack,
+            inputs=[shape_records, fil_width],
+            outputs=[ref_layers],
+        ).then(
+            fn=update_layer_preview,
+            inputs=layer_preview_inputs,
+            outputs=layer_preview_outputs,
+        ).then(
+            fn=_grid_spacing_table_update,
+            inputs=grid_spacing_refresh_inputs,
+            outputs=[nozzle_grid_spacing_table],
+            queue=False,
+        )
+        assign_valves_button.click(
+            fn=assign_unique_valves,
+            inputs=[shape_records, shape_settings],
+            outputs=[shape_records, shape_settings],
+            queue=False,
+        )
+
+        # Stale-G-code banner: re-checked on every table change and every
+        # generation option change; generation itself re-stamps the
+        # snapshots, so its chain clears the banner.
+        stale_inputs = [
+            shape_records,
+            shape_settings,
+            gcode_raster_pattern,
+            gcode_pressure_ramp_enabled,
+            gcode_lead_in_length,
+            gcode_lead_in_clearance,
+            gcode_lead_in_lines,
+            gcode_lead_in_direction,
+            layer_height,
+            fil_width,
+            scale_mode,
+        ]
+        shape_settings.change(
+            fn=check_gcode_staleness,
+            inputs=stale_inputs,
+            outputs=[gcode_stale_banner],
+            queue=False,
+        )
+        for stale_control in (
+            gcode_raster_pattern,
+            gcode_pressure_ramp_enabled,
+            gcode_lead_in_length,
+            gcode_lead_in_clearance,
+            gcode_lead_in_lines,
+            gcode_lead_in_direction,
+            layer_height,
+            fil_width,
+            scale_mode,
+        ):
+            stale_control.change(
+                fn=check_gcode_staleness,
+                inputs=stale_inputs,
+                outputs=[gcode_stale_banner],
+                queue=False,
+            )
+
+        # Defined before the generate chain so it can auto-render the
+        # parallel view with fresh files (the same lists drive the
+        # Visualization tab wiring further down).
+        parallel_render_inputs = [
+            shape_records,
+            shape_settings,
+            pp_travel_opacity,
+            pp_filament_width,
+            pp_travel_width,
+            nozzle_grid_columns,
+            nozzle_grid_rows,
+            nozzle_grid_column_spacing,
+            nozzle_grid_row_spacing,
+            nozzle_grid_use_individual_spacing,
+            nozzle_grid_spacing_table,
+            viz_nozzle_speed,
+        ]
+        parallel_outputs = [parallel_plot, parallel_status, parallel_mode, parallel_anim_controls, pp_width_row, pp_export_group]
 
         gcode_button.click(
             fn=generate_dynamic_gcode,
@@ -4776,6 +5089,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 layer_height,
                 fil_width,
                 scale_mode,
+                viz_nozzle_speed,
             ],
             outputs=[shape_records, ref_layers, gcode_downloads, gcode_status, gcode_text_source, gcode_source, gcode_download_all],
         ).then(
@@ -4793,6 +5107,17 @@ def build_dynamic_demo() -> gr.Blocks:
             inputs=[shape_records],
             outputs=[split_source],
             queue=False,
+        ).then(
+            fn=check_gcode_staleness,
+            inputs=stale_inputs,
+            outputs=[gcode_stale_banner],
+            queue=False,
+        ).then(
+            # Fresh files: refresh the parallel view so the Visualization
+            # tab always shows the current print.
+            fn=render_dynamic_parallel_lines,
+            inputs=parallel_render_inputs,
+            outputs=parallel_outputs,
         )
         gcode_text_source.change(fn=load_selected_gcode_text, inputs=[shape_records, gcode_text_source], outputs=[gcode_text])
         refresh_gcode_text_button.click(fn=load_selected_gcode_text, inputs=[shape_records, gcode_text_source], outputs=[gcode_text])
@@ -4915,23 +5240,13 @@ def build_dynamic_demo() -> gr.Blocks:
             queue=False,
         )
 
-        parallel_render_inputs = [
-            shape_records,
-            shape_settings,
-            pp_travel_opacity,
-            pp_filament_width,
-            pp_travel_width,
-            nozzle_grid_columns,
-            nozzle_grid_rows,
-            nozzle_grid_column_spacing,
-            nozzle_grid_row_spacing,
-            nozzle_grid_use_individual_spacing,
-            nozzle_grid_spacing_table,
-            viz_nozzle_speed,
-        ]
-        parallel_outputs = [parallel_plot, parallel_status, parallel_mode, parallel_anim_controls, pp_width_row, pp_export_group]
         parallel_line_button.click(fn=render_dynamic_parallel_lines, inputs=parallel_render_inputs, outputs=parallel_outputs)
         parallel_render_button.click(fn=render_dynamic_parallel_tubes, inputs=parallel_render_inputs, outputs=parallel_outputs)
+        viz_tab.select(
+            fn=refresh_parallel_on_tab_select,
+            inputs=[parallel_mode] + parallel_render_inputs,
+            outputs=[parallel_plot, parallel_status],
+        )
         pp_filament_width.release(fn=rerender_dynamic_parallel_current_mode, inputs=[parallel_mode] + parallel_render_inputs, outputs=[parallel_plot, parallel_status])
         pp_travel_width.release(fn=rerender_dynamic_parallel_current_mode, inputs=[parallel_mode] + parallel_render_inputs, outputs=[parallel_plot, parallel_status])
         pp_export_button.click(

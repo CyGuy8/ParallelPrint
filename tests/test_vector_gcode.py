@@ -217,8 +217,43 @@ def test_gcode_header_writes_presets_before_initial_aux_commands(tmp_path) -> No
     # {preset} marks pressure setup for the Aerotech host runtime.
     assert lines[2] == "{preset}serialPort3.write(eval(setpress(25)))"
     assert lines[3] == "{preset}serialPort3.write(eval(togglepress()))"
-    assert lines[4].startswith("{aux_command}WAGO_ValveCommands(")
-    assert lines[5].startswith("{aux_command}WAGO_ValveCommands(")
+    # The header ends there: no dummy valve-100 init, no duplicate close.
+    assert lines[4].startswith("G")
+    assert not any("WAGO_ValveCommands(100" in line for line in lines)
+
+
+def test_port_sharing_files_emit_pressure_commands_once(tmp_path) -> None:
+    # The pressure regulator is a PORT device: a file generated WITHOUT
+    # pressure ownership carries no serial commands at all (no preset, no
+    # toggle, no per-layer ramp) — its valve commands are untouched.
+    layer = box(0.0, 0.0, 2.0, 2.0)
+    stack = _stack(layer, layer)
+
+    def _generate(emit: bool, label: str) -> str:
+        path = generate_vector_gcode(
+            stack,
+            shape_name=label,
+            pressure=25,
+            valve=7,
+            port=3,
+            fil_width=1.0,
+            layer_height=1.0,
+            pressure_ramp_enabled=True,
+            emit_pressure_commands=emit,
+            output_dir=tmp_path / label,
+        )
+        return path.read_text()
+
+    owner = _generate(True, "owner")
+    follower = _generate(False, "follower")
+
+    assert "serialPort3" in owner
+    assert _pressure_set_count(owner) >= 2  # preset + at least one ramp step
+    assert "serialPort3" not in follower
+    assert _pressure_set_count(follower) == 0
+    assert "togglepress" not in follower
+    # Valve control is per shape and unaffected.
+    assert follower.count("WAGO_ValveCommands(7, 1)") == owner.count("WAGO_ValveCommands(7, 1)")
 
 
 def test_gcode_lead_in_runs_once_before_first_layer(tmp_path) -> None:

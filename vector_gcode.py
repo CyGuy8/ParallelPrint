@@ -117,7 +117,16 @@ def write_gcode_file(
     increase_pressure_per_layer: float,
     pressure_ramp_enabled: bool,
     all_g1: bool,
+    emit_pressure_commands: bool = True,
 ) -> None:
+    """Write the move list as a G-code file.
+
+    `emit_pressure_commands` gates EVERY pressure command (preset, toggle,
+    per-layer ramp, closing toggle): the pressure regulator is a PORT
+    device, so when several shapes share a serial port only ONE of their
+    files may own it — the print host compiles all files onto one timeline,
+    and duplicated toggles would flip the regulator on/off/on at start.
+    """
     off_color = 0
     com_port = f"serialPort{port}"
     color_dict: dict[int, int] = {0: 100, 255: valve}
@@ -131,12 +140,11 @@ def write_gcode_file(
     with open(gcode_path, "w") as f:
         f.write("G91\n")
         f.write(_valve_cmd(valve, 0))
-        for line in setpress_lines:
-            f.write(f"{line}\n")
-        for line in pressure_on_lines:
-            f.write(f"{line}\n")
-        for color in color_dict:
-            f.write(_valve_cmd(color_dict[color], 0))
+        if emit_pressure_commands:
+            for line in setpress_lines:
+                f.write(f"{line}\n")
+            for line in pressure_on_lines:
+                f.write(f"{line}\n")
 
         pressure_next: str | None = None
         for i, move in enumerate(gcode_list):
@@ -160,7 +168,7 @@ def write_gcode_file(
                     f"{move_type} X{_coord(move['X'])} Y{_coord(move['Y'])} "
                     f"Z{_coord(move['Z'])} ; Color {move['Color']}"
                 )
-                if pressure_ramp_enabled:
+                if pressure_ramp_enabled and emit_pressure_commands:
                     pressure_cur += increase_pressure_per_layer
                     pressure_next = _setpress_cmd(com_port, pressure_cur, start=False)
                 else:
@@ -177,10 +185,10 @@ def write_gcode_file(
                 f.write(f"{pressure_next}\n")
                 pressure_next = None
 
-        for color in color_dict:
-            f.write(_valve_cmd(color_dict[color], 0))
-        for line in pressure_off_lines:
-            f.write(f"{line}\n")
+        f.write(_valve_cmd(valve, 0))
+        if emit_pressure_commands:
+            for line in pressure_off_lines:
+                f.write(f"{line}\n")
 
 
 def generate_vector_gcode(
@@ -198,6 +206,7 @@ def generate_vector_gcode(
     active_contour_owner: int | None = None,
     infill: float = 1.0,
     motion_infill_fractions: list[float] | None = None,
+    emit_pressure_commands: bool = True,
     increase_pressure_per_layer: float = 0.1,
     pressure_ramp_enabled: bool = True,
     all_g1: bool = False,
@@ -376,5 +385,6 @@ def generate_vector_gcode(
         increase_pressure_per_layer=float(increase_pressure_per_layer),
         pressure_ramp_enabled=bool(pressure_ramp_enabled),
         all_g1=bool(all_g1),
+        emit_pressure_commands=bool(emit_pressure_commands),
     )
     return gcode_path
