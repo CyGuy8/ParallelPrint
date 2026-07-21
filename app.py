@@ -4587,22 +4587,25 @@ def build_dynamic_demo() -> gr.Blocks:
                 label="Shape Settings",
                 elem_id="shape-settings-table",
                 # Narrow fixed widths; two-word headers ("Pressure (psi)",
-                # "Contour Tracing", ...) wrap to two lines via CSS.
+                # "Contour Tracing", ...) wrap to two lines via CSS. Each
+                # column must fit its longest WORD in the widest host font
+                # (the Space renders a wide monospace) plus the header
+                # checkbox — too narrow and Gradio ellipsizes ("Con...").
                 column_widths=[
-                    "52px",   # Shape
-                    "170px",  # STL
+                    "64px",   # Shape
+                    "154px",  # STL
                     "62px",   # X (mm)
                     "62px",   # Y (mm)
                     "62px",   # Z (mm)
-                    "86px",   # Pressure (psi)
-                    "56px",   # Valve
-                    "60px",   # Nozzle
-                    "52px",   # Port
+                    "92px",   # Pressure (psi)
+                    "62px",   # Valve
+                    "68px",   # Nozzle
+                    "58px",   # Port
                     "104px",  # Color
-                    "62px",   # Infill %
-                    "86px",   # Contour Tracing
-                    "58px",   # Lead In
-                    "60px",   # Delete
+                    "72px",   # Infill %
+                    "112px",  # Contour Tracing
+                    "80px",   # Lead In
+                    "68px",   # Delete
                 ],
             )
             with gr.Row():
