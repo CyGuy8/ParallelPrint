@@ -1471,6 +1471,71 @@ def test_layer_preview_draws_the_selection_and_its_nozzle_group() -> None:
     assert not fig_hint.axes[0].patches
 
 
+def test_multi_material_demo_set_groups_parts_onto_shared_nozzles() -> None:
+    from app import load_sample_shapes
+
+    outputs = load_sample_shapes(None, [], None, "Multi-Material Demo")
+    records = outputs[1]
+    assert [record["name"] for record in records] == [
+        "Checkerboard_Cube_1",
+        "Checkerboard_Cube_2",
+        "Wrapped_Egg_Inside",
+        "Wrapped_Egg_Outside",
+        "Space_Helmet_Glass",
+        "Space_Helmet_Shell",
+    ]
+    # Parts of the same model share a nozzle (three assemblies)...
+    assert [record["nozzle"] for record in records] == [1, 1, 2, 2, 3, 3]
+    # ...while every part keeps its own valve.
+    valves = [record["valve"] for record in records]
+    assert len(set(valves)) == 6
+    # The table rows carry the grouped nozzles too.
+    nozzle_pos = SHAPE_SETTINGS_HEADERS.index("Nozzle")
+    assert [row[nozzle_pos] for row in outputs[2]] == [1, 1, 2, 2, 3, 3]
+
+
+def test_project_settings_export_import_round_trip(tmp_path) -> None:
+    from app import export_project_settings, import_project_settings
+
+    records = _records_from_files(["egg_inside.stl", "egg_outside.stl"], None)
+    records[0].update(nozzle=2, valve=9, pressure=40.0, infill=50.0, contour_tracing=True, color="#d62728")
+    records[1].update(nozzle=2, valve=10, pressure=40.0)
+
+    settings_path, status = export_project_settings(
+        records, None, 0.4, 0.4, None, "Circle Spiral raster", False, 1.2,
+        6.0, 7.0, 4, "Down", "Horizontal", 15.0,
+    )
+    assert settings_path and "2 shape(s)" in status
+
+    # A fresh session re-uploads the same files, then imports.
+    fresh = _records_from_files(["egg_inside.stl", "egg_outside.stl", "extra.stl"], None)
+    outputs = import_project_settings([settings_path], fresh, None)
+    updated, rows, message = outputs[0], outputs[1], outputs[2]
+    assert "2 shape(s)" in message
+    assert updated[0]["nozzle"] == 2 and updated[0]["valve"] == 9
+    assert updated[0]["pressure"] == 40.0 and updated[0]["infill"] == 50.0
+    assert updated[0]["contour_tracing"] is True and updated[0]["color"] == "#d62728"
+    assert updated[1]["nozzle"] == 2 and updated[1]["valve"] == 10
+    assert updated[2]["name"] == "extra"  # untouched shape keeps defaults
+    # Generation options come back as component updates.
+    option_updates = outputs[3:]
+    assert option_updates[0]["value"] == "Circle Spiral raster"
+    assert option_updates[1]["value"] is False
+    assert option_updates[2]["value"] == 1.2
+    assert option_updates[8]["value"] == 0.4  # layer height
+    assert option_updates[11]["value"] == 15.0  # nozzle speed
+
+    # A file listed in the export but not loaded is reported.
+    partial = import_project_settings([settings_path], _records_from_files(["egg_inside.stl"], None), None)
+    assert "egg_outside.stl" in partial[2]
+
+    # Garbage input fails gracefully.
+    bad = tmp_path / "bad.json"
+    bad.write_text("not json")
+    failed = import_project_settings([str(bad)], fresh, None)
+    assert "Import failed" in failed[2]
+
+
 def test_load_sample_shapes_respects_the_selected_set() -> None:
     from app import DEFAULT_SAMPLE_STL_SET, SAMPLE_STL_SETS, load_sample_shapes
 

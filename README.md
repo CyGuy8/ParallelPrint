@@ -51,6 +51,9 @@ Then open the local Gradio URL in your browser, upload STL files or load the bun
 - Port groups are marked too: shapes sharing a Port get a matching underline on their Pressure and Port cells and a summary line ("Port 1: A + B share one pressure regulator (25 psi)") — one regulator per serial port is why their pressures stay in sync
 - Automatically unions the sliced shapes into a combined reference layer set whenever shapes are sliced
 - Shows a sliced-layer preview in the Selected Shape Preview accordion (layer slider through the shape's polygon outlines, drawn in its print color; assembly parts sharing the nozzle are drawn together so multi-material slicing can be checked before generating G-code)
+- Bundled sample sets include a **Multi-Material Demo** (checkerboard cube, wrapped egg, space helmet — two STLs each) that loads with the parts of each model already grouped onto shared nozzles, forming three assemblies in one click
+- **Save / Load Settings**: exports every table setting plus the generation options as a small JSON keyed by STL filename; re-upload the same STLs later (or after a Space restart) and import to restore the whole setup — files in the export that aren't loaded yet are listed so they can be added. Split pieces are derived geometry and don't round-trip
+- Generate G-Code reports live progress (slicing, reference building, then shape-by-shape generation)
 - Splits one sliced shape's geometry into an editable row/column grid for multi-nozzle printing of one large shape
 - Converts sliced layers into G-code files with pressure, valve, nozzle, port, and infill % settings per shape from the Shape Settings table
 - **Pressure is a port property** (one pressure regulator per serial port): shapes sharing a Port always share one pressure — editing one shape's pressure updates every shape on that port, moving a shape onto a port adopts that port's pressure, and newly added shapes join at their port's existing pressure

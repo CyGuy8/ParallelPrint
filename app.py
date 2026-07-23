@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import tempfile
 import time
@@ -56,6 +57,26 @@ from vector_toolpath import (
 SAMPLE_STL_SETS = {
     "Standard Shapes": ("Hollow_Pyramid.stl", "Rounded_Cube_Through_Holes.stl", "halfsphere.stl"),
     "Simple Shapes": ("Simple_Circle.stl", "Simple_Square.stl", "Simple_Triangle.stl"),
+    "Multi-Material Demo": (
+        "Checkerboard_Cube_1.stl",
+        "Checkerboard_Cube_2.stl",
+        "Wrapped_Egg_Inside.stl",
+        "Wrapped_Egg_Outside.stl",
+        "Space_Helmet_Glass.stl",
+        "Space_Helmet_Shell.stl",
+    ),
+}
+# Default nozzle per sample file: parts of one multi-material model share a
+# nozzle, so loading the demo set forms the assemblies automatically.
+SAMPLE_SET_NOZZLES = {
+    "Multi-Material Demo": {
+        "Checkerboard_Cube_1.stl": 1,
+        "Checkerboard_Cube_2.stl": 1,
+        "Wrapped_Egg_Inside.stl": 2,
+        "Wrapped_Egg_Outside.stl": 2,
+        "Space_Helmet_Glass.stl": 3,
+        "Space_Helmet_Shell.stl": 3,
+    },
 }
 DEFAULT_SAMPLE_STL_SET = "Standard Shapes"
 SAMPLE_STL_DIR = Path(__file__).resolve().parent / "sample_stls"
@@ -1974,16 +1995,33 @@ def _next_unused_valve(used_valves: set[int]) -> int:
 
 def _records_from_files(files: Any, previous_records: list[dict] | None = None) -> list[dict]:
     previous_by_path: dict[str | None, list[dict]] = {}
+    previous_by_name: dict[str, list[dict]] = {}
     for record in previous_records or []:
         previous_by_path.setdefault(record.get("stl_path"), []).append(record)
+        if record.get("stl_path"):
+            previous_by_name.setdefault(Path(str(record["stl_path"])).name, []).append(record)
+    matched_ids: set[int] = set()
+
+    def _take_previous(path: str) -> dict:
+        """Match by exact path first, then by FILENAME: Gradio copies
+        uploads into its temp cache, so the same file re-arrives under a new
+        path — without the name fallback every re-sync treated all shapes
+        as brand-new, wiping nozzles/valves (and duplicating rows)."""
+        for queue in (previous_by_path.get(path), previous_by_name.get(Path(path).name)):
+            while queue:
+                candidate = queue.pop(0)
+                if id(candidate) not in matched_ids:
+                    matched_ids.add(id(candidate))
+                    return candidate
+        return {}
+
     used_nozzles: set[int] = set()
     used_valves: set[int] = {
         _coerce_int(record.get("valve"), 0) for record in (previous_records or [])
     }
     records: list[dict] = []
     for index, path in enumerate(_uploaded_file_paths(files), start=1):
-        previous_queue = previous_by_path.get(path) or []
-        previous = previous_queue.pop(0) if previous_queue else {}
+        previous = _take_previous(str(path))
         name = previous.get("name") or Path(path).stem or f"Shape {index}"
         default_x, default_y, default_z = _default_target_extents_for_stl(path)
         nozzle = _record_nozzle_number(previous, index) if previous else _next_unused_nozzle(used_nozzles)
@@ -2613,15 +2651,21 @@ def load_sample_shapes(
     sample_set: str | None = None,
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
-    filenames = SAMPLE_STL_SETS.get(
-        str(sample_set or ""), SAMPLE_STL_SETS[DEFAULT_SAMPLE_STL_SET]
-    )
+    set_name = str(sample_set or "")
+    filenames = SAMPLE_STL_SETS.get(set_name, SAMPLE_STL_SETS[DEFAULT_SAMPLE_STL_SET])
     paths = [str(SAMPLE_STL_DIR / filename) for filename in filenames if (SAMPLE_STL_DIR / filename).exists()]
     merged_paths = _append_file_paths(files, paths)
-    return (
-        gr.update(value=merged_paths),
-        *sync_uploaded_shapes(merged_paths, records, None),
-    )
+    outputs = sync_uploaded_shapes(merged_paths, records, None)
+    nozzle_map = SAMPLE_SET_NOZZLES.get(set_name, {})
+    if nozzle_map:
+        # Group the set's multi-material parts onto their shared nozzles.
+        next_records = outputs[0]
+        for record in next_records:
+            filename = Path(str(record.get("stl_path") or "")).name
+            if filename in nozzle_map:
+                record["nozzle"] = nozzle_map[filename]
+        outputs = (next_records, _shape_settings_rows(next_records), *outputs[2:])
+    return (gr.update(value=merged_paths), *outputs)
 
 
 def _shape_delete_outputs(
@@ -4074,6 +4118,161 @@ def check_gcode_staleness(
     return ""
 
 
+_SHAPE_EXPORT_FIELDS = (
+    "name",
+    "target_x",
+    "target_y",
+    "target_z",
+    "pressure",
+    "valve",
+    "nozzle",
+    "port",
+    "color",
+    "infill",
+    "contour_tracing",
+    "lead_in",
+)
+
+
+def export_project_settings(
+    records: list[dict] | None,
+    settings_table: Any,
+    layer_height: float,
+    fil_width: float,
+    scale_mode: str | None,
+    raster_pattern: str | None,
+    pressure_ramp_enabled: bool,
+    sweep_buffer: float,
+    lead_in_length: float,
+    lead_in_clearance: float,
+    lead_in_lines: float,
+    lead_in_direction: str | None,
+    lead_in_orientation: str | None,
+    nozzle_speed: Any,
+) -> tuple[str | None, str]:
+    """Write the session's settings to a small JSON file, keyed by STL name.
+
+    Sessions are otherwise lost on a page refresh or Space restart: the
+    export carries every per-shape table setting plus the generation
+    options; re-upload the same STLs and import to restore them. Split
+    pieces are derived geometry and cannot round-trip.
+    """
+    records = _apply_shape_settings(records or [], settings_table)
+    shapes = []
+    for record in records:
+        if not record.get("stl_path"):
+            continue
+        entry = {"file": Path(str(record["stl_path"])).name}
+        for field in _SHAPE_EXPORT_FIELDS:
+            entry[field] = record.get(field)
+        shapes.append(entry)
+    if not shapes:
+        return None, "Nothing to export: load at least one STL first."
+    payload = {
+        "app": "ParallelPrint",
+        "version": 1,
+        "shapes": shapes,
+        "generation": {
+            "layer_height": _coerce_float(layer_height, 0.8),
+            "fil_width": _coerce_float(fil_width, 0.8),
+            "scale_mode": _normalize_scale_mode(scale_mode),
+            "raster_pattern": str(raster_pattern or ""),
+            "pressure_ramp_enabled": bool(pressure_ramp_enabled),
+            "sweep_buffer": _coerce_float(sweep_buffer, 0.8),
+            "lead_in_length": _coerce_float(lead_in_length, 5.0),
+            "lead_in_clearance": _coerce_float(lead_in_clearance, 5.0),
+            "lead_in_lines": _coerce_int(lead_in_lines, 3),
+            "lead_in_direction": str(lead_in_direction or LEAD_IN_DIRECTION_LEFT),
+            "lead_in_orientation": str(lead_in_orientation or LEAD_IN_LINE_AUTO),
+            "nozzle_speed": _coerce_float(nozzle_speed, 10.0),
+        },
+    }
+    settings_path = Path(tempfile.mkdtemp(prefix="pp_settings_")) / "parallelprint_settings.json"
+    settings_path.write_text(json.dumps(payload, indent=2))
+    status = f"Exported settings for {len(shapes)} shape(s) and the generation options."
+    if any(not record.get("stl_path") for record in records):
+        status += " Split pieces are not exported — re-split after importing."
+    return str(settings_path), status
+
+
+def import_project_settings(
+    settings_upload: Any,
+    records: list[dict] | None,
+    settings_table: Any,
+) -> tuple:
+    """Apply an exported settings file to the loaded shapes and options.
+
+    Shape settings match by STL filename (duplicates apply in order); files
+    in the export that are not currently loaded are reported so they can be
+    uploaded and re-imported. Generation options apply regardless.
+    """
+
+    def _skip_options() -> tuple:
+        return tuple(gr.skip() for _ in range(12))
+
+    paths = _uploaded_file_paths(settings_upload)
+    if not paths:
+        return gr.skip(), gr.skip(), "", *_skip_options()
+    try:
+        payload = json.loads(Path(paths[0]).read_text())
+        if not isinstance(payload, dict) or "shapes" not in payload:
+            raise ValueError("not a ParallelPrint settings file")
+    except (OSError, ValueError) as exc:
+        return gr.skip(), gr.skip(), f"Import failed: {exc}", *_skip_options()
+
+    records = _apply_shape_settings(records or [], settings_table)
+    queues: dict[str, list[dict]] = {}
+    for entry in payload.get("shapes", []):
+        if isinstance(entry, dict) and entry.get("file"):
+            queues.setdefault(str(entry["file"]), []).append(entry)
+
+    updated: list[dict] = []
+    applied = 0
+    for record in records:
+        copy = dict(record)
+        filename = Path(str(copy.get("stl_path") or "")).name
+        queue = queues.get(filename)
+        if queue:
+            entry = queue.pop(0)
+            for field in _SHAPE_EXPORT_FIELDS:
+                if field in entry and entry[field] is not None:
+                    copy[field] = entry[field]
+            _round_targets_to_tenths(copy)
+            applied += 1
+        updated.append(copy)
+    missing = sorted({name for name, queue in queues.items() if queue})
+
+    generation = payload.get("generation", {}) if isinstance(payload.get("generation"), dict) else {}
+
+    def option(key: str):
+        return gr.update(value=generation[key]) if key in generation else gr.skip()
+
+    messages = [f"Imported settings for {applied} shape(s)."]
+    if generation:
+        messages.append("Generation options restored.")
+    if missing:
+        messages.append(
+            "Not currently loaded (upload them, then import again): " + ", ".join(f"`{name}`" for name in missing) + "."
+        )
+    return (
+        updated,
+        _shape_settings_rows(updated),
+        "  \n".join(messages),
+        option("raster_pattern"),
+        option("pressure_ramp_enabled"),
+        option("sweep_buffer"),
+        option("lead_in_length"),
+        option("lead_in_clearance"),
+        option("lead_in_lines"),
+        option("lead_in_direction"),
+        option("lead_in_orientation"),
+        option("layer_height"),
+        option("fil_width"),
+        option("scale_mode"),
+        option("nozzle_speed"),
+    )
+
+
 def assign_unique_valves(
     records: list[dict] | None, settings_table: Any
 ) -> tuple[list[dict], list[list[Any]]]:
@@ -4111,13 +4310,16 @@ def generate_dynamic_gcode(
     nozzle_speed: Any = None,
     sweep_buffer: float = 0.8,
     lead_in_orientation: str | None = None,
+    progress: gr.Progress = gr.Progress(),
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
     messages: list[str] = []
+    progress(0.02, desc="Slicing shapes…")
     _ensure_records_sliced(records, layer_height, scale_mode, messages)
     # Shared reference motion is always on: every head traces the combined
     # outline and dispenses only its own geometry. Rebuilt with the CURRENT
     # fil width so the alignment snap grid matches this generation.
+    progress(0.12, desc="Building the shared reference outline…")
     ref_layers = generate_dynamic_reference_stack(records, fil_width)
     contour_sources = _contour_tracing_sources(records)
     if contour_sources:
@@ -4160,6 +4362,12 @@ def generate_dynamic_gcode(
     # toggle, per-layer ramp) — the print host compiles every file onto one
     # timeline and duplicated toggles would flip the regulator on/off/on.
     ports_owned: set[int] = set()
+    generatable = sum(
+        1
+        for record in records
+        if record.get("layer_stack") is not None and getattr(record["layer_stack"], "layers", None)
+    )
+    generated_count = 0
     for record in records:
         stack = record.get("layer_stack")
         if stack is None or not getattr(stack, "layers", None):
@@ -4169,6 +4377,11 @@ def generate_dynamic_gcode(
             messages.append(f"Shape {record['idx']}: skipped (no combined reference outline; slice a shape first).")
             continue
         shape_name = str(record.get("name") or stack.name or f"shape_{record['idx']}").replace(" ", "_")
+        generated_count += 1
+        progress(
+            0.15 + 0.8 * (generated_count - 1) / max(1, generatable),
+            desc=f"Generating {shape_name} ({generated_count}/{generatable})…",
+        )
         port_number = _coerce_int(record.get("port"), 1)
         owns_port_pressure = port_number not in ports_owned
         try:
@@ -4244,6 +4457,7 @@ def generate_dynamic_gcode(
                 f"**Print path {shared_length:,.0f} mm — about {estimate} at {speed:g} mm/s** "
                 "(constant speed; the Visualization tab's Nozzle Speed sets the rate).",
             )
+    progress(1.0, desc="Done")
     return (
         records,
         ref_layers,
@@ -4574,6 +4788,25 @@ def build_dynamic_demo() -> gr.Blocks:
                         value=SCALE_MODE_TARGET_DIMENSIONS,
                         label="Scaling Mode",
                     )
+
+            with gr.Accordion("Save / Load Settings", open=False, elem_classes=["settings-accordion"]):
+                gr.Markdown(
+                    "Sessions are lost on a page refresh, so settings travel as a small JSON file "
+                    "keyed by STL filename: **Export** downloads every table setting plus the "
+                    "generation options; re-upload the same STLs later and **Import** restores them."
+                )
+                with gr.Row():
+                    with gr.Column(scale=1, min_width=220):
+                        export_settings_button = gr.Button("Export Settings", variant="secondary")
+                        settings_export_file = gr.File(label="Settings File", interactive=False, height=110)
+                    with gr.Column(scale=1, min_width=220):
+                        settings_import_upload = gr.File(
+                            label="Import Settings (.json)",
+                            file_types=[".json"],
+                            interactive=True,
+                            height=110,
+                        )
+                settings_status = gr.Markdown("")
 
             # Visually hidden (not visible=False: Gradio would omit them
             # from the DOM entirely and the color-select relay needs them).
@@ -5067,6 +5300,48 @@ def build_dynamic_demo() -> gr.Blocks:
             inputs=[shape_records, shape_settings],
             outputs=[shape_records, shape_settings],
             queue=False,
+        )
+        export_settings_button.click(
+            fn=export_project_settings,
+            inputs=[
+                shape_records,
+                shape_settings,
+                layer_height,
+                fil_width,
+                scale_mode,
+                gcode_raster_pattern,
+                gcode_pressure_ramp_enabled,
+                gcode_sweep_buffer,
+                gcode_lead_in_length,
+                gcode_lead_in_clearance,
+                gcode_lead_in_lines,
+                gcode_lead_in_direction,
+                gcode_lead_in_orientation,
+                viz_nozzle_speed,
+            ],
+            outputs=[settings_export_file, settings_status],
+            queue=False,
+        )
+        settings_import_upload.change(
+            fn=import_project_settings,
+            inputs=[settings_import_upload, shape_records, shape_settings],
+            outputs=[
+                shape_records,
+                shape_settings,
+                settings_status,
+                gcode_raster_pattern,
+                gcode_pressure_ramp_enabled,
+                gcode_sweep_buffer,
+                gcode_lead_in_length,
+                gcode_lead_in_clearance,
+                gcode_lead_in_lines,
+                gcode_lead_in_direction,
+                gcode_lead_in_orientation,
+                layer_height,
+                fil_width,
+                scale_mode,
+                viz_nozzle_speed,
+            ],
         )
 
         # Stale-G-code banner: re-checked on every table change and every
