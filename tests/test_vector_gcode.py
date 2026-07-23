@@ -222,6 +222,81 @@ def test_gcode_header_writes_presets_before_initial_aux_commands(tmp_path) -> No
     assert not any("WAGO_ValveCommands(100" in line for line in lines)
 
 
+def test_lead_in_line_direction_can_run_across_the_approach(tmp_path) -> None:
+    from vector_toolpath import LEAD_IN_DIRECTION_DOWN, LEAD_IN_LINE_HORIZONTAL
+
+    gcode_path = generate_vector_gcode(
+        _stack(box(0.0, 0.0, 0.5, 0.5)),
+        shape_name="lead_below_horizontal",
+        pressure=25,
+        valve=7,
+        port=3,
+        fil_width=0.5,
+        lead_in_enabled=True,
+        lead_in_length=3.0,
+        lead_in_clearance=4.0,
+        lead_in_lines=3,
+        lead_in_direction=LEAD_IN_DIRECTION_DOWN,
+        lead_in_orientation=LEAD_IN_LINE_HORIZONTAL,
+        output_dir=tmp_path,
+    )
+    moves = _moves_with_colors(gcode_path.read_text())
+
+    # The purge patch sits BELOW the shape with HORIZONTAL strokes: the
+    # first travel drops straight to y = -clearance, and every purge stroke
+    # runs in X only, stepping half a fil further down between strokes.
+    assert moves[0]["end"] == (0.0, -4.0, 0.0)
+    home_index = next(i for i, m in enumerate(moves[1:], start=1) if m["end"] == (0.0, 0.0, 0.0))
+    lead_prints = [m for m in moves[:home_index] if m["color"] == 255]
+    assert len(lead_prints) == 3
+    assert all(abs(m["end"][1] - m["start"][1]) < 1e-9 for m in lead_prints)  # horizontal
+    assert all(abs(abs(m["end"][0] - m["start"][0]) - 3.0) < 1e-9 for m in lead_prints)
+    stroke_rows = sorted(m["start"][1] for m in lead_prints)
+    assert stroke_rows == [-5.0, -4.5, -4.0]  # stepping AWAY from the shape
+
+    # The return route comes home without re-crossing a wet stroke row:
+    # travels between strokes' rows happen only beyond the patch or on the
+    # clean lane outside the stroke span (x < 0).
+    for travel in [m for m in moves[1:home_index] if m["color"] == 0]:
+        y0, y1 = travel["start"][1], travel["end"][1]
+        x0, x1 = travel["start"][0], travel["end"][0]
+        if abs(y1 - y0) < 1e-9 and abs(x1 - x0) > 1e-9 and y0 in stroke_rows:
+            # Horizontal travel on a wet row must be a stroke, not a travel.
+            raise AssertionError(f"travel drags along wet row y={y0}")
+
+
+def test_sweep_buffer_is_adjustable_and_can_be_disabled(tmp_path) -> None:
+    layer = box(0.0, 0.0, 4.0, 1.0)
+    stack = _stack(layer)
+
+    def _generate(label: str, **kwargs):
+        path = generate_vector_gcode(
+            stack,
+            shape_name=label,
+            pressure=25,
+            valve=7,
+            port=3,
+            fil_width=1.0,
+            output_dir=tmp_path / label,
+            **kwargs,
+        )
+        return _moves_with_colors(path.read_text())
+
+    # Default: the valve-settle approach travel is one fil_width long.
+    default = _generate("default")
+    assert default[0]["color"] == 0
+    assert abs(math.dist(default[0]["start"], default[0]["end"]) - 1.0) < 1e-9
+
+    # Custom buffer: the approach stretches to the requested length.
+    long_buffer = _generate("long", sweep_buffer=2.5)
+    assert abs(math.dist(long_buffer[0]["start"], long_buffer[0]["end"]) - 2.5) < 1e-9
+
+    # Zero buffer: no approach travel — the sweep starts on the material.
+    none = _generate("none", sweep_buffer=0.0)
+    assert none[0]["color"] == 255
+    assert none[0]["start"] == (0.0, 0.0, 0.0)
+
+
 def test_port_sharing_files_emit_pressure_commands_once(tmp_path) -> None:
     # The pressure regulator is a PORT device: a file generated WITHOUT
     # pressure ownership carries no serial commands at all (no preset, no

@@ -9,9 +9,7 @@ pressure ramp.
 from __future__ import annotations
 
 import tempfile
-from codecs import encode
 from pathlib import Path
-from textwrap import wrap
 
 from stl_slicer import LayerStack
 from vector_toolpath import (
@@ -50,44 +48,25 @@ __all__ = [
 ]
 
 
-def _setpress(pressure: float) -> str:
-    pressure_str = str(int(pressure * 10)).zfill(4)
-    command_bytes = bytes("08PS  " + pressure_str, "utf-8")
-    hex_command = encode(command_bytes, "hex").decode("utf-8")
-    format_command = "\\x" + "\\x".join(
-        hex_command[i : i + 2] for i in range(0, len(hex_command), 2)
-    )
-
-    hex_pairs = wrap(hex_command, 2)
-    decimal_sum = sum(int(pair, 16) for pair in hex_pairs)
-    checksum_bin = bin(decimal_sum % 256)[2:].zfill(8)
-    inverted = int("".join("1" if c == "0" else "0" for c in checksum_bin), 2) + 1
-    checksum_hex = hex(inverted)[2:].upper()
-    format_checksum = "\\x" + "\\x".join(
-        checksum_hex[i : i + 2] for i in range(0, len(checksum_hex), 2)
-    )
-
-    return "b'" + "\\x05\\x02" + format_command + format_checksum + "\\x03" + "'"
-
-
-def _togglepress() -> str:
-    return "b'\\x05\\x02\\x30\\x34\\x44\\x49\\x20\\x20\\x43\\x46\\x03'"
-
-
 def _setpress_cmd(port: str, pressure: float, start: bool) -> str:
-    # {preset} marks pressure setup for the Aerotech host runtime: presets
-    # execute at the controller's START signal, before the initial toggles.
+    """Pressure preset in the readable host dialect.
+
+    Every pressure command uses the same `eval(setpress(...))` form (the
+    print host defines `setpress`, which builds the serial byte string), so
+    the values are human-readable throughout the file. `start` adds the
+    {preset} marker: the host executes presets at the controller's START
+    signal, before the initial toggles; ramp commands mid-file run at their
+    scheduled times instead.
+    """
     if start:
         return f"\n\r{{preset}}{port}.write(eval(setpress({pressure:g})))"
-    insert = ""
-    return f"\n\r{insert}{port}.write({_setpress(pressure)})"
+    return f"\n\r{port}.write(eval(setpress({pressure:g})))"
 
 
 def _toggle_cmd(port: str, start: bool) -> str:
     if start:
         return f"\n\r{{preset}}{port}.write(eval(togglepress()))"
-    insert = ""
-    return f"\n\r{insert}{port}.write({_togglepress()})"
+    return f"\n\r{port}.write(eval(togglepress()))"
 
 
 def _valve_cmd(valve: int, command: int) -> str:
@@ -207,6 +186,7 @@ def generate_vector_gcode(
     infill: float = 1.0,
     motion_infill_fractions: list[float] | None = None,
     emit_pressure_commands: bool = True,
+    sweep_buffer: float | None = None,
     increase_pressure_per_layer: float = 0.1,
     pressure_ramp_enabled: bool = True,
     all_g1: bool = False,
@@ -215,6 +195,7 @@ def generate_vector_gcode(
     lead_in_clearance: float = 5.0,
     lead_in_lines: int = 3,
     lead_in_direction: str = LEAD_IN_DIRECTION_LEFT,
+    lead_in_orientation: str | None = None,
     lead_in_dispense: bool = True,
     wall_sources: list[LayerStack] | None = None,
     origin_sink: dict | None = None,
@@ -337,6 +318,9 @@ def generate_vector_gcode(
             if motion_infill_fractions is not None
             else None
         ),
+        # Valve-settle travel before/after each raster sweep; one fil_width
+        # when not given. Pass the SAME value for every shape sharing motion.
+        sweep_buffer=sweep_buffer,
     )
 
     # World anchor: the toolpath origin expressed in the shape's own frame.
@@ -365,6 +349,7 @@ def generate_vector_gcode(
         255 if lead_in_dispense else 0,
         0,
         direction=lead_in_direction,
+        orientation=lead_in_orientation,
     )
     if lead_in:
         gcode_list = [*lead_in, *gcode_list]

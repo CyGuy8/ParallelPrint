@@ -411,13 +411,15 @@ def _axis_raster_segments(
     scan_anchor: float | None = None,
     infill_keep=None,
     motion_keep=None,
+    sweep_buffer: float | None = None,
 ) -> list[Seg]:
     """Snake raster of `motion`, dispensing only inside `valve`.
 
     Axis "X" sweeps along X with rows stacked in Y; axis "Y" sweeps along Y
     with columns stacked in X. Each sweep spans from the first to the last
-    motion chord (crossing interior gaps valve-off) and gets a fil_width
-    valve-settle travel buffer before and after. `scan_anchor` pins the
+    motion chord (crossing interior gaps valve-off) and gets a valve-settle
+    travel buffer before and after (`sweep_buffer`, one fil_width when not
+    given; 0 disables it). `scan_anchor` pins the
     scanlines to a global grid (see `_scan_coords`). `infill_keep(k)` gates
     dispensing per grid line for partial infill: skipped lines are still
     swept with the valve closed. `motion_keep(k)` drops a grid line from the
@@ -427,6 +429,7 @@ def _axis_raster_segments(
     if motion is None or motion.is_empty:
         return []
 
+    buffer_length = fil_width if sweep_buffer is None else max(0.0, float(sweep_buffer))
     min_x, min_y, max_x, max_y = motion.bounds
     if axis == "Y":
         scan_lo, scan_hi = min_x, max_x
@@ -485,7 +488,7 @@ def _axis_raster_segments(
         sweep_number += 1
 
         if forward:
-            emit(sweep_lo - fil_width, sweep_lo, 0)
+            emit(sweep_lo - buffer_length, sweep_lo, 0)
             current = sweep_lo
             for lo, hi in valve_runs:
                 if lo - current > EPS:
@@ -498,9 +501,9 @@ def _axis_raster_segments(
             if sweep_hi - current > EPS:
                 emit(current, sweep_hi, 0)
                 current = sweep_hi
-            emit(current, current + fil_width, 0)
+            emit(current, current + buffer_length, 0)
         else:
-            emit(sweep_hi + fil_width, sweep_hi, 0)
+            emit(sweep_hi + buffer_length, sweep_hi, 0)
             current = sweep_hi
             for lo, hi in reversed(valve_runs):
                 if current - hi > EPS:
@@ -513,7 +516,7 @@ def _axis_raster_segments(
             if current - sweep_lo > EPS:
                 emit(current, sweep_lo, 0)
                 current = sweep_lo
-            emit(current, current - fil_width, 0)
+            emit(current, current - buffer_length, 0)
 
     return segments
 
@@ -529,6 +532,7 @@ def _oriented_axis_raster_segments(
     scan_anchor: float | None = None,
     infill_keep=None,
     motion_keep=None,
+    sweep_buffer: float | None = None,
 ) -> list[Seg]:
     """Pick the raster orientation whose start is nearest the current position."""
     default_segments = _axis_raster_segments(
@@ -539,6 +543,7 @@ def _oriented_axis_raster_segments(
         scan_anchor=scan_anchor,
         infill_keep=infill_keep,
         motion_keep=motion_keep,
+        sweep_buffer=sweep_buffer,
     )
     if prefer_default or not default_segments:
         return default_segments
@@ -556,6 +561,7 @@ def _oriented_axis_raster_segments(
                 scan_anchor=scan_anchor,
                 infill_keep=infill_keep,
                 motion_keep=motion_keep,
+                sweep_buffer=sweep_buffer,
             )
             if segments and segments not in candidates:
                 candidates.append(segments)
@@ -582,6 +588,7 @@ def _rotated_raster_segments(
     frame: tuple[float, float, float, float],
     infill_keep=None,
     motion_keep=None,
+    sweep_buffer: float | None = None,
 ) -> list[Seg]:
     """Snake raster at an arbitrary angle, reusing the axis raster machinery.
 
@@ -626,6 +633,7 @@ def _rotated_raster_segments(
         scan_anchor=anchor,
         infill_keep=infill_keep,
         motion_keep=motion_keep,
+        sweep_buffer=sweep_buffer,
     )
 
     theta_back = math.radians(angle_degrees)
@@ -1298,6 +1306,25 @@ def _normalize_lead_in_direction(direction: str | None) -> str:
     return LEAD_IN_DIRECTION_LEFT
 
 
+# Purge-stroke orientation: "Auto" keeps the strokes pointing at the shape
+# (the historical behavior — horizontal for Left/Right patches, vertical for
+# Up/Down); Horizontal/Vertical force an absolute stroke direction.
+LEAD_IN_LINE_AUTO = "Auto (toward the shape)"
+LEAD_IN_LINE_HORIZONTAL = "Horizontal"
+LEAD_IN_LINE_VERTICAL = "Vertical"
+LEAD_IN_LINE_CHOICES = (
+    LEAD_IN_LINE_AUTO,
+    LEAD_IN_LINE_HORIZONTAL,
+    LEAD_IN_LINE_VERTICAL,
+)
+
+
+def _normalize_lead_in_orientation(orientation: str | None) -> str:
+    if orientation in LEAD_IN_LINE_CHOICES:
+        return orientation
+    return LEAD_IN_LINE_AUTO
+
+
 def _lead_in_moves(
     enabled: bool,
     length: float,
@@ -1307,14 +1334,18 @@ def _lead_in_moves(
     print_color: int,
     off_color: int,
     direction: str | None = LEAD_IN_DIRECTION_LEFT,
+    orientation: str | None = None,
 ) -> list[dict]:
     """Purge patch printed before layer 1, in the chosen direction.
 
-    The patch sits `clearance` away from the toolpath start along the purge
-    direction and snakes `line_count` strokes of `length`, stepping one
-    `line_spacing` laterally between strokes. The return route exits the
-    patch one lateral step to the OUTSIDE and comes home through virgin
-    ground, so the freshly primed nozzle never drags back across the wet
+    `direction` places the patch (Left/Right/Up/Down of the toolpath start,
+    `clearance` away). `orientation` sets which way the purge strokes RUN:
+    Auto points them at the shape (horizontal for Left/Right patches,
+    vertical for Up/Down), Horizontal/Vertical force an absolute direction.
+    When strokes run along the approach, lines step laterally; when they run
+    across it, lines step further AWAY from the shape — either way the
+    return route exits one step outside the wet patch and comes home through
+    virgin ground, so the freshly primed nozzle never drags back across the
     purge lines.
     """
     if not enabled:
@@ -1326,6 +1357,13 @@ def _lead_in_moves(
     pass_count = max(1, int(line_count))
     spacing = max(0.0, float(line_spacing))
     away, lateral = _LEAD_IN_AXES[_normalize_lead_in_direction(direction)]
+    orientation = _normalize_lead_in_orientation(orientation)
+    if orientation == LEAD_IN_LINE_HORIZONTAL:
+        strokes_along_away = abs(away[0]) > 0.0
+    elif orientation == LEAD_IN_LINE_VERTICAL:
+        strokes_along_away = abs(away[1]) > 0.0
+    else:
+        strokes_along_away = True
 
     moves: list[dict] = []
     # Patch-local frame: `a` runs along the away axis, `v` along the lateral.
@@ -1346,22 +1384,44 @@ def _lead_in_moves(
         current_a += delta_a
         current_v += delta_v
 
-    append_move(lead_clearance + lead_length, 0.0, off_color)
-    stroke = -1.0  # first stroke prints back toward the part
-    for pass_index in range(pass_count):
-        append_move(stroke * lead_length, 0.0, print_color)
-        stroke *= -1.0
-        if pass_index < pass_count - 1:
-            append_move(0.0, spacing, off_color)
+    if strokes_along_away:
+        append_move(lead_clearance + lead_length, 0.0, off_color)
+        stroke = -1.0  # first stroke prints back toward the part
+        for pass_index in range(pass_count):
+            append_move(stroke * lead_length, 0.0, print_color)
+            stroke *= -1.0
+            if pass_index < pass_count - 1:
+                append_move(0.0, spacing, off_color)
 
-    # Return: step one spacing outside the patch laterally, travel home
-    # through the clearance lane, then step back onto the start point.
-    if spacing > 0.0:
-        append_move(0.0, -(current_v + spacing), off_color)
-        append_move(-current_a, 0.0, off_color)
-        append_move(0.0, -current_v, off_color)
+        # Return: step one spacing outside the patch laterally, travel home
+        # through the clearance lane, then step back onto the start point.
+        if spacing > 0.0:
+            append_move(0.0, -(current_v + spacing), off_color)
+            append_move(-current_a, 0.0, off_color)
+            append_move(0.0, -current_v, off_color)
+        else:
+            append_move(-current_a, -current_v, off_color)
     else:
-        append_move(-current_a, -current_v, off_color)
+        # Strokes run ACROSS the approach: lines step further away from the
+        # shape, so the patch grows outward from `clearance`.
+        append_move(lead_clearance, 0.0, off_color)
+        stroke = 1.0
+        for pass_index in range(pass_count):
+            append_move(0.0, stroke * lead_length, print_color)
+            stroke *= -1.0
+            if pass_index < pass_count - 1:
+                append_move(spacing, 0.0, off_color)
+
+        # Return: step one spacing PAST the outermost wet line, cross to the
+        # clean lane one spacing outside the stroke span, come home along
+        # it, then step onto the start point.
+        if spacing > 0.0:
+            append_move(spacing, 0.0, off_color)
+            append_move(0.0, -(current_v + spacing), off_color)
+            append_move(-current_a, 0.0, off_color)
+            append_move(0.0, -current_v, off_color)
+        else:
+            append_move(-current_a, -current_v, off_color)
     return moves
 
 
@@ -1379,6 +1439,7 @@ def plan_layer_moves(
     extra_wall_radii: list[list[float]] | None = None,
     ring_center: tuple[float, float] | None = None,
     motion_infill_fractions: list[float] | None = None,
+    sweep_buffer: float | None = None,
 ) -> tuple[list[dict], tuple[float, float]]:
     """Assemble per-layer segments into a relative move list for all patterns.
 
@@ -1548,6 +1609,7 @@ def plan_layer_moves(
                 frame=frame,
                 infill_keep=infill_keep,
                 motion_keep=motion_keep,
+                sweep_buffer=sweep_buffer,
             )
         else:
             raster_axis = _raster_axis_for_pattern(raster_pattern, layer_number)
@@ -1565,6 +1627,7 @@ def plan_layer_moves(
                 scan_anchor=axis_anchor,
                 infill_keep=infill_keep,
                 motion_keep=motion_keep,
+                sweep_buffer=sweep_buffer,
             )
 
         if not segments:

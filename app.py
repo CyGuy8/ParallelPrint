@@ -41,6 +41,8 @@ from vector_gcode import generate_vector_gcode
 from vector_toolpath import (
     LEAD_IN_DIRECTION_CHOICES,
     LEAD_IN_DIRECTION_LEFT,
+    LEAD_IN_LINE_AUTO,
+    LEAD_IN_LINE_CHOICES,
     RASTER_PATTERN_CHOICES,
     RASTER_PATTERN_SAME_DIRECTION,
     RASTER_PATTERN_Y_DIRECTION,
@@ -3983,6 +3985,8 @@ def _gcode_settings_snapshot(
     layer_height: float,
     fil_width: float,
     scale_mode: str | None,
+    sweep_buffer: float = 0.8,
+    lead_in_orientation: str | None = None,
 ) -> dict:
     """Fingerprint of every setting that shapes this record's G-code.
 
@@ -4008,10 +4012,12 @@ def _gcode_settings_snapshot(
             round(_coerce_float(lead_in_clearance, 5.0), 6),
             _coerce_int(lead_in_lines, 3),
             str(lead_in_direction or ""),
+            str(lead_in_orientation or LEAD_IN_LINE_AUTO),
         ),
         "layer_height": round(_coerce_float(layer_height, 0.8), 6),
         "fil_width": round(_coerce_float(fil_width, 0.8), 6),
         "scale_mode": _normalize_scale_mode(scale_mode),
+        "sweep_buffer": round(_coerce_float(sweep_buffer, 0.8), 6),
     }
 
 
@@ -4033,6 +4039,8 @@ def check_gcode_staleness(
     layer_height: float,
     fil_width: float,
     scale_mode: str | None,
+    sweep_buffer: float = 0.8,
+    lead_in_orientation: str | None = None,
 ) -> str:
     """Warning banner text when generated G-code no longer matches the settings."""
     records = _apply_shape_settings(records or [], settings_table)
@@ -4048,6 +4056,8 @@ def check_gcode_staleness(
         layer_height,
         fil_width,
         scale_mode,
+        sweep_buffer,
+        lead_in_orientation,
     )
     for record in records:
         if not record.get("gcode_path"):
@@ -4093,6 +4103,8 @@ def generate_dynamic_gcode(
     fil_width: float,
     scale_mode: str | None,
     nozzle_speed: Any = None,
+    sweep_buffer: float = 0.8,
+    lead_in_orientation: str | None = None,
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
     messages: list[str] = []
@@ -4174,11 +4186,14 @@ def generate_dynamic_gcode(
                 infill=_coerce_float(record.get("infill", 100.0), 100.0) / 100.0,
                 motion_infill_fractions=motion_infill_fractions,
                 emit_pressure_commands=owns_port_pressure,
+                # Same buffer for every shape: the shared motion must match.
+                sweep_buffer=max(0.0, _coerce_float(sweep_buffer, 0.8)),
                 lead_in_enabled=bool(lead_in_enabled),
                 lead_in_length=float(lead_in_length),
                 lead_in_clearance=effective_lead_in_clearance,
                 lead_in_lines=max(1, _coerce_int(lead_in_lines, 3)),
                 lead_in_direction=lead_in_direction or LEAD_IN_DIRECTION_LEFT,
+                lead_in_orientation=lead_in_orientation,
                 lead_in_dispense=bool(record.get("lead_in", True)),
                 wall_sources=wall_sources,
                 origin_sink=(origin_sink := {}),
@@ -4201,6 +4216,8 @@ def generate_dynamic_gcode(
                 layer_height,
                 fil_width,
                 scale_mode,
+                sweep_buffer,
+                lead_in_orientation,
             )
             messages.append(f"Shape {record['idx']}: wrote `{gcode_path.name}`.")
         except Exception as exc:
@@ -4663,23 +4680,49 @@ def build_dynamic_demo() -> gr.Blocks:
                 """
             )
             gcode_pressure_ramp_enabled = gr.Checkbox(label="Increase Pressure Each Layer", value=True)
-            gcode_raster_pattern = gr.Dropdown(
-                label="Raster Pattern",
-                choices=list(RASTER_PATTERN_CHOICES),
-                value=RASTER_PATTERN_SAME_DIRECTION,
-                allow_custom_value=False,
-            )
+            with gr.Row():
+                gcode_raster_pattern = gr.Dropdown(
+                    label="Raster Pattern",
+                    choices=list(RASTER_PATTERN_CHOICES),
+                    value=RASTER_PATTERN_SAME_DIRECTION,
+                    allow_custom_value=False,
+                    scale=3,
+                )
+                gcode_sweep_buffer = gr.Number(
+                    label="Sweep Buffer (mm)",
+                    value=0.8,
+                    minimum=0.0,
+                    step=0.1,
+                    scale=1,
+                    min_width=170,
+                    info="Valve-settle travel before/after each raster line (0 = none).",
+                )
             with gr.Accordion("Lead In Options", open=False, elem_classes=["settings-accordion"]):
                 gr.Markdown("Applies to shapes with **Lead In** checked in the Shape Settings table.")
                 with gr.Row():
-                    gcode_lead_in_length = gr.Number(label="Lead In Length (mm)", value=5.0, minimum=0.1, step=0.1)
-                    gcode_lead_in_clearance = gr.Number(label="Lead In Clearance (mm)", value=5.0, minimum=0.0, step=0.1)
+                    gcode_lead_in_length = gr.Number(label="Lead In Length (mm)", value=5.0, minimum=0.1, step=0.1, info="Length of each purge stroke.")
+                    gcode_lead_in_clearance = gr.Number(
+                        label="Lead In Clearance (mm)",
+                        value=5.0,
+                        minimum=0.0,
+                        step=0.1,
+                        info="Distance between the shape and the purge patch.",
+                    )
                     gcode_lead_in_lines = gr.Number(label="Lead In Raster Lines", value=3, minimum=1, step=1)
+                with gr.Row():
                     gcode_lead_in_direction = gr.Dropdown(
-                        label="Lead In Direction",
+                        label="Lead In Position",
                         choices=list(LEAD_IN_DIRECTION_CHOICES),
                         value=LEAD_IN_DIRECTION_LEFT,
                         allow_custom_value=False,
+                        info="Which side of the shape the purge patch sits on.",
+                    )
+                    gcode_lead_in_orientation = gr.Dropdown(
+                        label="Lead In Line Direction",
+                        choices=list(LEAD_IN_LINE_CHOICES),
+                        value=LEAD_IN_LINE_AUTO,
+                        allow_custom_value=False,
+                        info="Which way the purge strokes run within the patch.",
                     )
             gcode_stale_banner = gr.Markdown("", elem_id="gcode-stale-banner")
             gcode_button = gr.Button("Generate G-Code", variant="primary")
@@ -5034,6 +5077,8 @@ def build_dynamic_demo() -> gr.Blocks:
             layer_height,
             fil_width,
             scale_mode,
+            gcode_sweep_buffer,
+            gcode_lead_in_orientation,
         ]
         shape_settings.change(
             fn=check_gcode_staleness,
@@ -5051,6 +5096,8 @@ def build_dynamic_demo() -> gr.Blocks:
             layer_height,
             fil_width,
             scale_mode,
+            gcode_sweep_buffer,
+            gcode_lead_in_orientation,
         ):
             stale_control.change(
                 fn=check_gcode_staleness,
@@ -5093,6 +5140,8 @@ def build_dynamic_demo() -> gr.Blocks:
                 fil_width,
                 scale_mode,
                 viz_nozzle_speed,
+                gcode_sweep_buffer,
+                gcode_lead_in_orientation,
             ],
             outputs=[shape_records, ref_layers, gcode_downloads, gcode_status, gcode_text_source, gcode_source, gcode_download_all],
         ).then(
