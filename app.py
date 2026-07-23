@@ -290,6 +290,12 @@ APP_CSS = """
     font-weight: 500;
 }
 
+/* Raster Pattern + Sweep Buffer: bottom-align so the input boxes line up
+   even when their label/hint lines wrap differently. */
+#gcode-raster-row {
+    align-items: end;
+}
+
 /* Narrower columns: header labels ("Pressure (psi)", "Contour Tracing", ...)
    wrap to two lines instead of forcing single-line column widths. Wrapping
    happens ONLY at spaces — words never break mid-word (columns grow to fit
@@ -4680,13 +4686,14 @@ def build_dynamic_demo() -> gr.Blocks:
                 """
             )
             gcode_pressure_ramp_enabled = gr.Checkbox(label="Increase Pressure Each Layer", value=True)
-            with gr.Row():
+            with gr.Row(elem_id="gcode-raster-row"):
                 gcode_raster_pattern = gr.Dropdown(
                     label="Raster Pattern",
                     choices=list(RASTER_PATTERN_CHOICES),
                     value=RASTER_PATTERN_SAME_DIRECTION,
                     allow_custom_value=False,
                     scale=3,
+                    info="Tool path style used for every layer.",
                 )
                 gcode_sweep_buffer = gr.Number(
                     label="Sweep Buffer (mm)",
@@ -4708,7 +4715,7 @@ def build_dynamic_demo() -> gr.Blocks:
                         step=0.1,
                         info="Distance between the shape and the purge patch.",
                     )
-                    gcode_lead_in_lines = gr.Number(label="Lead In Raster Lines", value=3, minimum=1, step=1)
+                    gcode_lead_in_lines = gr.Number(label="Lead In Raster Lines", value=3, minimum=1, step=1, info="Number of purge strokes in the patch.")
                 with gr.Row():
                     gcode_lead_in_direction = gr.Dropdown(
                         label="Lead In Position",
