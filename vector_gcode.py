@@ -32,9 +32,14 @@ from vector_toolpath import (
     plan_layer_moves,
 )
 
+# The pressure box protocol ("08PS" + pressure*10 over serial) drives a
+# regulator with a 0-100 psi range; values are encoded to the tenths place.
+MAX_PRESSURE_PSI = 100.0
+
 __all__ = [
     "LEAD_IN_DIRECTION_CHOICES",
     "LEAD_IN_DIRECTION_LEFT",
+    "MAX_PRESSURE_PSI",
     "RASTER_PATTERN_CHOICES",
     "RASTER_PATTERN_CIRCLE_SPIRAL",
     "RASTER_PATTERN_DIAGONAL_WOODPILE",
@@ -110,6 +115,9 @@ def write_gcode_file(
     com_port = f"serialPort{port}"
     color_dict: dict[int, int] = {0: 100, 255: valve}
 
+    # The regulator tops out at MAX_PRESSURE_PSI and resolves tenths: clamp
+    # the preset AND the per-layer ramp so no command asks the impossible.
+    pressure = round(min(max(float(pressure), 0.0), MAX_PRESSURE_PSI), 1)
     setpress_lines = [_setpress_cmd(com_port, pressure, start=True)]
     pressure_on_lines = [_toggle_cmd(com_port, start=True)]
     pressure_off_lines = [_toggle_cmd(com_port, start=False)]
@@ -148,7 +156,9 @@ def write_gcode_file(
                     f"Z{_coord(move['Z'])} ; Color {move['Color']}"
                 )
                 if pressure_ramp_enabled and emit_pressure_commands:
-                    pressure_cur += increase_pressure_per_layer
+                    pressure_cur = round(
+                        min(pressure_cur + increase_pressure_per_layer, MAX_PRESSURE_PSI), 1
+                    )
                     pressure_next = _setpress_cmd(com_port, pressure_cur, start=False)
                 else:
                     pressure_next = None

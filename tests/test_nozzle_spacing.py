@@ -1226,6 +1226,43 @@ def test_table_dimensions_display_and_store_to_the_tenths_place() -> None:
         assert updated2[0][key] == round(updated2[0][key], 1)
 
 
+def test_pressure_clamps_to_the_regulator_range_and_tenths() -> None:
+    records = [
+        _mm_member(1, 1, 10.0, 10.0, 10.0),
+        _mm_member(2, 2, 10.0, 10.0, 10.0),
+        _mm_member(3, 3, 10.0, 10.0, 10.0),
+    ]
+    records[1]["port"] = 2
+    records[2]["port"] = 3
+    rows = _shape_settings_rows(records)
+    pressure_pos = SHAPE_SETTINGS_HEADERS.index("Pressure (psi)")
+    rows[0][pressure_pos] = 150.0    # above the regulator limit
+    rows[1][pressure_pos] = 25.678   # too many decimals
+    rows[2][pressure_pos] = -5.0     # negative
+
+    updated = _apply_shape_settings(records, rows)
+    assert [record["pressure"] for record in updated] == [100.0, 25.7, 0.0]
+
+
+def test_port_sync_propagates_the_clamped_rounded_pressure() -> None:
+    from app import SCALE_MODE_TARGET_DIMENSIONS
+
+    # Both shapes on port 1; the edit is over-limit AND over-precise.
+    records = [
+        _mm_member(1, 1, 10.0, 10.0, 10.0),
+        _mm_member(2, 2, 10.0, 10.0, 10.0),
+    ]
+    rows = _shape_settings_rows(records)
+    pressure_pos = SHAPE_SETTINGS_HEADERS.index("Pressure (psi)")
+    rows[0][pressure_pos] = 132.456
+
+    updated, _table = normalize_shape_dimensions_for_mode(
+        records, rows, SCALE_MODE_TARGET_DIMENSIONS
+    )
+    assert updated[0]["pressure"] == 100.0
+    assert updated[1]["pressure"] == 100.0  # the port-mate gets the CLAMPED value
+
+
 def test_pressure_edit_propagates_to_shapes_sharing_the_port() -> None:
     from app import SCALE_MODE_TARGET_DIMENSIONS
 
@@ -1257,6 +1294,53 @@ def test_pressure_edit_propagates_to_shapes_sharing_the_port() -> None:
     )
     assert not isinstance(table_out2, list)
     assert updated2[1]["pressure"] == 32.0
+
+
+def test_port_merge_follows_the_most_recently_edited_pressure() -> None:
+    from app import SCALE_MODE_TARGET_DIMENSIONS
+
+    # Shape 1 on port 1 (25 psi), shape 2 on port 2. The user edits shape
+    # 2's pressure (stamping it as most recent), THEN moves it onto port 1:
+    # the merged group follows the most recent edit — 40 psi wins, exactly
+    # like Keep Proportions follows the most recently changed dimension.
+    first = _mm_member(1, 1, 10.0, 10.0, 10.0)
+    second = _mm_member(2, 2, 10.0, 10.0, 10.0)
+    second["port"] = 2
+    records = [first, second]
+
+    rows = _shape_settings_rows(records)
+    pressure_pos = SHAPE_SETTINGS_HEADERS.index("Pressure (psi)")
+    rows[1][pressure_pos] = 40.0
+    records, _table = normalize_shape_dimensions_for_mode(
+        records, rows, SCALE_MODE_TARGET_DIMENSIONS
+    )
+    assert records[1]["pressure"] == 40.0
+    assert records[1].get("pressure_edited_at")  # stamped as the latest edit
+
+    rows2 = _shape_settings_rows(records)
+    port_pos = SHAPE_SETTINGS_HEADERS.index("Port")
+    rows2[1][port_pos] = 1  # merge onto port 1
+    merged, _table2 = normalize_shape_dimensions_for_mode(
+        records, rows2, SCALE_MODE_TARGET_DIMENSIONS
+    )
+    assert merged[0]["pressure"] == 40.0  # the incumbent FOLLOWS the newer edit
+    assert merged[1]["pressure"] == 40.0
+
+    # And the other way around: if the incumbent's pressure was edited more
+    # recently, ITS value wins when the ports merge.
+    third = _mm_member(3, 3, 10.0, 10.0, 10.0)
+    fourth = _mm_member(4, 4, 10.0, 10.0, 10.0)
+    fourth["port"] = 2
+    fourth["pressure"] = 40.0
+    group = [third, fourth]
+    rows3 = _shape_settings_rows(group)
+    rows3[0][pressure_pos] = 33.0  # edit the port-1 incumbent LAST
+    group, _t = normalize_shape_dimensions_for_mode(group, rows3, SCALE_MODE_TARGET_DIMENSIONS)
+    rows4 = _shape_settings_rows(group)
+    rows4[1][port_pos] = 1
+    merged2, _t2 = normalize_shape_dimensions_for_mode(group, rows4, SCALE_MODE_TARGET_DIMENSIONS)
+    assert merged2[0]["pressure"] == 33.0
+    assert merged2[1]["pressure"] == 33.0
 
 
 def test_moving_a_shape_onto_a_port_adopts_that_ports_pressure() -> None:

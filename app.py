@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import tempfile
@@ -38,7 +39,7 @@ from stl_slicer import (
     scale_mesh,
     slice_stl_to_layers,
 )
-from vector_gcode import generate_vector_gcode
+from vector_gcode import MAX_PRESSURE_PSI, generate_vector_gcode
 from vector_toolpath import (
     LEAD_IN_DIRECTION_CHOICES,
     LEAD_IN_DIRECTION_LEFT,
@@ -532,6 +533,28 @@ APP_HEAD = """
             }
         });
     }
+    function commitCellEditOnEnter(event) {
+        // Gradio's own Enter handler loses the edit: it reads the editor via
+        // its els registry, which the duplicate table copy has clobbered, so
+        // the typed value is dropped and no change event reaches the server.
+        // The click-out path works because the editor's real blur event
+        // carries the textarea itself. So on Enter: suppress Gradio's
+        // handler and commit through the blur path, then send a synthetic
+        // Escape so the cell exits edit mode like a normal commit.
+        if (event.key !== 'Enter' || event.shiftKey) return;
+        var el = event.target;
+        if (!el || el.tagName !== 'TEXTAREA' || !el.closest) return;
+        if (!el.closest('#shape-settings-table, #nozzle-grid-spacing-table')) return;
+        if (el.closest('th')) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        el.blur();
+        el.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'Escape',
+            bubbles: true,
+            cancelable: true,
+        }));
+    }
     function suppressDeleteCellEditor(event) {
         var cell = event.target && event.target.closest ? event.target.closest('#shape-settings-table td:last-child, #shape-settings-table [role="gridcell"]:nth-child(12n)') : null;
         if (!cell) return;
@@ -556,6 +579,8 @@ APP_HEAD = """
     }
     function start() {
         enableUndoButtons();
+        // Capture phase: must beat the dataframe's own keydown handlers.
+        document.addEventListener('keydown', commitCellEditOnEnter, true);
         document.addEventListener('focusin', suppressDeleteCellEditor);
         document.addEventListener('pointerdown', isolateColorCell, true);
         document.addEventListener('mousedown', isolateColorCell, true);
@@ -622,6 +647,7 @@ APP_HEAD = """
         var entries = [];
         Array.prototype.slice.call(container.querySelectorAll('table tbody tr')).forEach(function (tr) {
             var tds = tr.querySelectorAll('td');
+            tr.style.display = '';
             for (var i = 0; i < tds.length; i++) {
                 tds[i].style.background = '';
                 if (i === 0 || i === PRESSURE_COL || i === PORT_COL) tds[i].style.boxShadow = '';
@@ -652,7 +678,17 @@ APP_HEAD = """
                 entry.pressure = cellName(tds[PRESSURE_COL]);
                 entry.fromLive = true;
             }
-            entry.copies.push({tr: tr, tds: tds});
+            entry.copies.push({tr: tr, tds: tds, live: fromLive});
+        });
+        // Ghost pass: when a Shape number has a LIVE row, any stale copy of
+        // it in the outer table is a render leftover — hide it entirely.
+        // (Shape numbers with no live row are left alone: hiding on a guess
+        // could blank a legitimately rendered table.)
+        entries.forEach(function (entry) {
+            if (!entry.fromLive) return;
+            entry.copies.forEach(function (copy) {
+                if (!copy.live) copy.tr.style.display = 'none';
+            });
         });
         var byNozzle = {}, byValve = {}, byPort = {};
         entries.forEach(function (entry) {
@@ -2041,6 +2077,7 @@ def _records_from_files(files: Any, previous_records: list[dict] | None = None) 
                 if _coerce_int(record.get("port"), 1) == port
             ]
             pressure = port_mates[0].get("pressure", 25.0) if port_mates else 25.0
+        pressure = round(min(max(_coerce_float(pressure, 25.0), 0.0), MAX_PRESSURE_PSI), 1)
         records.append({
             "idx": index,
             "name": name,
@@ -2055,6 +2092,9 @@ def _records_from_files(files: Any, previous_records: list[dict] | None = None) 
             "target_z": round(_coerce_float(previous.get("target_z"), default_z), 1),
             "last_scaled_axis": previous.get("last_scaled_axis", "target_x"),
             "pressure": pressure,
+            # When this shape's pressure was last hand-edited (port-group
+            # sync follows the most recent edit); survives re-syncs.
+            "pressure_edited_at": previous.get("pressure_edited_at"),
             "valve": valve,
             "nozzle": nozzle,
             "port": previous.get("port", 1),
@@ -2156,6 +2196,11 @@ def _apply_shape_settings(records: list[dict], settings_table: Any) -> list[dict
                     copy[key] = float(row[pos])
                 except (IndexError, TypeError, ValueError):
                     copy[key] = copy.get(key, default)
+            # The regulator range is 0..MAX_PRESSURE_PSI in tenths: values
+            # outside it (or with more decimals) can't reach the hardware.
+            copy["pressure"] = round(
+                min(max(_coerce_float(copy.get("pressure"), 25.0), 0.0), MAX_PRESSURE_PSI), 1
+            )
             has_nozzle_column = len(row) >= len(SHAPE_SETTINGS_HEADERS)
             nozzle_pos = 7 if has_nozzle_column else None
             port_pos = 8 if has_nozzle_column else 7
@@ -2862,7 +2907,11 @@ def _last_edited_pressures(records: list[dict] | None, settings_table: Any) -> d
         if not previous or len(row) <= pressure_pos:
             continue
         old_pressure = _coerce_float(previous.get("pressure"), 25.0)
-        new_pressure = _coerce_float(row[pressure_pos], old_pressure)
+        # Clamp/round like _apply_shape_settings does, so the value that
+        # propagates through a port group is the one the hardware can take.
+        new_pressure = round(
+            min(max(_coerce_float(row[pressure_pos], old_pressure), 0.0), MAX_PRESSURE_PSI), 1
+        )
         if not math.isclose(new_pressure, old_pressure, rel_tol=0.0, abs_tol=1e-9):
             edited[idx] = new_pressure
     return edited
@@ -2896,6 +2945,9 @@ def _last_edited_ports(records: list[dict] | None, settings_table: Any) -> set[i
     return changed
 
 
+_PRESSURE_EDIT_SEQUENCE = itertools.count(1)
+
+
 def _sync_port_pressures(
     records: list[dict],
     edited_pressures: dict[int, float],
@@ -2904,13 +2956,15 @@ def _sync_port_pressures(
     """Sync pressures across shapes sharing a serial Port.
 
     Pressure is a PORT property — one regulator per serial port — so every
-    shape on a port must carry the same pressure. The source value must be
-    unambiguous: the pressure the user just edited (all edits agreeing), or
-    — when a shape just JOINED the group by a port edit — the incumbent
-    members' shared pressure, which the newcomer adopts. Groups already in
-    sync, or with no clear source (e.g. stale .change echoes that flag
-    conflicting members at once), are left untouched, so the event storm
-    converges instead of ping-ponging.
+    shape on a port must carry the same pressure. The source value, in
+    order of preference: the pressure the user just edited (all edits
+    agreeing); otherwise the member whose pressure was edited MOST RECENTLY
+    (each edit stamps `pressure_edited_at`, mirroring how Keep Proportions
+    follows the most recently changed dimension) — so when a port change
+    merges shapes whose pressures were set at different times, the newest
+    setting wins; otherwise, for stamp-less groups formed by a port edit,
+    the incumbents' shared pressure. Conflicting simultaneous edits (stale
+    .change echoes) are left untouched so the event storm converges.
     """
     joined_idx = joined_idx or set()
     by_port: dict[int, list[dict]] = {}
@@ -2935,9 +2989,22 @@ def _sync_port_pressures(
         newcomers = [
             member for member in members if int(member.get("idx", 0)) in joined_idx
         ]
+        stamped = [
+            member
+            for member in members
+            if _coerce_float(member.get("pressure_edited_at"), 0.0) > 0.0
+        ]
         if len(edited_values) == 1:
             value = next(iter(edited_values))
-        elif not edited_values and newcomers and incumbents:
+        elif edited_values:
+            continue  # conflicting simultaneous edits (stale echo): do not guess
+        elif stamped:
+            # No edit in this event: follow the most recently edited member.
+            source = max(
+                stamped, key=lambda member: _coerce_float(member.get("pressure_edited_at"), 0.0)
+            )
+            value = _coerce_float(source.get("pressure"), 25.0)
+        elif newcomers and incumbents:
             incumbent_pressures = [
                 _coerce_float(member.get("pressure"), 25.0) for member in incumbents
             ]
@@ -2946,11 +3013,11 @@ def _sync_port_pressures(
                 for p in incumbent_pressures[1:]
             ):
                 continue
-            # A port edit pulled newcomers into the group: they adopt the
-            # incumbents' shared pressure.
+            # A port edit pulled newcomers into a never-edited group: they
+            # adopt the incumbents' shared pressure.
             value = incumbent_pressures[0]
         else:
-            continue  # ambiguous (stale echo): do not guess
+            continue  # no clear source: do not guess
 
         for member in members:
             member["pressure"] = value
@@ -3075,6 +3142,8 @@ def normalize_shape_dimensions_for_mode(
                 record["last_scaled_axis"] = edited_axes[idx]
             if record.get("stl_path"):
                 _round_targets_to_tenths(record)
+            if idx in edited_pressures:
+                record["pressure_edited_at"] = next(_PRESSURE_EDIT_SEQUENCE)
         normalized = _propagate_group_scale_factors(normalized, edited_axes, set(), joined_idx)
         normalized = _sync_port_pressures(normalized, edited_pressures, port_joined_idx)
         changed = any(
@@ -3171,6 +3240,10 @@ def normalize_shape_dimensions_for_mode(
     normalized = _propagate_group_scale_factors(
         normalized, edited_axes, recomputed_idx, joined_idx
     )
+    if edited_pressures:
+        for record in normalized:
+            if int(record.get("idx", 0)) in edited_pressures:
+                record["pressure_edited_at"] = next(_PRESSURE_EDIT_SEQUENCE)
     normalized = _sync_port_pressures(normalized, edited_pressures, port_joined_idx)
 
     # Idempotence guard (breaks the .change write-back cascade): only write
@@ -4441,6 +4514,29 @@ def generate_dynamic_gcode(
             messages.append(f"Shape {record['idx']}: wrote `{gcode_path.name}`.")
         except Exception as exc:
             messages.append(f"Shape {record['idx']}: failed ({exc}).")
+
+    # Pressure sanity: the regulator tops out at MAX_PRESSURE_PSI, and the
+    # per-layer ramp climbs 0.1 psi per layer — warn when a print would hit
+    # the ceiling (the files clamp there, so later layers hold the maximum).
+    if pressure_ramp_enabled and ref_layers is not None and getattr(ref_layers, "layers", None):
+        layer_count = len(ref_layers.layers)
+        peak_base = max(
+            (
+                _coerce_float(record.get("pressure"), 25.0)
+                for record in records
+                if record.get("gcode_path")
+            ),
+            default=0.0,
+        )
+        peak = peak_base + 0.1 * max(0, layer_count - 1)
+        if peak > MAX_PRESSURE_PSI + 1e-9:
+            messages.insert(
+                0,
+                f"&#9888;&#65039; The pressure ramp reaches the {MAX_PRESSURE_PSI:g} psi regulator "
+                f"limit before the last layer (base {peak_base:g} psi + 0.1/layer x {layer_count} "
+                "layers); the files hold the maximum from there on. Lower the base pressure or "
+                "disable the ramp if that is not intended.",
+            )
 
     generated_paths = [record.get("gcode_path") for record in records if record.get("gcode_path")]
     if generated_paths:

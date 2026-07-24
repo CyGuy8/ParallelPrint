@@ -297,6 +297,28 @@ def test_sweep_buffer_is_adjustable_and_can_be_disabled(tmp_path) -> None:
     assert none[0]["start"] == (0.0, 0.0, 0.0)
 
 
+def test_pressure_ramp_clamps_at_the_regulator_limit(tmp_path) -> None:
+    import re
+
+    layer = box(0.0, 0.0, 2.0, 2.0)
+    gcode_path = generate_vector_gcode(
+        _stack(layer, layer, layer, layer),  # 3 layer changes -> 3 ramp steps
+        shape_name="ramp_cap",
+        pressure=99.8,
+        valve=7,
+        port=3,
+        fil_width=1.0,
+        layer_height=1.0,
+        pressure_ramp_enabled=True,
+        output_dir=tmp_path,
+    )
+    values = [
+        float(match) for match in re.findall(r"setpress\(([\d.]+)\)", gcode_path.read_text())
+    ]
+    # Preset, then the ramp climbing 0.1/layer but never past 100 psi.
+    assert values == [99.8, 99.9, 100.0, 100.0]
+
+
 def test_port_sharing_files_emit_pressure_commands_once(tmp_path) -> None:
     # The pressure regulator is a PORT device: a file generated WITHOUT
     # pressure ownership carries no serial commands at all (no preset, no
