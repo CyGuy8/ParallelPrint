@@ -1769,11 +1769,13 @@ def _centering_delta(stack: LayerStack, reference: LayerStack) -> tuple[float, f
     one-fil-width line pitch.
 
     Split siblings (stacks sharing the reference's scan frame) are aligned by
-    their cell corner within that frame instead of their centre: with cells
-    sized in whole grid multiples the deltas — and with them the required
-    nozzle spacing — come out uniform across all pieces, whereas snapping the
-    centres would wobble by up to one fil where the last cell's width (and so
-    its centre phase) differs.
+    their nominal CELL onto the reference centre, with the delta snapped to
+    the fil grid: every piece's material sits in the MIDDLE of the shared
+    motion instead of at the frame corner (less one-sided travel), the grid
+    snap keeps every piece's world scan-grid phase intact, and — because
+    grid-sized cells are all equal — every piece gets the same snap residue,
+    so the pieces' relative world offsets (and with them the required
+    nozzle spacing and seam pitch) stay exact.
 
     Multi-material group members (stacks carrying a shared `align_frame`)
     are aligned by the group frame's centre instead of their own bbox
@@ -1786,14 +1788,19 @@ def _centering_delta(stack: LayerStack, reference: LayerStack) -> tuple[float, f
         and stack.scan_frame is not None
         and stack.scan_frame == reference.scan_frame
     ):
-        (stack_min_x, stack_min_y, _sz), _stack_max = (
+        (stack_min_x, stack_min_y, _sz), (stack_max_x, stack_max_y, _sz2) = (
             stack.bounds[0],
             stack.bounds[1],
         )
-        frame_min_x, frame_min_y = stack.scan_frame[0], stack.scan_frame[1]
+        if reference.align_center is not None:
+            reference_x, reference_y = reference.align_center
+        else:
+            reference_x, reference_y = _stack_center(reference)
+        cell_center_x = (stack_min_x + stack_max_x) / 2.0
+        cell_center_y = (stack_min_y + stack_max_y) / 2.0
         return (
-            _snap_to_grid(frame_min_x - stack_min_x, grid),
-            _snap_to_grid(frame_min_y - stack_min_y, grid),
+            _snap_to_grid(reference_x - cell_center_x, grid),
+            _snap_to_grid(reference_y - cell_center_y, grid),
         )
 
     if reference.align_center is not None:

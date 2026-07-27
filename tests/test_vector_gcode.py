@@ -1683,6 +1683,36 @@ def test_split_contour_gcode_never_traces_the_cuts(tmp_path) -> None:
     assert vertical_prints == []
 
 
+def test_split_pieces_center_on_the_shared_motion() -> None:
+    from vector_toolpath import _centering_delta
+
+    layer = box(0.0, 0.0, 8.0, 6.0)
+    stack = _stack(layer, layer, name="center")
+    pieces = split_layer_stack_grid(stack, columns=2, rows=2, grid=1.0)
+    reference = build_reference_stack(pieces, grid=1.0)
+
+    ref_x, ref_y = reference.align_center
+    placements = []
+    for piece in pieces:
+        delta_x, delta_y = _centering_delta(piece, reference)
+        (x0, y0, _), (x1, y1, _) = piece.bounds
+        center = ((x0 + x1) / 2, (y0 + y1) / 2)
+        placements.append((center, (delta_x, delta_y)))
+        # The piece's nominal cell lands centered on the shared motion
+        # (within half a fil from the grid snap) — material sits mid-path,
+        # not at the frame corner.
+        assert abs(center[0] + delta_x - ref_x) <= 0.5 + 1e-9
+        assert abs(center[1] + delta_y - ref_y) <= 0.5 + 1e-9
+
+    # Deltas differ between pieces by EXACT cell multiples: the pieces'
+    # relative world offsets — and with them seams and nozzle spacing —
+    # are preserved exactly.
+    (first_center, first_delta) = placements[0]
+    for center, delta in placements[1:]:
+        assert abs((delta[0] - first_delta[0]) + (center[0] - first_center[0])) < 1e-9
+        assert abs((delta[1] - first_delta[1]) + (center[1] - first_center[1])) < 1e-9
+
+
 def test_split_overlapping_rows_comb_within_each_layer() -> None:
     layer = box(0.0, 0.0, 8.0, 6.0)
     stack = _stack(layer, layer, name="comb")

@@ -733,6 +733,100 @@ def test_auto_align_reports_missing_gcode_for_split_siblings(tmp_path) -> None:
     assert rows == [["Nozzle 1: Shape 1", "Nozzle 2: Shape 2", 10.0, 0.0]]
 
 
+def test_auto_align_pushes_non_split_shapes_clear_of_the_assembly(tmp_path) -> None:
+    from shapely.geometry import MultiPolygon, box
+
+    from app import _group_parts_by_nozzle, _nozzle_group_bounds
+    from stl_slicer import LayerStack
+    from vector_gcode import generate_vector_gcode
+
+    # A 2x2 split under shared reference motion: auto align pulls the rows
+    # together with negative gaps, so row 2's frames end HIGHER than row 1's.
+    records = _split_piece_records(tmp_path, columns=2, rows=2, use_reference_motion=True)
+
+    # An unrelated shape on the next nozzle. Placed only relative to row 2's
+    # bottom edge it would land inside row 1's frames.
+    layer = MultiPolygon([box(0.0, 0.0, 6.0, 5.0)])
+    stack = LayerStack(
+        layers=[layer, layer],
+        z_values=[0.5, 1.5],
+        bounds=((0.0, 0.0, 0.0), (6.0, 5.0, 2.0)),
+        layer_height=1.0,
+        name="extra",
+    )
+    origin_sink: dict = {}
+    gcode_path = generate_vector_gcode(
+        stack,
+        shape_name="extra",
+        pressure=25,
+        valve=9,
+        port=1,
+        fil_width=1.0,
+        origin_sink=origin_sink,
+        output_dir=tmp_path / "extra",
+    )
+    records.append(
+        {
+            "idx": 5,
+            "name": "extra",
+            "nozzle": 5,
+            "color": "#123456",
+            "gcode_path": str(gcode_path),
+            "path_origin": origin_sink.get("path_origin"),
+        }
+    )
+
+    from app import auto_align_split_parts
+
+    def _check_layout(records, piece_nozzles, extra_nozzle):
+        outputs = auto_align_split_parts(records, 2, 2, 5.0, 5.0)
+        spacing_rows = outputs[5]["value"]
+        cc = outputs[0]["value"]
+        rc = outputs[1]["value"]
+        # Grid layout: the chain keeps the split's 2-column grid shape.
+        assert cc == 2
+
+        parts, _messages = _parts_from_records(records)
+        offsets, _spacings = _resolve_nozzle_grid_layout(
+            parts, cc, rc, 5.0, 5.0, use_individual_spacing=True, spacing_table=spacing_rows
+        )
+        grouped = _group_parts_by_nozzle(parts)
+        boxes = {}
+        for nozzle, (offset_x, offset_y) in offsets.items():
+            (xmin, ymin, _), (xmax, ymax, _) = _nozzle_group_bounds(grouped, nozzle)
+            boxes[nozzle] = (xmin + offset_x, ymin + offset_y, xmax + offset_x, ymax + offset_y)
+
+        extra = boxes[extra_nozzle]
+        for nozzle in piece_nozzles:
+            piece = boxes[nozzle]
+            overlap_w = min(extra[2], piece[2]) - max(extra[0], piece[0])
+            overlap_h = min(extra[3], piece[3]) - max(extra[1], piece[1])
+            assert overlap_w <= 1e-6 or overlap_h <= 1e-6, (
+                f"non-split shape overlaps piece on nozzle {nozzle}: {extra} vs {piece}"
+            )
+
+        # The split pieces still reassemble exactly: every piece's layout
+        # offset differs from its world anchor by one shared constant.
+        anchors = {part["nozzle"]: part["parsed"]["path_origin"] for part in parts}
+        constants = [
+            (offsets[n][0] - anchors[n][0], offsets[n][1] - anchors[n][1])
+            for n in piece_nozzles
+        ]
+        for constant in constants[1:]:
+            assert abs(constant[0] - constants[0][0]) < 5e-4
+            assert abs(constant[1] - constants[0][1]) < 5e-4
+
+    # Pieces first (nozzles 1-4), the unrelated shape after them.
+    _check_layout(records, (1, 2, 3, 4), 5)
+
+    # Pieces LAST (the unrelated shape sorts first): the assembly's own
+    # negative gaps used to climb back over the earlier shape's row.
+    for record in records[:4]:
+        record["nozzle"] = record["nozzle"] + 1
+    records[4]["nozzle"] = 1
+    _check_layout(records, (2, 3, 4, 5), 1)
+
+
 def test_auto_align_grid_spacing_skips_unsplit_records() -> None:
     records = [
         {"idx": 1, "name": "first", "nozzle": 1},

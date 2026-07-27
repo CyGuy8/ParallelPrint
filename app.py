@@ -2450,10 +2450,19 @@ def _auto_align_grid_spacing_rows(
 
     Every generated G-code file records its PathOrigin: the world position of
     the relative toolpath's start. Anchoring each piece back into its world
-    frame turns the required pair gaps into the actual world-frame gaps
-    between the parts' toolpath bounding boxes — which automatically accounts
-    for the raster pattern, filament width, travel buffers, reference-stack
-    motion, and overlapping-layer splits. No hardcoded offsets.
+    frame gives the exact relative offsets that reassemble the pieces —
+    accounting automatically for the raster pattern, filament width, travel
+    buffers, reference-stack motion, and interlocking splits.
+
+    Two stages: (1) compute a DESIRED position for every nozzle's toolpath
+    box — each run of split siblings placed as ONE rigid block at its world
+    offsets, every other shape flowed into the grid row-major and pushed
+    sideways until it clears EVERYTHING already placed (the default
+    spacings are the flow margins); (2) encode those positions into the
+    pair-gap table by inverting `_resolve_nozzle_grid_layout`'s chaining,
+    so the layout reproduces them exactly. Nothing can overlap, and the
+    grid arrangement (pieces in their split grid, other shapes in the
+    remaining slots) is preserved.
     """
     spacing_rows, column_count, row_count = _grid_spacing_rows(
         records,
@@ -2463,40 +2472,179 @@ def _auto_align_grid_spacing_rows(
         row_spacing,
     )
     parts, _messages = _parts_from_records(records)
-    world = _nozzle_world_bounds(_group_parts_by_nozzle(parts))
+    grouped = _group_parts_by_nozzle(parts)
+    world = _nozzle_world_bounds(grouped)
     records_by_nozzle = _records_by_nozzle(records)
     ordered_nozzles = _ordered_nozzle_numbers(records)
 
-    aligned_count = 0
-    missing_count = 0
-    for index, (first, second) in enumerate(zip(ordered_nozzles, ordered_nozzles[1:])):
-        if not _split_pair_was_created_together(records_by_nozzle, first, second):
-            continue
+    pairs = list(zip(ordered_nozzles, ordered_nozzles[1:]))
+    sibling_pairs = {
+        index
+        for index, (first, second) in enumerate(pairs)
+        if _split_pair_was_created_together(records_by_nozzle, first, second)
+    }
+    aligned_pairs = {
+        index
+        for index in sibling_pairs
+        if pairs[index][0] in world and pairs[index][1] in world
+    }
+    aligned_count = len(aligned_pairs)
+    missing_count = len(sibling_pairs) - aligned_count
+    if aligned_count == 0 or any(nozzle not in grouped for nozzle in ordered_nozzles):
+        if any(nozzle not in grouped for nozzle in ordered_nozzles) and sibling_pairs:
+            return spacing_rows, column_count, row_count, 0, len(sibling_pairs)
+        return spacing_rows, column_count, row_count, 0, missing_count
 
-        second_column = (index + 1) % column_count
-        if second_column == 0:
-            # Row transition: `second` opens a new grid row. The layout places
-            # it relative to the previous row's first nozzle (x) and the
-            # previous row's lowest edge (y).
-            previous_row = ordered_nozzles[index + 1 - column_count : index + 1]
-            anchors = [second, *previous_row]
-        else:
-            row_first = ordered_nozzles[index + 1 - second_column]
-            anchors = [first, second, row_first]
-        if any(nozzle not in world for nozzle in anchors):
-            missing_count += 1
-            continue
+    bounds = {nozzle: _nozzle_group_bounds(grouped, nozzle) for nozzle in ordered_nozzles}
+    size = {
+        nozzle: (
+            bounds[nozzle][1][0] - bounds[nozzle][0][0],
+            bounds[nozzle][1][1] - bounds[nozzle][0][1],
+        )
+        for nozzle in ordered_nozzles
+    }
 
-        (second_min_x, second_min_y), _second_max = world[second]
-        if second_column == 0:
-            gap_x = second_min_x - world[previous_row[0]][0][0]
-            gap_y = second_min_y - max(world[nozzle][1][1] for nozzle in previous_row)
-        else:
-            gap_x = second_min_x - world[first][1][0]
-            gap_y = second_min_y - world[row_first][0][1]
-        spacing_rows[index][2] = round(gap_x, 4)
-        spacing_rows[index][3] = round(gap_y, 4)
-        aligned_count += 1
+    # Rigid clusters: maximal runs of consecutive nozzles linked by aligned
+    # sibling connections.
+    cluster_of: dict[int, tuple[int, ...]] = {}
+    run: list[int] = []
+    for index, nozzle in enumerate(ordered_nozzles):
+        if run and (index - 1) in aligned_pairs:
+            run.append(nozzle)
+            continue
+        if len(run) > 1:
+            for member in run:
+                cluster_of[member] = tuple(run)
+        run = [nozzle]
+    if len(run) > 1:
+        for member in run:
+            cluster_of[member] = tuple(run)
+
+    # ---- Stage 1: desired positions (box min-corners). --------------------
+    eps = 1e-6
+    x_gap = _coerce_float(column_spacing, 5.0)
+    y_gap = _coerce_float(row_spacing, 5.0)
+    placed: list[tuple[float, float, float, float]] = []
+    targets: dict[int, tuple[float, float]] = {}
+
+    def _push_clear(x: float, y: float, width: float, height: float) -> float:
+        pushed = True
+        while pushed:
+            pushed = False
+            for bx0, by0, bx1, by1 in placed:
+                if (
+                    x < bx1 - eps
+                    and x + width > bx0 + eps
+                    and y < by1 - eps
+                    and y + height > by0 + eps
+                ):
+                    x = bx1 + x_gap
+                    pushed = True
+        return x
+
+    for row in range(row_count):
+        row_nozzles = ordered_nozzles[row * column_count:(row + 1) * column_count]
+        if not row_nozzles:
+            break
+        row_y: float | None = None
+        cursor_x = 0.0
+        for nozzle in row_nozzles:
+            width, height = size[nozzle]
+            if nozzle in targets:
+                # Cluster member already placed with its block.
+                cursor_x = max(cursor_x, targets[nozzle][0] + width + x_gap)
+                if row_y is None:
+                    row_y = targets[nozzle][1]
+                continue
+            if row_y is None:
+                row_y = (max(box[3] for box in placed) + y_gap) if placed else 0.0
+            members = cluster_of.get(nozzle)
+            if members:
+                # Place the whole assembly as one rigid block: every
+                # member's frame at its exact world offset.
+                base_x, base_y = world[nozzle][0]
+                rel = {
+                    member: (
+                        world[member][0][0] - base_x,
+                        world[member][0][1] - base_y,
+                    )
+                    for member in members
+                }
+                block_min_x = min(rel[member][0] for member in members)
+                block_min_y = min(rel[member][1] for member in members)
+                block_w = max(rel[m][0] + size[m][0] for m in members) - block_min_x
+                block_h = max(rel[m][1] + size[m][1] for m in members) - block_min_y
+                block_x = _push_clear(cursor_x, row_y, block_w, block_h)
+                for member in members:
+                    targets[member] = (
+                        block_x + rel[member][0] - block_min_x,
+                        row_y + rel[member][1] - block_min_y,
+                    )
+                    m_w, m_h = size[member]
+                    placed.append(
+                        (
+                            targets[member][0],
+                            targets[member][1],
+                            targets[member][0] + m_w,
+                            targets[member][1] + m_h,
+                        )
+                    )
+                cursor_x = block_x + block_w + x_gap
+            else:
+                target_x = _push_clear(cursor_x, row_y, width, height)
+                targets[nozzle] = (target_x, row_y)
+                placed.append((target_x, row_y, target_x + width, row_y + height))
+                cursor_x = target_x + width + x_gap
+
+    # The layout pins the first nozzle's box at the origin.
+    base_x, base_y = targets[ordered_nozzles[0]]
+    targets = {
+        nozzle: (position[0] - base_x, position[1] - base_y)
+        for nozzle, position in targets.items()
+    }
+
+    # ---- Stage 2: encode positions into the pair-gap table. ---------------
+    # Mirrors `_resolve_nozzle_grid_layout`'s individual-spacing chaining and
+    # solves each gap; state advances on the ROUNDED values so rounding
+    # errors are compensated in the following gaps instead of accumulating.
+    offsets: dict[int, tuple[float, float]] = {}
+    row_start_x = 0.0
+    row_min_y = 0.0
+    row_bottom = 0.0
+    for row in range(row_count):
+        row_start_index = row * column_count
+        row_nozzles = ordered_nozzles[row_start_index:row_start_index + column_count]
+        if not row_nozzles:
+            break
+        for col, nozzle in enumerate(row_nozzles):
+            (xmin, ymin, _), _ = bounds[nozzle]
+            target_x, target_y = targets[nozzle]
+            if col == 0:
+                if row == 0:
+                    actual_x, actual_y = 0.0, 0.0
+                else:
+                    pair_index = row_start_index - 1
+                    shift_x = round(target_x - row_start_x, 4)
+                    row_gap = round(target_y - row_bottom, 4)
+                    spacing_rows[pair_index][2] = shift_x
+                    spacing_rows[pair_index][3] = row_gap
+                    row_start_x += shift_x
+                    row_min_y = row_bottom + row_gap
+                    actual_x, actual_y = row_start_x, row_min_y
+            else:
+                pair_index = row_start_index + col - 1
+                prev = row_nozzles[col - 1]
+                prev_right = offsets[prev][0] + bounds[prev][1][0]
+                gap_x = round(target_x - prev_right, 4)
+                gap_y = round(target_y - row_min_y, 4)
+                spacing_rows[pair_index][2] = gap_x
+                spacing_rows[pair_index][3] = gap_y
+                actual_x = prev_right + gap_x
+                actual_y = row_min_y + gap_y
+            offsets[nozzle] = (actual_x - xmin, actual_y - ymin)
+        row_bottom = max(
+            offsets[nozzle][1] + bounds[nozzle][1][1] for nozzle in row_nozzles
+        )
     return spacing_rows, column_count, row_count, aligned_count, missing_count
 
 
@@ -2535,6 +2683,10 @@ def auto_align_split_parts(
     row_spacing: Any,
 ) -> tuple:
     records = records or []
+    # Grid layout: the chain uses the split's own grid shape, so pieces sit
+    # in their split arrangement and other shapes flow into the remaining
+    # grid slots. Positions are computed globally (assembly as one rigid
+    # block, everything else pushed clear), so nothing can overlap.
     grid_shape = _split_grid_shape(records)
     if grid_shape is not None:
         columns, rows = grid_shape
@@ -2568,7 +2720,8 @@ def auto_align_split_parts(
     status = (
         f"Auto aligned {aligned_count} split nozzle connection(s) from the generated "
         f"G-code in a {column_count} x {row_count} grid. The exact per-connection "
-        "gaps are in the Advanced Grid Spacing table."
+        "gaps are in the Advanced Grid Spacing table; other shapes flow into the "
+        "remaining grid slots, kept clear of the reassembled pieces."
     )
     if missing_count:
         status += (
