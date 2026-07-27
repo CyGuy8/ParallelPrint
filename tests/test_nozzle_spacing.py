@@ -748,6 +748,29 @@ def test_auto_align_grid_spacing_skips_unsplit_records() -> None:
     assert rows == [["Nozzle 1: Shape 1", "Nozzle 2: Shape 2", 10.0, 0.0]]
 
 
+def test_generate_runs_auto_align_only_for_split_pieces(tmp_path) -> None:
+    from app import auto_align_split_parts_after_generate
+
+    # Plain (unsplit) shapes: a silent skip that touches nothing on the
+    # Visualization tab.
+    plain = [
+        {"idx": 1, "name": "first", "nozzle": 1},
+        {"idx": 2, "name": "second", "nozzle": 2},
+    ]
+    outputs = auto_align_split_parts_after_generate(plain, 2, 1, 5.0, 5.0)
+    assert len(outputs) == 7
+    assert all(output == {"__type__": "update"} for output in outputs)
+
+    # Split pieces with generated G-code: delegates to Auto Align, which
+    # fills the advanced spacing table and reports the alignment.
+    records = _split_piece_records(tmp_path, columns=2, rows=1)
+    outputs = auto_align_split_parts_after_generate(records, 2, 1, 5.0, 5.0)
+    status = outputs[-1]
+    assert "Auto aligned" in status
+    table_update = outputs[5]
+    assert table_update.get("value")
+
+
 def test_grid_spacing_rows_follow_row_major_pattern() -> None:
     records = [
         {"idx": 1, "name": "first", "nozzle": 1},
@@ -1001,6 +1024,62 @@ def test_group_split_splits_all_materials_on_one_shared_grid() -> None:
     for path in pieces[0]["layer_stack"].contour_paths[0]:
         for x, y in path:
             assert x <= 10.0 - 0.5 + 1e-9 or y <= 5.0 - 0.5 + 1e-9
+
+
+def test_split_overlapping_rows_option_combs_pieces() -> None:
+    from shapely.geometry import MultiPolygon, box
+
+    from app import _slice_params_snapshot, split_selected_shape_for_grid
+    from stl_slicer import LayerStack
+
+    layer = MultiPolygon([box(0.0, 0.0, 8.0, 6.0)])
+    stack = LayerStack(
+        layers=[layer, layer],
+        z_values=[0.4, 1.2],
+        bounds=((0.0, 0.0, 0.0), (8.0, 6.0, 1.6)),
+        layer_height=0.8,
+        name="comb",
+    )
+    record = {
+        "idx": 1,
+        "name": "comb",
+        "stl_path": "comb.stl",
+        "target_x": 8.0,
+        "target_y": 6.0,
+        "target_z": 1.6,
+        "pressure": 25.0,
+        "valve": 4,
+        "nozzle": 1,
+        "port": 1,
+        "color": "#111111",
+        "layer_stack": stack,
+    }
+    record["slice_params"] = _slice_params_snapshot(record, 0.8, None, None)
+
+    outputs = split_selected_shape_for_grid(
+        [record],
+        None,  # selected -> defaults to the first record
+        None,  # settings table
+        2,  # columns
+        1,  # rows
+        False,  # overlapping layers
+        5,  # starting nozzle
+        9,  # starting valve
+        1.0,  # fil width
+        overlapping_rows=True,
+        overlap_size=0.5,
+    )
+    next_records = outputs[0]
+    status = outputs[7]
+
+    pieces = [rec for rec in next_records if rec.get("split_group_id")]
+    assert len(pieces) == 2
+    left_stack = pieces[0]["layer_stack"]
+    # Alternate raster-row teeth reach the chosen 0.5 mm past the x=4 cut...
+    assert abs(left_stack.layers[0].bounds[2] - 4.5) < 1e-9
+    # ...while the nominal piece bounds (and targets) stay the plain cell.
+    assert pieces[0]["layer_stack"].bounds[1][0] == 4.0
+    assert "Overlapping Rows" in status and "0.5 mm" in status
 
 
 def test_describe_split_source_warns_about_group_splits() -> None:

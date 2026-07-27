@@ -1683,6 +1683,154 @@ def test_split_contour_gcode_never_traces_the_cuts(tmp_path) -> None:
     assert vertical_prints == []
 
 
+def test_split_overlapping_rows_comb_within_each_layer() -> None:
+    layer = box(0.0, 0.0, 8.0, 6.0)
+    stack = _stack(layer, layer, name="comb")
+
+    left, right = split_layer_stack_grid(
+        stack, columns=2, rows=1, overlapping_rows=True, overlap=1.0, grid=1.0
+    )
+
+    # Scan frame (0,0,8,6) at 1 mm pitch: rows at y=0.5..5.5, so band k spans
+    # y in [k, k+1]. The x=4 seam combs: even bands push the boundary to 5,
+    # odd bands pull it to 3 (on layer 0). Probes are inset from the band
+    # edges so they don't graze the neighbouring tooth's boundary segment.
+    band0 = box(0.0, 0.1, 8.0, 0.9)
+    band1 = box(0.0, 1.1, 8.0, 1.9)
+    assert abs(left.layers[0].intersection(band0).bounds[2] - 5.0) < 1e-9
+    assert abs(left.layers[0].intersection(band1).bounds[2] - 3.0) < 1e-9
+    assert abs(right.layers[0].intersection(band0).bounds[0] - 5.0) < 1e-9
+    assert abs(right.layers[0].intersection(band1).bounds[0] - 3.0) < 1e-9
+    # The comb phase flips between layers so the teeth interlock in Z too.
+    assert abs(left.layers[1].intersection(band0).bounds[2] - 3.0) < 1e-9
+
+    # The pieces still tile the parent exactly: no gap, no double-print.
+    for layer_number in range(2):
+        union = left.layers[layer_number].union(right.layers[layer_number])
+        assert abs(union.area - layer.area) < 1e-6
+        doubled = left.layers[layer_number].intersection(right.layers[layer_number])
+        assert doubled.area < 1e-9
+
+    # Nominal bounds stay the un-shifted cells.
+    assert left.bounds == ((0.0, 0.0, 0.0), (4.0, 6.0, 2.0))
+    assert right.bounds == ((4.0, 0.0, 0.0), (8.0, 6.0, 2.0))
+
+
+def test_split_overlapping_rows_raster_rows_alternate_across_the_seam() -> None:
+    from vector_toolpath import _axis_raster_segments
+
+    layer = box(0.0, 0.0, 8.0, 6.0)
+    stack = _stack(layer, layer, name="combr")
+    left, right = split_layer_stack_grid(
+        stack, columns=2, rows=1, overlapping_rows=True, overlap=1.0, grid=1.0
+    )
+
+    def print_spans(piece: LayerStack) -> dict:
+        spans: dict = {}
+        segments = _axis_raster_segments(
+            piece.layers[0], piece.layers[0], 1.0, "X", scan_anchor=0.5
+        )
+        for seg in segments:
+            if seg[4] != 255:
+                continue
+            row = round(seg[1], 6)
+            lo, hi = spans.get(row, (min(seg[0], seg[2]), max(seg[0], seg[2])))
+            spans[row] = (min(lo, seg[0], seg[2]), max(hi, seg[0], seg[2]))
+        return spans
+
+    left_spans = print_spans(left)
+    right_spans = print_spans(right)
+    # Even rows: the left head prints past the seam to x=5 and the right head
+    # takes over exactly there; odd rows mirror at x=3 — the interleaved
+    # finger pattern.
+    assert left_spans[0.5] == (0.0, 5.0)
+    assert right_spans[0.5] == (5.0, 8.0)
+    assert left_spans[1.5] == (0.0, 3.0)
+    assert right_spans[1.5] == (3.0, 8.0)
+
+
+def test_split_overlapping_rows_axes_restrict_which_seams_comb() -> None:
+    layer = box(0.0, 0.0, 8.0, 8.0)
+    stack = _stack(layer, name="axes")
+
+    # X only: the vertical (column) seam combs, the horizontal seam stays a
+    # straight cut at y=4.
+    pieces = split_layer_stack_grid(
+        stack,
+        columns=2,
+        rows=2,
+        overlapping_rows=True,
+        row_overlap_axes="x",
+        overlap=1.0,
+        grid=1.0,
+    )
+    top_left = pieces[0].layers[0]  # row 1 = top strip
+    bottom_left = pieces[2].layers[0]
+    band0 = box(0.0, 0.1, 8.0, 0.9)
+    band1 = box(0.0, 1.1, 8.0, 1.9)
+    teeth_x = {
+        round(bottom_left.intersection(band0).bounds[2], 6),
+        round(bottom_left.intersection(band1).bounds[2], 6),
+    }
+    assert teeth_x == {3.0, 5.0}
+    assert abs(top_left.bounds[1] - 4.0) < 1e-9  # straight horizontal cut
+    assert abs(bottom_left.bounds[3] - 4.0) < 1e-9
+
+    # Y only: mirrored — the horizontal seam combs, the vertical cut at x=4
+    # stays straight.
+    pieces = split_layer_stack_grid(
+        stack,
+        columns=2,
+        rows=2,
+        overlapping_rows=True,
+        row_overlap_axes="y",
+        overlap=1.0,
+        grid=1.0,
+    )
+    bottom_left = pieces[2].layers[0]
+    col_band0 = box(0.1, 0.0, 0.9, 8.0)
+    col_band1 = box(1.1, 0.0, 1.9, 8.0)
+    teeth_y = {
+        round(bottom_left.intersection(col_band0).bounds[3], 6),
+        round(bottom_left.intersection(col_band1).bounds[3], 6),
+    }
+    assert teeth_y == {3.0, 5.0}
+    assert abs(bottom_left.bounds[2] - 4.0) < 1e-9  # straight vertical cut
+
+    # Pieces always tile the parent, whichever axes comb.
+    total = pieces[0].layers[0]
+    for piece in pieces[1:]:
+        total = total.union(piece.layers[0])
+    assert abs(total.area - layer.area) < 1e-6
+
+
+def test_split_overlapping_rows_and_layers_combine() -> None:
+    layer = box(0.0, 0.0, 8.0, 6.0)
+    stack = _stack(layer, layer, name="both")
+
+    left, right = split_layer_stack_grid(
+        stack,
+        columns=2,
+        rows=1,
+        overlapping_layers=True,
+        overlapping_rows=True,
+        overlap=0.5,
+        grid=1.0,
+    )
+
+    # Layer shift moves the seam to 4.5 (layer 0), the comb then swings the
+    # per-band boundary to 5.0 / 4.0 around it. Tiling stays exact.
+    band0 = box(0.0, 0.1, 8.0, 0.9)
+    band1 = box(0.0, 1.1, 8.0, 1.9)
+    assert abs(left.layers[0].intersection(band0).bounds[2] - 5.0) < 1e-9
+    assert abs(left.layers[0].intersection(band1).bounds[2] - 4.0) < 1e-9
+    for layer_number in range(2):
+        union = left.layers[layer_number].union(right.layers[layer_number])
+        assert abs(union.area - layer.area) < 1e-6
+        doubled = left.layers[layer_number].intersection(right.layers[layer_number])
+        assert doubled.area < 1e-9
+
+
 def test_split_layer_stack_grid_overlap_alternates_between_layers() -> None:
     layer = box(0.0, 0.0, 4.0, 2.0)
     stack = _stack(layer, layer, name="interlock")

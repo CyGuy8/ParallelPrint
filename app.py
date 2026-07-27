@@ -2591,6 +2591,26 @@ def auto_align_split_parts(
     )
 
 
+def auto_align_split_parts_after_generate(
+    records: list[dict] | None,
+    columns: Any,
+    rows: Any,
+    column_spacing: Any,
+    row_spacing: Any,
+) -> tuple:
+    """Auto-run of Auto Align Split Parts right after Generate G-Code.
+
+    Runs before the post-generate parallel render so the Visualization tab
+    comes up with the pieces already reassembled. Silent no-op when the
+    table holds no split pieces, so plain generations leave the spacing
+    controls and status untouched.
+    """
+    records = records or []
+    if not any(record.get("split_group_id") for record in records):
+        return tuple(gr.skip() for _ in range(7))
+    return auto_align_split_parts(records, columns, rows, column_spacing, row_spacing)
+
+
 def update_nozzle_grid_preset(
     preset: str | None,
     records: list[dict] | None,
@@ -3703,6 +3723,9 @@ def _split_group_records(
     split_column_count: int,
     split_row_count: int,
     overlapping_layers: bool,
+    overlapping_rows: bool,
+    overlap_mm: float,
+    row_overlap_axes: str,
     starting_nozzle: Any,
     starting_valve: Any,
     fil_width: float,
@@ -3755,7 +3778,9 @@ def _split_group_records(
                     columns=split_column_count,
                     rows=split_row_count,
                     overlapping_layers=bool(overlapping_layers),
-                    overlap=float(fil_width) if overlapping_layers else 0.0,
+                    overlapping_rows=bool(overlapping_rows),
+                    row_overlap_axes=row_overlap_axes,
+                    overlap=overlap_mm if (overlapping_layers or overlapping_rows) else 0.0,
                     grid=float(fil_width),
                     frame=frame,
                 ),
@@ -3824,12 +3849,47 @@ def _split_group_records(
         f"Each cell's pieces share a nozzle (nozzles {first_nozzle}-"
         f"{first_nozzle + cell_count - 1}); valves {first_valve}-{valve_cursor - 1}."
     )
-    if overlapping_layers:
-        status += (
-            "  \nOverlapping Layers is enabled: split boundaries alternate by one "
-            "filament width per layer so neighbouring pieces interlock."
-        )
+    status += _split_overlap_status(
+        overlapping_layers, overlapping_rows, overlap_mm, row_overlap_axes
+    )
     return _outputs(next_records, split_selected, status)
+
+
+ROW_OVERLAP_AXES_CHOICES = ["Both", "X only", "Y only"]
+
+
+def _row_overlap_axes_value(choice: Any) -> str:
+    """UI direction choice -> engine axes value ("both" | "x" | "y")."""
+    text = str(choice or "").strip().lower()
+    if text.startswith("x"):
+        return "x"
+    if text.startswith("y"):
+        return "y"
+    return "both"
+
+
+def _split_overlap_status(
+    overlapping_layers: bool,
+    overlapping_rows: bool,
+    overlap_mm: float,
+    row_overlap_axes: str = "both",
+) -> str:
+    parts = []
+    if overlapping_layers:
+        parts.append(
+            f"  \nOverlapping Layers: split boundaries alternate by {overlap_mm:g} mm "
+            "per layer so stacked pieces interlock."
+        )
+    if overlapping_rows:
+        seams = {
+            "x": "the column seams (X direction)",
+            "y": "the row seams (Y direction)",
+        }.get(row_overlap_axes, "each seam")
+        parts.append(
+            f"  \nOverlapping Rows: alternate raster rows reach {overlap_mm:g} mm "
+            f"across {seams} so neighbouring pieces interlock within every layer."
+        )
+    return "".join(parts)
 
 
 def split_selected_shape_for_grid(
@@ -3845,8 +3905,17 @@ def split_selected_shape_for_grid(
     layer_height: float = 0.8,
     scale_mode: str | None = None,
     undo_stack: list[list[dict]] | None = None,
+    overlapping_rows: bool = False,
+    overlap_size: float | None = None,
+    row_overlap_direction: str | None = None,
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
+    # Overlap depth for both interlock styles; blank/zero falls back to one
+    # filament width (the pre-option behavior).
+    overlap_mm = round(_coerce_float(overlap_size, float(fil_width)), 3)
+    if overlap_mm <= 0.0:
+        overlap_mm = float(fil_width)
+    row_overlap_axes = _row_overlap_axes_value(row_overlap_direction)
     # One-button flow: shapes are sliced (or re-sliced when their settings
     # changed) straight from the table here, so splitting never needs a
     # separate slicing step.
@@ -3912,6 +3981,9 @@ def split_selected_shape_for_grid(
             split_column_count,
             split_row_count,
             overlapping_layers,
+            overlapping_rows,
+            overlap_mm,
+            row_overlap_axes,
             starting_nozzle,
             starting_valve,
             fil_width,
@@ -3925,7 +3997,9 @@ def split_selected_shape_for_grid(
             columns=split_column_count,
             rows=split_row_count,
             overlapping_layers=bool(overlapping_layers),
-            overlap=float(fil_width) if overlapping_layers else 0.0,
+            overlapping_rows=bool(overlapping_rows),
+            row_overlap_axes=row_overlap_axes,
+            overlap=overlap_mm if (overlapping_layers or overlapping_rows) else 0.0,
             # Whole-fil cells (last piece absorbs the remainder): keeps the
             # required nozzle spacing uniform under shared reference motion.
             grid=float(fil_width),
@@ -3968,11 +4042,9 @@ def split_selected_shape_for_grid(
         f"({split_column_count} columns x {split_row_count} rows).  \n"
         f"Nozzles {first_nozzle}-{first_nozzle + len(pieces) - 1}; valves {first_valve}-{first_valve + len(pieces) - 1}."
     )
-    if overlapping_layers:
-        status += (
-            "  \nOverlapping Layers is enabled: split boundaries alternate by one "
-            "filament width per layer so neighbouring pieces interlock."
-        )
+    status += _split_overlap_status(
+        overlapping_layers, overlapping_rows, overlap_mm, row_overlap_axes
+    )
     return _outputs(next_records, split_selected, status)
 
 
@@ -4973,7 +5045,34 @@ def build_dynamic_demo() -> gr.Blocks:
                     split_rows = gr.Number(label="Rows (Y)", value=1, minimum=1, step=1)
                     split_start_nozzle = gr.Number(label="Starting Nozzle", value=1, minimum=1, step=1)
                     split_start_valve = gr.Number(label="Starting Valve", value=4, minimum=1, step=1)
-                split_overlapping_layers = gr.Checkbox(label="Overlapping Layers", value=False)
+                with gr.Row():
+                    split_overlapping_layers = gr.Checkbox(
+                        label="Overlapping Layers",
+                        info="Cut lines alternate sideways between layers",
+                        value=False,
+                        scale=2,
+                    )
+                    split_overlapping_rows = gr.Checkbox(
+                        label="Overlapping Rows",
+                        info="Alternate raster rows reach across each seam",
+                        value=False,
+                        scale=2,
+                    )
+                    split_row_overlap_direction = gr.Dropdown(
+                        label="Row Overlap Direction",
+                        info="Which seams the rows reach across",
+                        choices=ROW_OVERLAP_AXES_CHOICES,
+                        value=ROW_OVERLAP_AXES_CHOICES[0],
+                        scale=1,
+                    )
+                    split_overlap = gr.Number(
+                        label="Overlap (mm)",
+                        info="Depth of both interlocks; 0 = one filament width",
+                        value=0.8,
+                        minimum=0.0,
+                        step=0.1,
+                        scale=1,
+                    )
                 with gr.Row():
                     split_button = gr.Button("Split Selected Shape into Grid Pieces", variant="primary", scale=3)
                     split_undo_button = gr.Button("Undo Split", variant="secondary", size="sm", scale=1, min_width=110)
@@ -5335,6 +5434,9 @@ def build_dynamic_demo() -> gr.Blocks:
                 layer_height,
                 scale_mode,
                 split_undo,
+                split_overlapping_rows,
+                split_overlap,
+                split_row_overlap_direction,
             ],
             outputs=[
                 shape_records,
@@ -5541,6 +5643,28 @@ def build_dynamic_demo() -> gr.Blocks:
             fn=check_gcode_staleness,
             inputs=stale_inputs,
             outputs=[gcode_stale_banner],
+            queue=False,
+        ).then(
+            # Fresh PathOrigins: reassemble split pieces automatically so the
+            # Visualization tab needs no manual Auto Align click. Runs BEFORE
+            # the parallel render below, which reads the spacing table.
+            fn=auto_align_split_parts_after_generate,
+            inputs=[
+                shape_records,
+                nozzle_grid_columns,
+                nozzle_grid_rows,
+                nozzle_grid_column_spacing,
+                nozzle_grid_row_spacing,
+            ],
+            outputs=[
+                nozzle_grid_columns,
+                nozzle_grid_rows,
+                nozzle_grid_column_spacing,
+                nozzle_grid_row_spacing,
+                nozzle_grid_use_individual_spacing,
+                nozzle_grid_spacing_table,
+                nozzle_spacing_status,
+            ],
             queue=False,
         ).then(
             # Fresh files: refresh the parallel view so the Visualization

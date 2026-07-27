@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 from shapely import prepare
 from shapely.affinity import rotate, translate
-from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, box
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon, box
 from shapely.geometry.polygon import orient
 from shapely.ops import linemerge, unary_union
 
@@ -1965,6 +1965,153 @@ def _shifted_split_edges(
     return adjusted
 
 
+def _comb_amplitude(edges: list[float], overlap: float) -> float:
+    """Row-overlap tooth depth, capped so comb boundaries can never cross.
+
+    Adjacent interior boundaries comb in opposite phases, converging by twice
+    the amplitude within a band — so with several interior boundaries the
+    teeth may reach at most half the narrowest cell. With a single interior
+    boundary (2 cells) only the outer edges bound the teeth.
+    """
+    count = len(edges) - 1
+    if count <= 1 or overlap <= 0.0:
+        return 0.0
+    min_width = min(edges[i + 1] - edges[i] for i in range(count))
+    limit = min_width * (0.999 if count == 2 else 0.4995)
+    return max(0.0, min(overlap, limit))
+
+
+def _comb_boundary(
+    edges: list[float],
+    boundary_index: int,
+    band_index: int,
+    layer_index: int,
+    amplitude: float,
+) -> float:
+    """Comb boundary position at one raster-row band.
+
+    A pure function of (boundary, band, layer), so the two cells sharing a
+    boundary always compute the same tooth positions and tile exactly. The
+    parity convention extends `_shifted_split_edges`, so combining
+    Overlapping Rows with Overlapping Layers keeps both alternations.
+    """
+    direction = 1 if (band_index + boundary_index + layer_index) % 2 == 1 else -1
+    return edges[boundary_index] + direction * amplitude
+
+
+def _comb_profile_polygon(
+    span_lo: float,
+    span_hi: float,
+    lo_for_band,
+    hi_for_band,
+    anchor: float,
+    pitch: float,
+    comb_axis: str,
+) -> Polygon:
+    """Staircase polygon: the combed extent per raster-row band.
+
+    Bands are one `pitch` tall, centred on the scanline grid
+    {anchor + k*pitch} (band cuts sit midway BETWEEN scanlines), so each
+    tooth covers exactly one raster row. `comb_axis` "X" means the combed
+    coordinate is X with bands stacked along Y; "Y" is the transpose.
+    """
+    cuts: list[float] = []
+    k = math.floor((span_lo - anchor) / pitch) - 2
+    while True:
+        cut = anchor + (k + 0.5) * pitch
+        if cut >= span_hi - EPS:
+            break
+        if cut > span_lo + EPS:
+            cuts.append(cut)
+        k += 1
+    stops = [span_lo, *cuts, span_hi]
+
+    lows: list[float] = []
+    highs: list[float] = []
+    for index in range(len(stops) - 1):
+        mid = (stops[index] + stops[index + 1]) / 2.0
+        band = math.floor((mid - anchor) / pitch + 0.5)
+        lows.append(lo_for_band(band))
+        highs.append(hi_for_band(band))
+
+    ring: list[tuple[float, float]] = []
+    for index in range(len(stops) - 1):
+        ring.append((lows[index], stops[index]))
+        ring.append((lows[index], stops[index + 1]))
+    for index in reversed(range(len(stops) - 1)):
+        ring.append((highs[index], stops[index + 1]))
+        ring.append((highs[index], stops[index]))
+    if comb_axis == "Y":
+        ring = [(stop, value) for value, stop in ring]
+    deduped = [pt for idx, pt in enumerate(ring) if idx == 0 or pt != ring[idx - 1]]
+    return Polygon(deduped)
+
+
+def _comb_cell_geometry(
+    x_edges: list[float],
+    y_edges: list[float],
+    x_cell: int,
+    y_cell: int,
+    comb_x: float,
+    comb_y: float,
+    pitch: float,
+    anchor_x: float,
+    anchor_y: float,
+    layer_index: int,
+):
+    """One split cell with Overlapping Rows: interior boundaries comb.
+
+    With teeth on both axes the cell is the intersection of the two full-
+    frame comb profiles: a point's column is decided by the x-comb at its
+    y-band and its row by the y-comb at its x-band, which assigns every
+    point to exactly one cell — the pieces still tile the parent exactly.
+    """
+    columns = len(x_edges) - 1
+    rows = len(y_edges) - 1
+
+    def x_lo(band: int) -> float:
+        if x_cell == 0 or comb_x <= 0.0:
+            return x_edges[x_cell]
+        return _comb_boundary(x_edges, x_cell, band, layer_index, comb_x)
+
+    def x_hi(band: int) -> float:
+        if x_cell + 1 == columns or comb_x <= 0.0:
+            return x_edges[x_cell + 1]
+        return _comb_boundary(x_edges, x_cell + 1, band, layer_index, comb_x)
+
+    def y_lo(band: int) -> float:
+        if y_cell == 0 or comb_y <= 0.0:
+            return y_edges[y_cell]
+        return _comb_boundary(y_edges, y_cell, band, layer_index, comb_y)
+
+    def y_hi(band: int) -> float:
+        if y_cell + 1 == rows or comb_y <= 0.0:
+            return y_edges[y_cell + 1]
+        return _comb_boundary(y_edges, y_cell + 1, band, layer_index, comb_y)
+
+    combs_x = comb_x > 0.0 and columns > 1
+    combs_y = comb_y > 0.0 and rows > 1
+    if not combs_x and not combs_y:
+        return box(
+            x_edges[x_cell], y_edges[y_cell], x_edges[x_cell + 1], y_edges[y_cell + 1]
+        )
+    if combs_x and not combs_y:
+        return _comb_profile_polygon(
+            y_edges[y_cell], y_edges[y_cell + 1], x_lo, x_hi, anchor_y, pitch, "X"
+        )
+    if combs_y and not combs_x:
+        return _comb_profile_polygon(
+            x_edges[x_cell], x_edges[x_cell + 1], y_lo, y_hi, anchor_x, pitch, "Y"
+        )
+    profile_x = _comb_profile_polygon(
+        y_edges[0], y_edges[-1], x_lo, x_hi, anchor_y, pitch, "X"
+    )
+    profile_y = _comb_profile_polygon(
+        x_edges[0], x_edges[-1], y_lo, y_hi, anchor_x, pitch, "Y"
+    )
+    return profile_x.intersection(profile_y)
+
+
 def _linework_to_paths(geometry: object) -> list[list[tuple[float, float]]]:
     """Merge linework into maximal polylines, ordered/oriented
     deterministically so shapes sharing reference motion trace them
@@ -2049,15 +2196,24 @@ def split_layer_stack_grid(
     overlap: float = 0.0,
     grid: float | None = None,
     frame: tuple[float, float, float, float] | None = None,
+    overlapping_rows: bool = False,
+    row_overlap_axes: str = "both",
 ) -> list[LayerStack]:
     """Split a sliced shape into a rows x columns grid of piece stacks.
 
     Pieces are returned row-major with row 1 the top strip (max-Y side),
     matching the legacy image-grid ordering. With `overlapping_layers`, the
     interior cut lines alternate by ±overlap between layers so neighbouring
-    pieces interlock. `grid` (the fil width) sizes the cells in whole grid
-    multiples (see `_base_split_edges`). Piece `bounds` are the nominal
-    (un-shifted) cell boxes.
+    pieces interlock. With `overlapping_rows`, each interior cut becomes a
+    comb within every layer: alternate raster-row bands (one `grid` pitch
+    each, aligned to the shared scanline grid) extend ±overlap past the cut
+    in opposite directions, so neighbouring pieces interlock like fingers —
+    this needs `grid` to place the bands. `row_overlap_axes` restricts which
+    cuts comb: "x" only the column cuts (teeth reach along X), "y" only the
+    row cuts (teeth reach along Y), "both" (default) all interior cuts.
+    `grid` (the fil width) sizes the cells in whole grid multiples (see
+    `_base_split_edges`). Piece `bounds` are the nominal (un-shifted) cell
+    boxes.
 
     `frame` overrides the XY box the cell grid is computed over. Splitting
     every member of a multi-material group with the group's combined bounds
@@ -2089,6 +2245,27 @@ def split_layer_stack_grid(
     # one-fil-width pitch instead of each piece re-centring its own lines.
     scan_frame = stack.scan_frame or (x_min, y_min, x_max, y_max)
 
+    # Overlapping Rows: comb bands ride the same scanline grid the raster
+    # uses, so each tooth covers exactly one raster row.
+    pitch = float(grid) if grid and float(grid) > 0.0 else None
+    axes = str(row_overlap_axes or "both").strip().lower()
+    comb_rows_x = (
+        bool(overlapping_rows)
+        and axes in ("both", "x")
+        and columns > 1
+        and overlap > 0.0
+        and pitch is not None
+    )
+    comb_rows_y = (
+        bool(overlapping_rows)
+        and axes in ("both", "y")
+        and rows > 1
+        and overlap > 0.0
+        and pitch is not None
+    )
+    anchor_x = _scan_anchor(scan_frame[0], scan_frame[2], pitch) if pitch else 0.0
+    anchor_y = _scan_anchor(scan_frame[1], scan_frame[3], pitch) if pitch else 0.0
+
     base_name = stack.name or "shape"
     pieces: list[LayerStack] = []
     for row_index in range(1, rows + 1):
@@ -2106,12 +2283,26 @@ def split_layer_stack_grid(
                     continue
                 x_edges = layer_x_edges[layer_number]
                 y_edges = layer_y_edges[layer_number]
-                cell = box(
-                    x_edges[x_cell],
-                    y_edges[y_cell],
-                    x_edges[x_cell + 1],
-                    y_edges[y_cell + 1],
-                )
+                if comb_rows_x or comb_rows_y:
+                    cell = _comb_cell_geometry(
+                        x_edges,
+                        y_edges,
+                        x_cell,
+                        y_cell,
+                        _comb_amplitude(x_edges, overlap) if comb_rows_x else 0.0,
+                        _comb_amplitude(y_edges, overlap) if comb_rows_y else 0.0,
+                        pitch,
+                        anchor_x,
+                        anchor_y,
+                        layer_number,
+                    )
+                else:
+                    cell = box(
+                        x_edges[x_cell],
+                        y_edges[y_cell],
+                        x_edges[x_cell + 1],
+                        y_edges[y_cell + 1],
+                    )
                 layers.append(_as_multipolygon(layer.intersection(cell)))
 
                 # Contours come from the parent's outline (or, when
