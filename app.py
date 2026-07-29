@@ -41,6 +41,8 @@ from stl_slicer import (
 )
 from vector_gcode import MAX_PRESSURE_PSI, generate_vector_gcode
 from vector_toolpath import (
+    CONTOUR_ORDER_CHOICES,
+    CONTOUR_ORDER_LAST,
     LEAD_IN_DIRECTION_CHOICES,
     LEAD_IN_DIRECTION_LEFT,
     LEAD_IN_LINE_AUTO,
@@ -4335,6 +4337,7 @@ def _gcode_settings_snapshot(
     scale_mode: str | None,
     sweep_buffer: float = 0.8,
     lead_in_orientation: str | None = None,
+    contour_order: str | None = None,
 ) -> dict:
     """Fingerprint of every setting that shapes this record's G-code.
 
@@ -4366,6 +4369,7 @@ def _gcode_settings_snapshot(
         "fil_width": round(_coerce_float(fil_width, 0.8), 6),
         "scale_mode": _normalize_scale_mode(scale_mode),
         "sweep_buffer": round(_coerce_float(sweep_buffer, 0.8), 6),
+        "contour_order": str(contour_order or CONTOUR_ORDER_LAST),
     }
 
 
@@ -4389,6 +4393,7 @@ def check_gcode_staleness(
     scale_mode: str | None,
     sweep_buffer: float = 0.8,
     lead_in_orientation: str | None = None,
+    contour_order: str | None = None,
 ) -> str:
     """Warning banner text when generated G-code no longer matches the settings."""
     records = _apply_shape_settings(records or [], settings_table)
@@ -4406,6 +4411,7 @@ def check_gcode_staleness(
         scale_mode,
         sweep_buffer,
         lead_in_orientation,
+        contour_order,
     )
     for record in records:
         if not record.get("gcode_path"):
@@ -4447,6 +4453,7 @@ def export_project_settings(
     lead_in_direction: str | None,
     lead_in_orientation: str | None,
     nozzle_speed: Any,
+    contour_order: str | None = None,
 ) -> tuple[str | None, str]:
     """Write the session's settings to a small JSON file, keyed by STL name.
 
@@ -4483,6 +4490,7 @@ def export_project_settings(
             "lead_in_direction": str(lead_in_direction or LEAD_IN_DIRECTION_LEFT),
             "lead_in_orientation": str(lead_in_orientation or LEAD_IN_LINE_AUTO),
             "nozzle_speed": _coerce_float(nozzle_speed, 10.0),
+            "contour_order": str(contour_order or CONTOUR_ORDER_LAST),
         },
     }
     settings_path = Path(tempfile.mkdtemp(prefix="pp_settings_")) / "parallelprint_settings.json"
@@ -4506,7 +4514,7 @@ def import_project_settings(
     """
 
     def _skip_options() -> tuple:
-        return tuple(gr.skip() for _ in range(12))
+        return tuple(gr.skip() for _ in range(13))
 
     paths = _uploaded_file_paths(settings_upload)
     if not paths:
@@ -4568,6 +4576,7 @@ def import_project_settings(
         option("fil_width"),
         option("scale_mode"),
         option("nozzle_speed"),
+        option("contour_order"),
     )
 
 
@@ -4608,6 +4617,7 @@ def generate_dynamic_gcode(
     nozzle_speed: Any = None,
     sweep_buffer: float = 0.8,
     lead_in_orientation: str | None = None,
+    contour_order: str | None = None,
     progress: gr.Progress = gr.Progress(),
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
@@ -4700,6 +4710,9 @@ def generate_dynamic_gcode(
                 raster_pattern=raster_pattern,
                 contour_sources=contour_sources,
                 active_contour_owner=int(record.get("idx", 0)),
+                # Same order for every shape: contour placement is part of
+                # the shared motion path.
+                contour_order=contour_order,
                 infill=_coerce_float(record.get("infill", 100.0), 100.0) / 100.0,
                 motion_infill_fractions=motion_infill_fractions,
                 emit_pressure_commands=owns_port_pressure,
@@ -4735,6 +4748,7 @@ def generate_dynamic_gcode(
                 scale_mode,
                 sweep_buffer,
                 lead_in_orientation,
+                contour_order,
             )
             messages.append(f"Shape {record['idx']}: wrote `{gcode_path.name}`.")
         except Exception as exc:
@@ -5285,6 +5299,15 @@ def build_dynamic_demo() -> gr.Blocks:
                     min_width=170,
                     info="Valve-settle travel before/after each raster line (0 = none).",
                 )
+                gcode_contour_order = gr.Dropdown(
+                    label="Contour Order",
+                    choices=list(CONTOUR_ORDER_CHOICES),
+                    value=CONTOUR_ORDER_LAST,
+                    allow_custom_value=False,
+                    scale=1,
+                    min_width=170,
+                    info="Trace shape outlines before or after each layer's infill.",
+                )
             with gr.Accordion("Lead In Options", open=False, elem_classes=["settings-accordion"]):
                 gr.Markdown("Applies to shapes with **Lead In** checked in the Shape Settings table.")
                 with gr.Row():
@@ -5669,6 +5692,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 gcode_lead_in_direction,
                 gcode_lead_in_orientation,
                 viz_nozzle_speed,
+                gcode_contour_order,
             ],
             outputs=[settings_export_file, settings_status],
             queue=False,
@@ -5692,6 +5716,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 fil_width,
                 scale_mode,
                 viz_nozzle_speed,
+                gcode_contour_order,
             ],
         )
 
@@ -5712,6 +5737,7 @@ def build_dynamic_demo() -> gr.Blocks:
             scale_mode,
             gcode_sweep_buffer,
             gcode_lead_in_orientation,
+            gcode_contour_order,
         ]
         shape_settings.change(
             fn=check_gcode_staleness,
@@ -5731,6 +5757,7 @@ def build_dynamic_demo() -> gr.Blocks:
             scale_mode,
             gcode_sweep_buffer,
             gcode_lead_in_orientation,
+            gcode_contour_order,
         ):
             stale_control.change(
                 fn=check_gcode_staleness,
@@ -5775,6 +5802,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 viz_nozzle_speed,
                 gcode_sweep_buffer,
                 gcode_lead_in_orientation,
+                gcode_contour_order,
             ],
             outputs=[shape_records, ref_layers, gcode_downloads, gcode_status, gcode_text_source, gcode_source, gcode_download_all],
         ).then(

@@ -1683,6 +1683,98 @@ def test_split_contour_gcode_never_traces_the_cuts(tmp_path) -> None:
     assert vertical_prints == []
 
 
+def test_contour_order_option_places_contours_first_or_last(tmp_path) -> None:
+    from vector_toolpath import CONTOUR_ORDER_FIRST
+
+    layer = box(0.0, 0.0, 6.0, 4.0)
+    stack = _stack(layer, layer, name="order")
+    sources = [ContourSource(owner_idx=1, stack=stack)]
+
+    def per_layer_kinds(contour_order):
+        tag = str(contour_order or "default").replace(" ", "_")
+        gcode_path = generate_vector_gcode(
+            stack,
+            shape_name=f"order_{tag}",
+            pressure=25,
+            valve=4,
+            port=1,
+            fil_width=1.0,
+            contour_sources=sources,
+            active_contour_owner=1,
+            contour_order=contour_order,
+            output_dir=tmp_path / tag,
+        )
+        moves = _moves_with_colors(gcode_path.read_text())
+        prints = [move for move in moves if move["color"] == 255]
+        # The contour rims are the outermost printed Y lines; the X-raster
+        # scanlines run strictly inside them.
+        rim_lo = min(min(m["start"][1], m["end"][1]) for m in prints)
+        rim_hi = max(max(m["start"][1], m["end"][1]) for m in prints)
+
+        def kind(move: dict) -> str:
+            if abs(move["end"][1] - move["start"][1]) > 1e-9:
+                return "contour"  # vertical print: box side edge
+            on_rim = (
+                min(abs(move["start"][1] - rim_lo), abs(move["start"][1] - rim_hi))
+                < 1e-6
+            )
+            return "contour" if on_rim else "infill"
+
+        layers: list[list[str]] = [[]]
+        for move in moves:
+            if abs(move["end"][2] - move["start"][2]) > 1e-9:
+                layers.append([])
+                continue
+            if move["color"] != 255:
+                continue
+            layers[-1].append(kind(move))
+        return [kinds for kinds in layers if kinds]
+
+    # Default: infill first, contours close the layer.
+    for kinds in per_layer_kinds(None):
+        assert "contour" in kinds and "infill" in kinds
+        first_contour = kinds.index("contour")
+        assert all(kind == "contour" for kind in kinds[first_contour:])
+        assert kinds[0] == "infill"
+
+    # Before infill: contours open the layer, infill follows.
+    for kinds in per_layer_kinds(CONTOUR_ORDER_FIRST):
+        assert "contour" in kinds and "infill" in kinds
+        first_infill = kinds.index("infill")
+        assert all(kind == "infill" for kind in kinds[first_infill:])
+        assert kinds[0] == "contour"
+
+    # Shared motion stays in sync with contours first: every head traces one
+    # identical path.
+    stack_b = _stack(layer, layer, name="order_b")
+    reference = build_reference_stack([stack, stack_b], grid=1.0)
+    shared_sources = [
+        ContourSource(owner_idx=1, stack=stack),
+        ContourSource(owner_idx=2, stack=stack_b),
+    ]
+    lengths = set()
+    ends = set()
+    for idx, shape in enumerate((stack, stack_b), start=1):
+        path = generate_vector_gcode(
+            shape,
+            shape_name=f"sync_{idx}",
+            pressure=25,
+            valve=3 + idx,
+            port=1,
+            fil_width=1.0,
+            motion=reference,
+            contour_sources=shared_sources,
+            active_contour_owner=idx,
+            contour_order=CONTOUR_ORDER_FIRST,
+            output_dir=tmp_path / f"sync_{idx}",
+        )
+        moves = _moves_with_colors(path.read_text())
+        lengths.add(round(_total_length(moves), 4))
+        ends.add(moves[-1]["end"])
+    assert len(lengths) == 1
+    assert len(ends) == 1
+
+
 def test_split_pieces_center_on_the_shared_motion() -> None:
     from vector_toolpath import _centering_delta
 

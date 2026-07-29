@@ -193,6 +193,7 @@ def generate_vector_gcode(
     motion: LayerStack | None = None,
     contour_sources: list[ContourSource] | None = None,
     active_contour_owner: int | None = None,
+    contour_order: str | None = None,
     infill: float = 1.0,
     motion_infill_fractions: list[float] | None = None,
     emit_pressure_commands: bool = True,
@@ -331,6 +332,9 @@ def generate_vector_gcode(
         # Valve-settle travel before/after each raster sweep; one fil_width
         # when not given. Pass the SAME value for every shape sharing motion.
         sweep_buffer=sweep_buffer,
+        # Same value for every shape sharing motion: contour placement is
+        # part of the shared path.
+        contour_order=contour_order,
     )
 
     # World anchor: the toolpath origin expressed in the shape's own frame.

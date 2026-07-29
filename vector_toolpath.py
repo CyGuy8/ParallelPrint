@@ -1281,6 +1281,16 @@ def _append_layer_contours(
     return current_x, current_y
 
 
+CONTOUR_ORDER_LAST = "After infill"
+CONTOUR_ORDER_FIRST = "Before infill"
+CONTOUR_ORDER_CHOICES = (CONTOUR_ORDER_LAST, CONTOUR_ORDER_FIRST)
+
+
+def _contours_first(contour_order: str | None) -> bool:
+    text = str(contour_order or "").strip().lower()
+    return text.startswith("before") or text == "first"
+
+
 LEAD_IN_DIRECTION_LEFT = "Left"
 LEAD_IN_DIRECTION_RIGHT = "Right"
 LEAD_IN_DIRECTION_UP = "Up"
@@ -1440,8 +1450,13 @@ def plan_layer_moves(
     ring_center: tuple[float, float] | None = None,
     motion_infill_fractions: list[float] | None = None,
     sweep_buffer: float | None = None,
+    contour_order: str | None = None,
 ) -> tuple[list[dict], tuple[float, float]]:
     """Assemble per-layer segments into a relative move list for all patterns.
+
+    `contour_order` picks when each layer's contours are traced:
+    "After infill" (default) appends them after the layer's raster;
+    "Before infill" traces them first, right after the layer's Z lift.
 
     `scan_frame` (an XY box) pins the rasters' scanlines to a global grid so
     lines stack across layers and across split pieces, and provides the
@@ -1481,6 +1496,7 @@ def plan_layer_moves(
     origin_y = 0.0
     raster_origin_initialized = False
     contour_layers = contour_layers or []
+    contours_first = _contours_first(contour_order)
 
     for layer_number, (motion, valve) in enumerate(zip(motion_layers, valve_layers)):
         if motion is None or motion.is_empty:
@@ -1675,12 +1691,35 @@ def plan_layer_moves(
                 gcode_list,
                 current_x,
                 current_y,
-                first_x,
-                first_y,
+                # Contours-first: lift Z in place — the contours run before
+                # the travel to the raster start.
+                current_x if contours_first else first_x,
+                current_y if contours_first else first_y,
                 0,
                 z_step=layer_height,
             )
-        else:
+        elif not contours_first:
+            current_x, current_y = _append_relative_move(
+                gcode_list,
+                current_x,
+                current_y,
+                first_x,
+                first_y,
+                0,
+            )
+
+        if contours_first:
+            current_x, current_y = _append_layer_contours(
+                gcode_list,
+                current_x,
+                current_y,
+                contour_layers,
+                layer_number,
+                active_contour_owner,
+                origin_x,
+                origin_y,
+                shared_motion,
+            )
             current_x, current_y = _append_relative_move(
                 gcode_list,
                 current_x,
@@ -1708,26 +1747,27 @@ def plan_layer_moves(
                 color,
             )
 
-        layer_end_x, layer_end_y = current_x, current_y
-        current_x, current_y = _append_layer_contours(
-            gcode_list,
-            current_x,
-            current_y,
-            contour_layers,
-            layer_number,
-            active_contour_owner,
-            origin_x,
-            origin_y,
-            shared_motion,
-        )
-        current_x, current_y = _append_relative_move(
-            gcode_list,
-            current_x,
-            current_y,
-            layer_end_x,
-            layer_end_y,
-            0,
-        )
+        if not contours_first:
+            layer_end_x, layer_end_y = current_x, current_y
+            current_x, current_y = _append_layer_contours(
+                gcode_list,
+                current_x,
+                current_y,
+                contour_layers,
+                layer_number,
+                active_contour_owner,
+                origin_x,
+                origin_y,
+                shared_motion,
+            )
+            current_x, current_y = _append_relative_move(
+                gcode_list,
+                current_x,
+                current_y,
+                layer_end_x,
+                layer_end_y,
+                0,
+            )
 
     return gcode_list, (origin_x, origin_y)
 
