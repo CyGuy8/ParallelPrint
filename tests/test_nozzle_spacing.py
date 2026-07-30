@@ -1751,6 +1751,63 @@ def test_multi_material_demo_set_groups_parts_onto_shared_nozzles() -> None:
     assert [row[nozzle_pos] for row in outputs[2]] == [1, 1, 2, 2, 3, 3]
 
 
+def test_apply_shape_rotation_updates_dims_and_reslices(tmp_path) -> None:
+    import trimesh
+
+    from app import _slice_record, apply_shape_rotation, selected_shape_rotation
+
+    mesh = trimesh.creation.box(extents=(10.0, 4.0, 2.0))
+    stl_path = tmp_path / "bar.stl"
+    mesh.export(stl_path)
+
+    records = _records_from_files([str(stl_path)], None)
+    record = records[0]
+    assert (record["target_x"], record["target_y"], record["target_z"]) == (10.0, 4.0, 2.0)
+
+    # Slice unrotated, then rotate: the slice_params fingerprint must change
+    # so the auto re-slice kicks in on the next generation.
+    _slice_record(record, 1.0, None)
+    params_before = dict(record["slice_params"])
+
+    updated, rows, status = apply_shape_rotation(records, None, None, 90, 0, 0)
+    record = updated[0]
+    assert "Rotated" in status
+    assert record["rotation"] == (90.0, 0.0, 0.0)
+    # Dimensions reset to the rotated bounding box: (10, 4, 2) -> (10, 2, 4).
+    assert (record["target_x"], record["target_y"], record["target_z"]) == (10.0, 2.0, 4.0)
+    assert (record["original_x"], record["original_y"], record["original_z"]) == (10.0, 2.0, 4.0)
+    assert rows[0][2:5] == [10.0, 2.0, 4.0]
+
+    from app import _slice_params_snapshot
+
+    assert _slice_params_snapshot(record, 1.0, None) != params_before
+
+    # Re-slicing uses the rotated mesh: 4 layers of the stood-up bar.
+    stack = _slice_record(record, 1.0, None)
+    assert len(stack.layers) == 4
+    (x0, y0, _), (x1, y1, _) = stack.bounds
+    assert round(x1 - x0, 3) == 10.0
+    assert round(y1 - y0, 3) == 2.0
+
+    # The rotation inputs mirror the stored value; clearing it restores the
+    # unrotated dimensions.
+    assert selected_shape_rotation(updated, None) == (90.0, 0.0, 0.0)
+    cleared, _rows, cleared_status = apply_shape_rotation(updated, None, None, 0, 0, 0)
+    assert cleared[0]["rotation"] is None
+    assert "cleared" in cleared_status
+    assert (cleared[0]["target_x"], cleared[0]["target_y"], cleared[0]["target_z"]) == (10.0, 4.0, 2.0)
+
+    # The single-input UI wrapper spins the shape on the bed (about Z):
+    # the 10 x 4 bar's X and Y swap.
+    from app import apply_shape_z_rotation, selected_shape_z_rotation
+
+    spun, _rows, spun_status = apply_shape_z_rotation(cleared, None, None, 90)
+    assert spun[0]["rotation"] == (0.0, 0.0, 90.0)
+    assert "90°" in spun_status and "X " not in spun_status.split(".")[0]
+    assert (spun[0]["target_x"], spun[0]["target_y"], spun[0]["target_z"]) == (4.0, 10.0, 2.0)
+    assert selected_shape_z_rotation(spun, None) == 90.0
+
+
 def test_project_settings_export_import_round_trip(tmp_path) -> None:
     from app import export_project_settings, import_project_settings
 

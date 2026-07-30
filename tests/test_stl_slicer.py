@@ -9,10 +9,53 @@ import pytest
 from stl_slicer import (
     _compose_even_odd_polygons,
     calculate_z_levels,
+    rotate_mesh,
     scale_factors_for_target_extents,
     scale_mesh,
     slice_stl_to_layers,
 )
+
+
+def test_slice_stl_to_layers_applies_rotation(tmp_path) -> None:
+    mesh = trimesh.creation.box(extents=(10.0, 4.0, 2.0))
+    stl_path = tmp_path / "bar.stl"
+    mesh.export(stl_path)
+
+    # 90° about X stands the bar up: extents (10, 4, 2) -> (10, 2, 4).
+    stack = slice_stl_to_layers(stl_path, layer_height=1.0, rotation=(90.0, 0.0, 0.0))
+
+    bounds = np.array(stack.bounds)
+    np.testing.assert_allclose(bounds[1] - bounds[0], (10.0, 2.0, 4.0), atol=1e-6)
+    assert len(stack.layers) == 4
+    for layer in stack.layers:
+        assert layer.area == pytest.approx(20.0)
+
+    # Scale factors apply to the ROTATED bounding box.
+    rotated = rotate_mesh(trimesh.creation.box(extents=(10.0, 4.0, 2.0)), (90.0, 0.0, 0.0))
+    np.testing.assert_allclose(sorted(rotated.extents), sorted((10.0, 2.0, 4.0)), atol=1e-6)
+    factors = scale_factors_for_target_extents(rotated, (5.0, 2.0, 2.0))
+    scaled_stack = slice_stl_to_layers(
+        stl_path,
+        layer_height=1.0,
+        rotation=(90.0, 0.0, 0.0),
+        scale_factors=factors,
+    )
+    scaled_bounds = np.array(scaled_stack.bounds)
+    np.testing.assert_allclose(scaled_bounds[1] - scaled_bounds[0], (5.0, 2.0, 2.0), atol=1e-6)
+
+
+def test_rotate_mesh_uses_shared_center_for_assemblies() -> None:
+    left = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    right = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    right.apply_translation((4.0, 0.0, 0.0))
+    combined_center = (2.0, 0.0, 0.0)
+
+    # Rotating both parts 180° about Z around the SHARED centre swaps their
+    # positions — the assembly turns as one rigid unit.
+    left_rotated = rotate_mesh(left, (0.0, 0.0, 180.0), center=combined_center)
+    right_rotated = rotate_mesh(right, (0.0, 0.0, 180.0), center=combined_center)
+    np.testing.assert_allclose(left_rotated.bounds, right.bounds, atol=1e-9)
+    np.testing.assert_allclose(right_rotated.bounds, left.bounds, atol=1e-9)
 
 
 def test_calculate_z_levels_creates_single_layer_for_thin_mesh() -> None:

@@ -119,6 +119,34 @@ def scale_mesh(
     return scaled
 
 
+def rotate_mesh(
+    mesh: trimesh.Trimesh,
+    rotation: Sequence[float] | None,
+    center: Sequence[float] | None = None,
+) -> trimesh.Trimesh:
+    """Rotated copy of `mesh`: X, then Y, then Z angles in degrees, about
+    `center` (the mesh's own bounding-box centre by default).
+
+    Multi-material assembly parts pass their GROUP's combined centre so
+    equal rotations turn the whole assembly as one rigid unit.
+    """
+    angles = tuple(float(value or 0.0) for value in (rotation or (0.0, 0.0, 0.0)))
+    rotated = mesh.copy()
+    if all(abs(angle) < 1e-9 for angle in angles):
+        return rotated
+    point = np.asarray(
+        (mesh.bounds[0] + mesh.bounds[1]) / 2.0 if center is None else center,
+        dtype=float,
+    )
+    for angle, axis in zip(angles, ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))):
+        if abs(angle) < 1e-9:
+            continue
+        rotated.apply_transform(
+            trimesh.transformations.rotation_matrix(math.radians(angle), axis, point)
+        )
+    return rotated
+
+
 def scale_factors_for_target_extents(
     mesh: trimesh.Trimesh,
     target_extents: Sequence[float],
@@ -301,6 +329,8 @@ def slice_stl_to_layers(
     scale_anchor: Sequence[float] | None = None,
     flip_z: bool = False,
     z_flip_mid: float | None = None,
+    rotation: Sequence[float] | None = None,
+    rotation_center: Sequence[float] | None = None,
 ) -> LayerStack:
     """Slice an STL into per-layer vector outlines (world-XY millimetres).
 
@@ -310,13 +340,22 @@ def slice_stl_to_layers(
     is the point target-dimension scaling happens about (assembly parts share
     their group's corner so they stay assembled when rescaled).
 
+    `rotation` turns the RAW mesh (X, then Y, then Z degrees, about
+    `rotation_center` — its own bbox centre by default) BEFORE scaling, so
+    the target dimensions apply to the rotated shape's bounding box: the
+    shape can be printed lying in any orientation. Callers computing scale
+    factors must derive them from the rotated mesh (see `rotate_mesh`).
+
     `flip_z` mirrors the scaled mesh about the horizontal plane at
     `z_flip_mid` (its own Z midpoint by default) — printing the shape the
     other way up. Assembly parts pass their GROUP's midplane so the whole
     assembly flips as one unit.
     """
     stl_path = Path(stl_path)
-    mesh = scale_mesh(load_mesh(stl_path), scale_factors, anchor=scale_anchor)
+    mesh = load_mesh(stl_path)
+    if rotation is not None:
+        mesh = rotate_mesh(mesh, rotation, center=rotation_center)
+    mesh = scale_mesh(mesh, scale_factors, anchor=scale_anchor)
     if flip_z:
         mid = (
             float(z_flip_mid)

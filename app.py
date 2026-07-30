@@ -35,6 +35,7 @@ from stl_slicer import (
     LayerStack,
     calculate_z_levels,
     load_mesh,
+    rotate_mesh,
     scale_factors_for_target_extents,
     scale_mesh,
     slice_stl_to_layers,
@@ -1986,6 +1987,29 @@ def _default_color(index: int) -> str:
     return DEFAULT_PARALLEL_COLORS[(index - 1) % len(DEFAULT_PARALLEL_COLORS)]
 
 
+def _record_rotation(record: dict) -> tuple[float, float, float]:
+    """The shape's print rotation (X, Y, Z degrees); (0, 0, 0) when unset."""
+    rotation = record.get("rotation")
+    if not isinstance(rotation, (list, tuple)):
+        return (0.0, 0.0, 0.0)
+    values = [_coerce_float(value, 0.0) for value in list(rotation)[:3]]
+    while len(values) < 3:
+        values.append(0.0)
+    return tuple(round(value, 1) for value in values)
+
+
+def _rotated_display_stl(stl_path: str, rotation: tuple[float, float, float]) -> str:
+    """A temp STL of the rotated mesh, so the 3D preview shows the shape the
+    way it will actually print."""
+    try:
+        mesh = rotate_mesh(load_mesh(stl_path), rotation)
+        out_path = Path(tempfile.mkdtemp(prefix="pp_rotated_")) / Path(stl_path).name
+        mesh.export(out_path)
+        return str(out_path)
+    except Exception:
+        return stl_path
+
+
 def _default_target_extents_for_stl(path: str) -> tuple[float, float, float]:
     try:
         extents = load_mesh(path).extents
@@ -2104,6 +2128,7 @@ def _records_from_files(files: Any, previous_records: list[dict] | None = None) 
             "infill": previous.get("infill", 100.0),
             "contour_tracing": previous.get("contour_tracing", False),
             "lead_in": previous.get("lead_in", False),
+            "rotation": previous.get("rotation"),
             "layer_stack": previous.get("layer_stack"),
             "slice_params": previous.get("slice_params"),
             "gcode_path": previous.get("gcode_path"),
@@ -3450,8 +3475,14 @@ def show_selected_model(
     if pos < 0:
         return _viewer_update(None), "No model loaded."
     record = records[pos]
+    stl_path = record.get("stl_path")
+    rotation = _record_rotation(record)
+    if stl_path and any(rotation):
+        # Preview the shape the way it will print: rotated first, so the
+        # target dimensions apply to the rotated bounding box.
+        stl_path = _rotated_display_stl(str(stl_path), rotation)
     return load_single_model(
-        record.get("stl_path"),
+        stl_path,
         False,  # full opacity (the 75%-opacity option was removed)
         True,
         scale_mode,
@@ -3459,6 +3490,97 @@ def show_selected_model(
         record.get("target_y"),
         record.get("target_z"),
     )
+
+
+def apply_shape_rotation(
+    records: list[dict] | None,
+    selected: str | None,
+    settings_table: Any,
+    rotate_x: Any,
+    rotate_y: Any,
+    rotate_z: Any,
+) -> tuple:
+    """Store a print rotation on the selected shape.
+
+    The rotation turns the raw mesh (X, then Y, then Z, about its centre)
+    before slicing, so the shape can print lying in any orientation. The
+    dimensions reset to the rotated shape's natural bounding box — edit
+    them afterwards as usual; slicing picks the rotation up automatically
+    on the next Generate G-Code (or split).
+    """
+    records = _apply_shape_settings(records or [], settings_table)
+    pos = _selected_record_index(records, selected)
+    if pos < 0:
+        return records, _shape_settings_rows(records), "Load a shape before rotating it."
+    record = records[pos]
+    name = str(record.get("name") or f"Shape {record.get('idx', pos + 1)}")
+    if not record.get("stl_path"):
+        return (
+            records,
+            _shape_settings_rows(records),
+            f"{name} is a split piece and cannot be rotated — rotate the source "
+            "shape, then split again.",
+        )
+
+    rotation = tuple(
+        round(_coerce_float(value, 0.0) % 360.0, 1)
+        for value in (rotate_x, rotate_y, rotate_z)
+    )
+    try:
+        extents = tuple(
+            float(value)
+            for value in rotate_mesh(load_mesh(record["stl_path"]), rotation).extents
+        )
+    except Exception as exc:
+        return records, _shape_settings_rows(records), f"Rotation failed: {exc}"
+
+    record["rotation"] = rotation if any(rotation) else None
+    for axis, extent in zip(("x", "y", "z"), extents):
+        record[f"original_{axis}"] = round(extent, 1)
+        record[f"target_{axis}"] = round(extent, 1)
+
+    dims = " x ".join(f"{round(extent, 1):g}" for extent in extents)
+    if any(rotation):
+        if rotation[0] or rotation[1]:
+            angle_text = f"X {rotation[0]:g}°, Y {rotation[1]:g}°, Z {rotation[2]:g}°"
+        else:
+            angle_text = f"{rotation[2]:g}°"
+        status = (
+            f"Rotated {name} to {angle_text}. "
+            f"Dimensions reset to the rotated size ({dims} mm) — edit them as needed; "
+            "the next Generate G-Code (or split) slices the rotated shape."
+        )
+    else:
+        status = f"Rotation cleared for {name}; dimensions reset to {dims} mm."
+    return records, _shape_settings_rows(records), status
+
+
+def apply_shape_z_rotation(
+    records: list[dict] | None,
+    selected: str | None,
+    settings_table: Any,
+    angle: Any,
+) -> tuple:
+    """UI entry point: the single Rotate input spins the shape on the bed
+    (about Z). The engine supports X/Y tilts too — expose more inputs here
+    when they are needed."""
+    return apply_shape_rotation(records, selected, settings_table, 0.0, 0.0, angle)
+
+
+def selected_shape_rotation(
+    records: list[dict] | None, selected: str | None
+) -> tuple[float, float, float]:
+    """The stored rotation of the selected shape, for the rotation inputs."""
+    records = records or []
+    pos = _selected_record_index(records, selected)
+    if pos < 0:
+        return 0.0, 0.0, 0.0
+    return _record_rotation(records[pos])
+
+
+def selected_shape_z_rotation(records: list[dict] | None, selected: str | None) -> float:
+    """The stored bed rotation (Z) of the selected shape, for the Rotate input."""
+    return selected_shape_rotation(records, selected)[2]
 
 
 def _polygon_patch(polygon, **kwargs):
@@ -3589,7 +3711,7 @@ def _slice_params_snapshot(
     record: dict,
     layer_height: float,
     scale_mode: str | None,
-    slice_plan: tuple[list[float], tuple[float, float, float]] | None = None,
+    slice_plan: tuple | None = None,
 ) -> dict:
     z_levels = slice_plan[0] if slice_plan else None
     anchor = slice_plan[1] if slice_plan else None
@@ -3599,6 +3721,7 @@ def _slice_params_snapshot(
         "target_x": record.get("target_x"),
         "target_y": record.get("target_y"),
         "target_z": record.get("target_z"),
+        "rotation": _record_rotation(record),
         # Multi-material groups: the shared Z grid + scale anchor
         # fingerprint. Adding/removing an assembly part changes them, which
         # correctly marks every part's slices stale.
@@ -3672,23 +3795,46 @@ def _multi_material_slice_plan(
     records: list[dict],
     layer_height: float,
     scale_mode: str | None,
-) -> tuple[list[float], tuple[float, float, float]] | None:
-    """(shared Z grid, shared scale anchor) for one multi-material group.
+) -> tuple[list[float], tuple[float, float, float], tuple[float, float, float] | None] | None:
+    """(shared Z grid, shared scale anchor, shared rotation centre) for one
+    multi-material group.
 
     Group members must slice on the SAME planes so a part that starts
     higher gets empty lower layers instead of having its first material
     layer treated as layer 0 — and any target-dimension scaling must happen
     about ONE shared point (the group's combined un-scaled corner), or
     same-factor scaling would still shift the parts relative to each other.
+    Rotations likewise happen about the group's combined RAW centre, so
+    equal rotations turn the whole assembly as one rigid unit.
     """
-    loaded: list[tuple[Any, tuple[float, float, float]]] = []
-    corner = [math.inf, math.inf, math.inf]
+    raw: list[tuple[dict, Any]] = []
+    raw_lo = [math.inf, math.inf, math.inf]
+    raw_hi = [-math.inf, -math.inf, -math.inf]
     for record in records:
         stl_path = record.get("stl_path")
         if not stl_path:
             continue
         try:
             mesh = load_mesh(stl_path)
+        except Exception:
+            continue
+        raw.append((record, mesh))
+        for axis in range(3):
+            raw_lo[axis] = min(raw_lo[axis], float(mesh.bounds[0][axis]))
+            raw_hi[axis] = max(raw_hi[axis], float(mesh.bounds[1][axis]))
+    if not raw or not all(math.isfinite(value) for value in raw_lo):
+        return None
+    rotation_center = tuple(
+        (lo + hi) / 2.0 for lo, hi in zip(raw_lo, raw_hi)
+    )
+
+    loaded: list[tuple[Any, tuple[float, float, float]]] = []
+    corner = [math.inf, math.inf, math.inf]
+    for record, mesh in raw:
+        rotation = _record_rotation(record)
+        if any(rotation):
+            mesh = rotate_mesh(mesh, rotation, center=rotation_center)
+        try:
             scale_factors = _resolve_mesh_scale_factors(
                 mesh,
                 True,
@@ -3717,7 +3863,7 @@ def _multi_material_slice_plan(
         z_hi = max(z_hi, float(scaled.bounds[1][2]))
     if not math.isfinite(z_lo) or not math.isfinite(z_hi):
         return None
-    return calculate_z_levels(z_lo, z_hi, float(layer_height)), anchor
+    return calculate_z_levels(z_lo, z_hi, float(layer_height)), anchor, rotation_center
 
 
 def _slice_record(
@@ -3725,10 +3871,16 @@ def _slice_record(
     layer_height: float,
     scale_mode: str | None,
     progress_callback=None,
-    slice_plan: tuple[list[float], tuple[float, float, float]] | None = None,
+    slice_plan: tuple | None = None,
 ) -> LayerStack:
     stl_path = record["stl_path"]
+    rotation = _record_rotation(record)
+    rotation_center = slice_plan[2] if slice_plan and len(slice_plan) > 2 else None
     mesh = load_mesh(stl_path)
+    if any(rotation):
+        # Scale factors come from the ROTATED bounding box: the target
+        # dimensions describe the shape as it will print.
+        mesh = rotate_mesh(mesh, rotation, center=rotation_center)
     scale_factors = _resolve_mesh_scale_factors(
         mesh,
         True,
@@ -3745,6 +3897,8 @@ def _slice_record(
         name=str(record.get("name") or Path(stl_path).stem),
         z_levels=slice_plan[0] if slice_plan else None,
         scale_anchor=slice_plan[1] if slice_plan else None,
+        rotation=rotation if any(rotation) else None,
+        rotation_center=rotation_center,
     )
     record["layer_stack"] = stack
     record["slice_params"] = _slice_params_snapshot(record, layer_height, scale_mode, slice_plan)
@@ -3756,10 +3910,10 @@ def _group_z_levels_by_record(
     layer_height: float,
     scale_mode: str | None,
     messages: list[str] | None = None,
-) -> dict[int, tuple[list[float], tuple[float, float, float]]]:
+) -> dict[int, tuple]:
     """Per multi-material group member: (shared Z grid, shared scale anchor),
     keyed by record id."""
-    plan_by_record: dict[int, tuple[list[float], tuple[float, float, float]]] = {}
+    plan_by_record: dict[int, tuple] = {}
     for nozzle, members in sorted(_multi_material_groups(records).items()):
         plan = _multi_material_slice_plan(members, layer_height, scale_mode)
         if plan is None:
@@ -4356,6 +4510,7 @@ def _gcode_settings_snapshot(
         "infill": round(_coerce_float(record.get("infill"), 100.0), 6),
         "contour_tracing": bool(record.get("contour_tracing")),
         "lead_in": bool(record.get("lead_in")),
+        "rotation": _record_rotation(record),
         "raster_pattern": str(raster_pattern or ""),
         "pressure_ramp": bool(pressure_ramp_enabled),
         "lead_in_params": (
@@ -4427,6 +4582,10 @@ _SHAPE_EXPORT_FIELDS = (
     "target_x",
     "target_y",
     "target_z",
+    "original_x",
+    "original_y",
+    "original_z",
+    "rotation",
     "pressure",
     "valve",
     "nozzle",
@@ -5252,6 +5411,19 @@ def build_dynamic_demo() -> gr.Blocks:
                     refresh_preview_button = gr.Button("Regenerate Preview", variant="secondary", size="sm")
 
                 with gr.Row():
+                    rotate_input = gr.Number(
+                        label="Rotate (°)", value=0.0, step=15.0, min_width=140,
+                        info="Spins the shape on the bed - print it in any direction.",
+                        scale=1,
+                    )
+                    apply_rotation_button = gr.Button(
+                        "Apply Rotation", variant="secondary", size="sm",
+                        min_width=140, scale=1,
+                    )
+                    gr.HTML("", scale=3)
+                rotation_status = gr.Markdown("")
+
+                with gr.Row():
                     with gr.Column(scale=2, min_width=420):
                         model_viewer = gr.Model3D(
                             label="Selected 3D Viewer",
@@ -5765,6 +5937,32 @@ def build_dynamic_demo() -> gr.Blocks:
                 outputs=[gcode_stale_banner],
                 queue=False,
             )
+
+        apply_rotation_button.click(
+            fn=apply_shape_z_rotation,
+            inputs=[shape_records, selected_shape, shape_settings, rotate_input],
+            outputs=[shape_records, shape_settings, rotation_status],
+        ).then(
+            fn=show_selected_model,
+            inputs=preview_inputs,
+            outputs=[model_viewer, model_details],
+        ).then(
+            fn=update_layer_preview,
+            inputs=layer_preview_inputs,
+            outputs=layer_preview_outputs,
+        ).then(
+            fn=check_gcode_staleness,
+            inputs=stale_inputs,
+            outputs=[gcode_stale_banner],
+            queue=False,
+        )
+        # Selecting a shape shows its stored rotation in the input.
+        selected_shape.change(
+            fn=selected_shape_z_rotation,
+            inputs=[shape_records, selected_shape],
+            outputs=[rotate_input],
+            queue=False,
+        )
 
         # Defined before the generate chain so it can auto-render the
         # parallel view with fresh files (the same lists drive the
