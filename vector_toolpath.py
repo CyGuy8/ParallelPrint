@@ -682,7 +682,12 @@ def _rectangular_spiral_polyline(
     fil_width: float,
     reverse: bool = False,
 ) -> list[tuple[float, float]]:
-    """Corner polyline spiralling from the bounds inward (or outward if reversed)."""
+    """Corner polyline spiralling from the bounds inward (or outward if reversed).
+
+    Starts at the BOTTOM-left corner and runs the bottom edge first, climbing
+    upward — matching the other raster patterns (and putting the toolpath
+    start where a below-the-shape lead-in ends).
+    """
     min_x, min_y, max_x, max_y = bounds
     half = fil_width / 2.0
     left = min_x + half
@@ -702,21 +707,21 @@ def _rectangular_spiral_polyline(
             points.append((x, y))
 
     while left <= right + eps and bottom <= top + eps:
-        add(left, top)
-        add(right, top)
-        top -= fil_width
+        add(left, bottom)
+        add(right, bottom)
+        bottom += fil_width
 
         if bottom <= top + eps:
-            add(right, bottom)
+            add(right, top)
         right -= fil_width
 
         if bottom <= top + eps:
-            add(left, bottom)
-            bottom += fil_width
+            add(left, top)
+            top -= fil_width
 
         if left <= right + eps:
             if bottom <= top + eps:
-                add(left, top)
+                add(left, bottom)
             left += fil_width
 
     if len(points) == 1:
@@ -905,8 +910,11 @@ def _circle_rings_polyline(
     """Concentric-ring "spiral": one full circle per radius, in list order.
 
     Each revolution stays at a CONSTANT radius (so the printed walls are true
-    smooth circles); consecutive rings are joined by a radial jump at theta 0,
-    which the caller classifies as valve-off travel.
+    smooth circles) and starts/ends at the BOTTOM of the circle — the path
+    begins at the shape's lowest point and sweeps upward, matching the other
+    raster patterns (and putting the toolpath start where a below-the-shape
+    lead-in ends). Consecutive rings are joined by a radial jump at the
+    bottom, which the caller classifies as valve-off travel.
     """
     pitch = max(float(pitch), 1e-9)
     points: list[tuple[float, float]] = []
@@ -917,7 +925,7 @@ def _circle_rings_polyline(
         d_theta = min(math.pi / 10.0, pitch / max(radius, pitch))
         steps = max(8, int(math.ceil((2.0 * math.pi) / d_theta)))
         for index in range(steps + 1):
-            theta = (2.0 * math.pi) * index / steps
+            theta = -math.pi / 2.0 + (2.0 * math.pi) * index / steps
             points.append(
                 (
                     center_x + (radius * math.cos(theta)),
@@ -1352,11 +1360,13 @@ def _lead_in_moves(
     `clearance` away). `orientation` sets which way the purge strokes RUN:
     Auto points them at the shape (horizontal for Left/Right patches,
     vertical for Up/Down), Horizontal/Vertical force an absolute direction.
-    When strokes run along the approach, lines step laterally; when they run
-    across it, lines step further AWAY from the shape — either way the
-    return route exits one step outside the wet patch and comes home through
-    virgin ground, so the freshly primed nozzle never drags back across the
-    purge lines.
+
+    The purge always FINISHES at the patch corner nearest the toolpath
+    start, whatever the line count's parity: strokes across the approach
+    print the farthest line first and step back toward the shape, and the
+    zigzag starts from whichever end makes the LAST stroke land on the
+    start corner. The freshly primed nozzle then travels only the short
+    clearance lane home — never back across the purge lines.
     """
     if not enabled:
         return []
@@ -1395,43 +1405,48 @@ def _lead_in_moves(
         current_v += delta_v
 
     if strokes_along_away:
-        append_move(lead_clearance + lead_length, 0.0, off_color)
-        stroke = -1.0  # first stroke prints back toward the part
+        # Strokes run along the approach, stepping laterally between lines.
+        # The LAST stroke must print TOWARD the part (ending at the
+        # clearance line): with an odd count that means starting from the
+        # far end, with an even count from the near end.
+        if pass_count % 2 == 1:
+            append_move(lead_clearance + lead_length, 0.0, off_color)
+            stroke = -1.0
+        else:
+            append_move(lead_clearance, 0.0, off_color)
+            stroke = 1.0
         for pass_index in range(pass_count):
             append_move(stroke * lead_length, 0.0, print_color)
             stroke *= -1.0
             if pass_index < pass_count - 1:
                 append_move(0.0, spacing, off_color)
 
-        # Return: step one spacing outside the patch laterally, travel home
-        # through the clearance lane, then step back onto the start point.
-        if spacing > 0.0:
-            append_move(0.0, -(current_v + spacing), off_color)
-            append_move(-current_a, 0.0, off_color)
-            append_move(0.0, -current_v, off_color)
-        else:
-            append_move(-current_a, -current_v, off_color)
+        # Ends at the clearance line, one lateral span from the start:
+        # travel home through the clearance lane (the strokes all sit
+        # beyond it, so nothing wet is crossed).
+        append_move(-current_a, -current_v, off_color)
     else:
-        # Strokes run ACROSS the approach: lines step further away from the
-        # shape, so the patch grows outward from `clearance`.
-        append_move(lead_clearance, 0.0, off_color)
-        stroke = 1.0
+        # Strokes run ACROSS the approach: the FARTHEST line prints first
+        # and each next line steps back TOWARD the shape, so the purge
+        # finishes on the nearest line. With an odd count the zigzag starts
+        # from the far lateral end so the last stroke also lands on the
+        # start corner.
+        append_move(lead_clearance + spacing * (pass_count - 1), 0.0, off_color)
+        if pass_count % 2 == 1:
+            append_move(0.0, lead_length, off_color)
+            stroke = -1.0
+        else:
+            stroke = 1.0
         for pass_index in range(pass_count):
             append_move(0.0, stroke * lead_length, print_color)
             stroke *= -1.0
             if pass_index < pass_count - 1:
-                append_move(spacing, 0.0, off_color)
+                append_move(-spacing, 0.0, off_color)
 
-        # Return: step one spacing PAST the outermost wet line, cross to the
-        # clean lane one spacing outside the stroke span, come home along
-        # it, then step onto the start point.
-        if spacing > 0.0:
-            append_move(spacing, 0.0, off_color)
-            append_move(0.0, -(current_v + spacing), off_color)
-            append_move(-current_a, 0.0, off_color)
-            append_move(0.0, -current_v, off_color)
-        else:
-            append_move(-current_a, -current_v, off_color)
+        # Ends at the near line's start-corner end: straight home along the
+        # clearance lane (later lines were printed closer, so the route
+        # never crosses a wet stroke).
+        append_move(-current_a, -current_v, off_color)
     return moves
 
 

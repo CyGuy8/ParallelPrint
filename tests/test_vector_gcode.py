@@ -242,26 +242,33 @@ def test_lead_in_line_direction_can_run_across_the_approach(tmp_path) -> None:
     )
     moves = _moves_with_colors(gcode_path.read_text())
 
-    # The purge patch sits BELOW the shape with HORIZONTAL strokes: the
-    # first travel drops straight to y = -clearance, and every purge stroke
-    # runs in X only, stepping half a fil further down between strokes.
-    assert moves[0]["end"] == (0.0, -4.0, 0.0)
+    # The purge patch sits BELOW the shape with HORIZONTAL strokes. The
+    # FARTHEST row prints first and every next stroke steps back TOWARD the
+    # shape, so the purge finishes on the nearest row: the first travel
+    # drops to the farthest row y = -(clearance + spacing*(lines-1)).
+    assert moves[0]["end"] == (0.0, -5.0, 0.0)
     home_index = next(i for i, m in enumerate(moves[1:], start=1) if m["end"] == (0.0, 0.0, 0.0))
     lead_prints = [m for m in moves[:home_index] if m["color"] == 255]
     assert len(lead_prints) == 3
     assert all(abs(m["end"][1] - m["start"][1]) < 1e-9 for m in lead_prints)  # horizontal
     assert all(abs(abs(m["end"][0] - m["start"][0]) - 3.0) < 1e-9 for m in lead_prints)
-    stroke_rows = sorted(m["start"][1] for m in lead_prints)
-    assert stroke_rows == [-5.0, -4.5, -4.0]  # stepping AWAY from the shape
+    # Farthest first, stepping toward the shape.
+    assert [round(m["start"][1], 6) for m in lead_prints] == [-5.0, -4.5, -4.0]
+    # The odd line count starts the zigzag from the far end, so the LAST
+    # stroke lands on the corner nearest the toolpath start — the return is
+    # one short straight travel home through the clearance lane.
+    assert lead_prints[-1]["end"] == (0.0, -4.0, 0.0)
+    assert moves[home_index]["start"] == (0.0, -4.0, 0.0)
 
-    # The return route comes home without re-crossing a wet stroke row:
-    # travels between strokes' rows happen only beyond the patch or on the
-    # clean lane outside the stroke span (x < 0).
-    for travel in [m for m in moves[1:home_index] if m["color"] == 0]:
-        y0, y1 = travel["start"][1], travel["end"][1]
-        x0, x1 = travel["start"][0], travel["end"][0]
-        if abs(y1 - y0) < 1e-9 and abs(x1 - x0) > 1e-9 and y0 in stroke_rows:
-            # Horizontal travel on a wet row must be a stroke, not a travel.
+    # No travel drags along a row that has ALREADY been printed.
+    wet_rows: list[float] = []
+    for move in moves[1:home_index]:
+        if move["color"] == 255:
+            wet_rows.append(round(move["start"][1], 6))
+            continue
+        y0, y1 = move["start"][1], move["end"][1]
+        x0, x1 = move["start"][0], move["end"][0]
+        if abs(y1 - y0) < 1e-9 and abs(x1 - x0) > 1e-9 and round(y0, 6) in wet_rows:
             raise AssertionError(f"travel drags along wet row y={y0}")
 
 
@@ -372,24 +379,22 @@ def test_gcode_lead_in_runs_once_before_first_layer(tmp_path) -> None:
 
     moves = _moves_with_colors(gcode_path.read_text())
 
-    assert moves[:9] == [
+    assert moves[:7] == [
         {"start": (0.0, 0.0, 0.0), "end": (-7.0, 0.0, 0.0), "color": 0},
         {"start": (-7.0, 0.0, 0.0), "end": (-4.0, 0.0, 0.0), "color": 255},
         {"start": (-4.0, 0.0, 0.0), "end": (-4.0, 0.5, 0.0), "color": 0},
         {"start": (-4.0, 0.5, 0.0), "end": (-7.0, 0.5, 0.0), "color": 255},
         {"start": (-7.0, 0.5, 0.0), "end": (-7.0, 1.0, 0.0), "color": 0},
         {"start": (-7.0, 1.0, 0.0), "end": (-4.0, 1.0, 0.0), "color": 255},
-        # Return route: exit the patch one spacing to the outside, travel
-        # home through the clearance lane, then step onto the start point —
-        # never dragging the primed nozzle back across the purge lines.
-        {"start": (-4.0, 1.0, 0.0), "end": (-4.0, -0.5, 0.0), "color": 0},
-        {"start": (-4.0, -0.5, 0.0), "end": (0.0, -0.5, 0.0), "color": 0},
-        {"start": (0.0, -0.5, 0.0), "end": (0.0, 0.0, 0.0), "color": 0},
+        # The last stroke ends on the clearance line; the return is one
+        # straight travel home through the clearance lane (all strokes sit
+        # beyond it, so nothing wet is crossed).
+        {"start": (-4.0, 1.0, 0.0), "end": (0.0, 0.0, 0.0), "color": 0},
     ]
-    assert all(move["end"][2] == 0.0 for move in moves[:9])
+    assert all(move["end"][2] == 0.0 for move in moves[:7])
 
     first_z_index = next(index for index, move in enumerate(moves) if move["end"][2] > 0.0)
-    assert first_z_index > 9
+    assert first_z_index > 7
     assert not any(
         move["start"][0] < -3.0 or move["end"][0] < -3.0
         for move in moves[first_z_index:]
@@ -416,18 +421,20 @@ def test_gcode_lead_in_direction_points_the_purge_patch(tmp_path) -> None:
     )
 
     moves = _moves_with_colors(gcode_path.read_text())
-    # Patch is ABOVE the start: first travel goes +7 in Y, purge strokes are
-    # vertical and sit in y in [4, 7]; only the half-fil-wide return lane
-    # dips to the negative lateral side.
-    assert moves[0]["end"] == (0.0, 7.0, 0.0)
+    # Patch is ABOVE the start with vertical strokes in y in [4, 7]. The
+    # EVEN line count starts from the near end (first travel = clearance
+    # only) so the second stroke prints back down and lands on the
+    # clearance line — the purge always finishes nearest the start.
+    assert moves[0]["end"] == (0.0, 4.0, 0.0)
     lead_prints = [m for m in moves[:6] if m["color"] == 255]
-    assert lead_prints
+    assert len(lead_prints) == 2
     assert all(abs(m["end"][0] - m["start"][0]) < 1e-9 for m in lead_prints)
     assert all(
         3.9 <= min(m["start"][1], m["end"][1]) and max(m["start"][1], m["end"][1]) <= 7.1
         for m in lead_prints
     )
-    assert all(m["end"][0] >= -0.5 - 1e-9 for m in moves[:9])
+    assert abs(lead_prints[-1]["end"][1] - 4.0) < 1e-9  # ends on the clearance line
+    assert all(abs(m["end"][0]) <= 0.5 + 1e-9 for m in moves[:6])
 
 
 def test_lead_in_opt_out_travels_shared_patch_but_skips_it_solo(tmp_path) -> None:
@@ -486,21 +493,38 @@ def test_gcode_lead_in_return_never_crosses_the_purge_lines(tmp_path) -> None:
             lead_in_lines=lines,
             output_dir=tmp_path / str(lines),
         )
+        from shapely.geometry import LineString
+
         moves = _moves_with_colors(gcode_path.read_text())
         lead_end = next(i for i, m in enumerate(moves) if m["end"] == (0.0, 0.0, 0.0))
+        # Whatever the line count's parity, the purge finishes on the
+        # clearance line and no travel crosses an ALREADY-printed stroke
+        # anywhere but at a shared endpoint.
         prints = [m for m in moves[: lead_end + 1] if m["color"] == 255]
-        travels = [m for m in moves[: lead_end + 1] if m["color"] == 0]
-        # No travel move's interior crosses a printed purge line: every
-        # printed line sits on a lane y = k*0.5, and travels only run along
-        # x = const (lane changes at line ends) or at y = -0.5 / y <= 0.
-        for travel in travels[1:]:
-            y0, y1 = travel["start"][1], travel["end"][1]
-            x0, x1 = travel["start"][0], travel["end"][0]
-            if abs(y1 - y0) < 1e-9 and abs(x1 - x0) > 1e-9:
-                # Horizontal travel: must be outside the printed lanes.
-                assert y0 < -1e-9 or not any(
-                    abs(p["start"][1] - y0) < 1e-9 for p in prints
-                ), (lines, travel)
+        patch_far = min(min(p["start"][0], p["end"][0]) for p in prints)
+        assert abs(patch_far + 7.0) < 1e-9
+        assert prints[-1]["end"][0] == -4.0  # last stroke ends on the clearance line
+
+        wet: list[LineString] = []
+        for move in moves[: lead_end + 1]:
+            if move["color"] == 255:
+                wet.append(LineString([move["start"][:2], move["end"][:2]]))
+                continue
+            travel_line = LineString([move["start"][:2], move["end"][:2]])
+            for stroke in wet:
+                crossing = travel_line.intersection(stroke)
+                if crossing.is_empty:
+                    continue
+                assert crossing.geom_type == "Point", (lines, move)
+                point = (crossing.x, crossing.y)
+                endpoints = [
+                    move["start"][:2], move["end"][:2],
+                    tuple(stroke.coords[0]), tuple(stroke.coords[-1]),
+                ]
+                assert any(
+                    abs(point[0] - ex) < 1e-6 and abs(point[1] - ey) < 1e-6
+                    for ex, ey in endpoints
+                ), (lines, move)
 
 
 def test_gcode_pressure_ramp_can_be_disabled(tmp_path) -> None:
@@ -782,6 +806,43 @@ def test_raster_crosses_interior_holes_with_valve_off(tmp_path) -> None:
         0.0 < move["start"][0] < 7.0 and 0.0 < move["end"][0] < 7.0
         for move in travel_moves
     )
+
+
+def test_spirals_start_printing_at_the_bottom(tmp_path) -> None:
+    layer = box(0.0, 0.0, 6.0, 6.0)
+    stack = _stack(layer, layer, name="spiral_bottom")
+    for pattern in (RASTER_PATTERN_RECTANGULAR_SPIRAL, RASTER_PATTERN_CIRCLE_SPIRAL):
+        tag = pattern.replace(" ", "_")
+        path = generate_vector_gcode(
+            stack,
+            shape_name=f"start_{tag}",
+            pressure=25,
+            valve=7,
+            port=3,
+            fil_width=1.0,
+            raster_pattern=pattern,
+            output_dir=tmp_path / tag,
+        )
+        moves = _moves_with_colors(path.read_text())
+        layer0 = [
+            m
+            for m in moves
+            if m["color"] == 255
+            and abs(m["end"][2] - m["start"][2]) < 1e-9
+            and m["start"][2] == 0.0
+        ]
+        assert layer0, pattern
+        min_y = min(min(m["start"][1], m["end"][1]) for m in layer0)
+        first = layer0[0]
+        # Like the other patterns, the spiral starts printing at the BOTTOM
+        # of the shape (within one fil of its lowest printed line) and works
+        # upward — so a below-the-shape lead-in connects directly to the
+        # start of the print.
+        assert min(first["start"][1], first["end"][1]) <= min_y + 1.0 + 1e-6, pattern
+        # The toolpath origin itself (where the lead-in would attach) also
+        # sits at the bottom.
+        origin_y = moves[0]["start"][1]
+        assert origin_y <= min_y + 1.0 + 1e-6, pattern
 
 
 def test_rectangular_spiral_polyline_reverses_center_to_edge() -> None:
