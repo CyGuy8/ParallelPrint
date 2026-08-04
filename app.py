@@ -650,13 +650,15 @@ APP_HEAD = """
         var entries = [];
         Array.prototype.slice.call(container.querySelectorAll('table tbody tr')).forEach(function (tr) {
             var tds = tr.querySelectorAll('td');
-            tr.style.display = '';
             for (var i = 0; i < tds.length; i++) {
                 tds[i].style.background = '';
                 if (i === 0 || i === PRESSURE_COL || i === PORT_COL) tds[i].style.boxShadow = '';
                 if (i === VALVE_COL || i === PRESSURE_COL || i === PORT_COL) tds[i].removeAttribute('title');
             }
             tr.removeAttribute('title');
+            // Visibility is decided ONCE at the end of the pass (below) —
+            // never blanket-unhidden here: a mid-render pass whose live twin
+            // is momentarily absent must not repaint a hidden ghost.
             if (tds.length < COLUMNS) return;
             var idx = cellNumber(tds[0]);
             if (idx === null) return;
@@ -684,13 +686,13 @@ APP_HEAD = """
             entry.copies.push({tr: tr, tds: tds, live: fromLive});
         });
         // Ghost pass: when a Shape number has a LIVE row, any stale copy of
-        // it in the outer table is a render leftover — hide it entirely.
-        // (Shape numbers with no live row are left alone: hiding on a guess
-        // could blank a legitimately rendered table.)
+        // it in the outer table is a render leftover — hide it; every other
+        // recognized row is explicitly shown (it may have been a ghost in a
+        // previous render). Unrecognized rows keep their current state.
         entries.forEach(function (entry) {
-            if (!entry.fromLive) return;
             entry.copies.forEach(function (copy) {
-                if (!copy.live) copy.tr.style.display = 'none';
+                var hide = entry.fromLive && !copy.live;
+                copy.tr.style.display = hide ? 'none' : '';
             });
         });
         var byNozzle = {}, byValve = {}, byPort = {};
@@ -787,7 +789,17 @@ APP_HEAD = """
         // container node when it hydrates, which would orphan the observer.
         // Style writes are attribute mutations and the note rewrite is
         // guarded, so observing childList/characterData cannot loop.
-        new MutationObserver(schedule).observe(document.body, {childList: true, subtree: true, characterData: true});
+        new MutationObserver(function () {
+            // Refresh SYNCHRONOUSLY: observer callbacks are microtasks that
+            // run BEFORE the browser paints the mutations that fired them,
+            // so ghost rows are hidden and group tints applied pre-paint —
+            // a table re-render never visibly flashes duplicated/unstyled
+            // rows. (A delayed pass here made every table write-back blink
+            // for ~50 ms.) The trailing debounced pass still runs to catch
+            // whatever an in-flight render finishes after this batch.
+            refresh();
+            schedule();
+        }).observe(document.body, {childList: true, subtree: true, characterData: true});
         schedule();
     }
     if (document.readyState === 'loading') {
