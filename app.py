@@ -1998,6 +1998,21 @@ def _record_rotation(record: dict) -> tuple[float, float, float]:
     return tuple(round(value, 1) for value in values)
 
 
+def _rotation_matrix(rotation: tuple[float, float, float]) -> np.ndarray:
+    """4x4 matrix of a shape rotation (X, then Y, then Z degrees, about the
+    origin) — matching `rotate_mesh`'s composition order. Rotation matrices
+    invert by transposition, which is how the rotation DELTA between two
+    stored rotations is computed."""
+    matrix = np.eye(4)
+    for angle, axis in zip(rotation, ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))):
+        if abs(angle) < 1e-9:
+            continue
+        matrix = (
+            trimesh.transformations.rotation_matrix(math.radians(angle), axis) @ matrix
+        )
+    return matrix
+
+
 def _rotated_display_stl(stl_path: str, rotation: tuple[float, float, float]) -> str:
     """A temp STL of the rotated mesh, so the 3D preview shows the shape the
     way it will actually print."""
@@ -3394,46 +3409,69 @@ def normalize_shape_dimensions_for_mode(
             continue
         idx = int(copy.get("idx", 0))
 
-        # Anchor on the row's own evidence: in a proportional row all three
-        # target/original ratios agree; a user edit makes exactly one ratio
-        # the odd one out. This is ORDER-INDEPENDENT — the .change event
-        # storm delivers stale/echoed tables whose rows are self-consistent,
-        # and those must recompute to themselves (skip) instead of being
-        # diffed against fresher records, mis-anchored, and reverted.
-        ratios = targets / originals
+        def _recomputed_from(anchor_index: int) -> tuple[float, float, float]:
+            scale = float(targets[anchor_index] / originals[anchor_index])
+            scaled = originals * scale
+            values = [round(float(value), 1) for value in scaled]
+            # The anchor keeps the ENTERED value exactly (float noise in the
+            # round trip must never nudge it).
+            values[anchor_index] = round(float(targets[anchor_index]), 1)
+            return tuple(values)
 
-        def _close(a: float, b: float) -> bool:
-            return math.isclose(float(a), float(b), rel_tol=1e-6, abs_tol=1e-9)
+        def _self_consistent(anchor_index: int) -> bool:
+            return all(
+                math.isclose(value, float(targets[axis]), abs_tol=1e-9)
+                for axis, value in enumerate(_recomputed_from(anchor_index))
+            )
 
-        if _close(ratios[0], ratios[1]) and _close(ratios[1], ratios[2]):
-            # Already proportional (a pristine row or an echo of our own
-            # write-back): nothing to recompute.
-            if idx in edited_axes:
-                copy["last_scaled_axis"] = edited_axes[idx]
-            normalized.append(copy)
-            continue
-        # others_agree[i] means the OTHER two ratios agree -> axis i was edited.
-        others_agree = [
-            _close(ratios[1], ratios[2]),
-            _close(ratios[0], ratios[2]),
-            _close(ratios[0], ratios[1]),
-        ]
-        if sum(others_agree) == 1:
-            anchor_index = others_agree.index(True)
+        edited_key = edited_axes.get(idx)
+        if edited_key in TARGET_DIMENSION_KEYS:
+            # A FRESH user edit anchors on the edited axis, full stop. The
+            # ratio heuristic below can misfire on rounded rows — e.g. equal
+            # X/Y originals agree with each other, and a small axis whose
+            # rounded value lands back on its original reads as ratio 1.0 —
+            # and would rewrite the value the user just typed.
+            anchor_index = TARGET_DIMENSION_KEYS.index(edited_key)
         else:
-            # All three differ (e.g. custom dims from Independent mode):
-            # fall back to the detected edit, then the last anchor.
-            anchor_key = edited_axes.get(idx) or copy.get("last_scaled_axis") or "target_x"
-            try:
-                anchor_index = TARGET_DIMENSION_KEYS.index(str(anchor_key))
-            except ValueError:
-                anchor_index = 0
-        scale = float(targets[anchor_index] / originals[anchor_index])
+            # No fresh edit: an echo of our own write-back, or a stale
+            # table. Tenths rounding makes exact proportionality impossible,
+            # so "converged" means the row RECOMPUTES TO ITSELF from its
+            # last anchor — skip the write entirely. This is
+            # ORDER-INDEPENDENT: stale/echoed tables are self-consistent
+            # and never get mis-anchored against fresher records.
+            last_key = str(copy.get("last_scaled_axis") or "target_x")
+            last_index = (
+                TARGET_DIMENSION_KEYS.index(last_key)
+                if last_key in TARGET_DIMENSION_KEYS
+                else 0
+            )
+            if _self_consistent(last_index):
+                normalized.append(copy)
+                continue
+
+            # Not self-consistent (e.g. dims carried over from Independent
+            # mode, or an import): anchor on the row's own evidence — the
+            # axis whose OTHER two ratios agree is the edited one.
+            ratios = targets / originals
+
+            def _close(a: float, b: float) -> bool:
+                return math.isclose(float(a), float(b), rel_tol=1e-6, abs_tol=1e-9)
+
+            others_agree = [
+                _close(ratios[1], ratios[2]),
+                _close(ratios[0], ratios[2]),
+                _close(ratios[0], ratios[1]),
+            ]
+            if sum(others_agree) == 1:
+                anchor_index = others_agree.index(True)
+            else:
+                anchor_index = last_index
+
         copy["last_scaled_axis"] = TARGET_DIMENSION_KEYS[anchor_index]
-        scaled = originals * scale
-        copy["target_x"] = round(float(scaled[0]), 1)
-        copy["target_y"] = round(float(scaled[1]), 1)
-        copy["target_z"] = round(float(scaled[2]), 1)
+        new_x, new_y, new_z = _recomputed_from(anchor_index)
+        copy["target_x"] = new_x
+        copy["target_y"] = new_y
+        copy["target_z"] = new_z
         recomputed_idx.add(idx)
         normalized.append(copy)
 
@@ -3522,37 +3560,141 @@ def apply_shape_rotation(
             "shape, then split again.",
         )
 
-    rotation = tuple(
-        round(_coerce_float(value, 0.0) % 360.0, 1)
-        for value in (rotate_x, rotate_y, rotate_z)
-    )
-    try:
-        extents = tuple(
-            float(value)
-            for value in rotate_mesh(load_mesh(record["stl_path"]), rotation).extents
-        )
-    except Exception as exc:
-        return records, _shape_settings_rows(records), f"Rotation failed: {exc}"
+    rotation = _normalize_rotation_input(rotate_x, rotate_y, rotate_z)
+    error = _apply_rotation_to_record(record, rotation)
+    if error:
+        return records, _shape_settings_rows(records), f"Rotation failed: {error}"
 
-    record["rotation"] = rotation if any(rotation) else None
-    for axis, extent in zip(("x", "y", "z"), extents):
-        record[f"original_{axis}"] = round(extent, 1)
-        record[f"target_{axis}"] = round(extent, 1)
-
-    dims = " x ".join(f"{round(extent, 1):g}" for extent in extents)
+    dims = _record_dims_text(record)
     if any(rotation):
-        if rotation[0] or rotation[1]:
-            angle_text = f"X {rotation[0]:g}°, Y {rotation[1]:g}°, Z {rotation[2]:g}°"
-        else:
-            angle_text = f"{rotation[2]:g}°"
         status = (
-            f"Rotated {name} to {angle_text}. "
-            f"Dimensions reset to the rotated size ({dims} mm) — edit them as needed; "
+            f"Rotated {name} to {_rotation_angle_text(rotation)}. "
+            f"Dimensions follow the rotation ({dims} mm) — edit them as needed; "
             "the next Generate G-Code (or split) slices the rotated shape."
         )
     else:
-        status = f"Rotation cleared for {name}; dimensions reset to {dims} mm."
+        status = f"Rotation cleared for {name}; dimensions follow back to {dims} mm."
     return records, _shape_settings_rows(records), status
+
+
+def _normalize_rotation_input(
+    rotate_x: Any, rotate_y: Any, rotate_z: Any
+) -> tuple[float, float, float]:
+    return tuple(
+        round(_coerce_float(value, 0.0) % 360.0, 1)
+        for value in (rotate_x, rotate_y, rotate_z)
+    )
+
+
+def _rotation_angle_text(rotation: tuple[float, float, float]) -> str:
+    if rotation[0] or rotation[1]:
+        return f"X {rotation[0]:g}°, Y {rotation[1]:g}°, Z {rotation[2]:g}°"
+    return f"{rotation[2]:g}°"
+
+
+def _record_dims_text(record: dict) -> str:
+    return " x ".join(
+        f"{round(_coerce_float(record.get(f'target_{axis}'), 0.0), 1):g}"
+        for axis in ("x", "y", "z")
+    )
+
+
+def _apply_rotation_to_record(
+    record: dict, rotation: tuple[float, float, float]
+) -> str | None:
+    """Set one shape's rotation in place; returns an error message or None.
+
+    Carries the CONFIGURED dimensions through the rotation: the shape as it
+    is set up today is reoriented by the rotation DELTA and its new bounding
+    box becomes the targets — a spun 20 x 8 shape becomes 8 x 20, it does
+    not snap back to its natural size. Originals stay the NATURAL rotated
+    size (the ratio basis for Keep Proportions).
+    """
+    old_rotation = _record_rotation(record)
+    try:
+        raw_mesh = load_mesh(record["stl_path"])
+        old_rotated = rotate_mesh(raw_mesh, old_rotation)
+        old_extents = tuple(float(value) for value in old_rotated.extents)
+        natural = tuple(
+            float(value) for value in rotate_mesh(raw_mesh, rotation).extents
+        )
+        factors = tuple(
+            (
+                _coerce_float(record.get(f"target_{axis}"), extent) / extent
+                if extent > 1e-9
+                else 1.0
+            )
+            for axis, extent in zip(("x", "y", "z"), old_extents)
+        )
+        carried_mesh = scale_mesh(old_rotated, factors)
+        delta = _rotation_matrix(rotation) @ _rotation_matrix(old_rotation).T
+        carried_mesh.apply_transform(delta)
+        carried = tuple(float(value) for value in carried_mesh.extents)
+    except Exception as exc:
+        return str(exc)
+
+    record["rotation"] = rotation if any(rotation) else None
+    for axis, natural_extent, carried_extent in zip(("x", "y", "z"), natural, carried):
+        record[f"original_{axis}"] = round(natural_extent, 1)
+        record[f"target_{axis}"] = round(carried_extent, 1)
+    return None
+
+
+def apply_all_shapes_rotation(
+    records: list[dict] | None,
+    settings_table: Any,
+    rotate_x: Any,
+    rotate_y: Any,
+    rotate_z: Any,
+) -> tuple:
+    """Set the SAME rotation on every uploaded shape at once.
+
+    The angle is absolute (like the single-shape apply): every shape's
+    rotation becomes exactly the entered value, each carrying its own
+    configured dimensions through the turn. Split pieces are derived
+    geometry and are skipped with a note.
+    """
+    records = _apply_shape_settings(records or [], settings_table)
+    if not records:
+        return records, _shape_settings_rows(records), "Load shapes before rotating."
+
+    rotation = _normalize_rotation_input(rotate_x, rotate_y, rotate_z)
+    rotated_count = 0
+    skipped_pieces = 0
+    errors: list[str] = []
+    for record in records:
+        if not record.get("stl_path"):
+            skipped_pieces += 1
+            continue
+        error = _apply_rotation_to_record(record, rotation)
+        if error:
+            errors.append(f"Shape {record.get('idx')}: {error}")
+        else:
+            rotated_count += 1
+
+    if any(rotation):
+        status = (
+            f"Rotated {rotated_count} shape(s) to {_rotation_angle_text(rotation)}. "
+            "Every shape's dimensions follow its rotation; the next Generate "
+            "G-Code (or split) slices the rotated shapes."
+        )
+    else:
+        status = f"Rotation cleared for {rotated_count} shape(s)."
+    if skipped_pieces:
+        status += (
+            f"  \n{skipped_pieces} split piece(s) skipped — rotate before "
+            "splitting, or re-split after rotating."
+        )
+    if errors:
+        status += "  \n" + "  \n".join(errors)
+    return records, _shape_settings_rows(records), status
+
+
+def apply_all_shapes_z_rotation(
+    records: list[dict] | None, settings_table: Any, angle: Any
+) -> tuple:
+    """UI entry point: spin EVERY shape on the bed by the same angle."""
+    return apply_all_shapes_rotation(records, settings_table, 0.0, 0.0, angle)
 
 
 def apply_shape_z_rotation(
@@ -5420,7 +5562,11 @@ def build_dynamic_demo() -> gr.Blocks:
                         "Apply Rotation", variant="secondary", size="sm",
                         min_width=140, scale=1,
                     )
-                    gr.HTML("", scale=3)
+                    rotate_all_button = gr.Button(
+                        "Rotate All Shapes", variant="secondary", size="sm",
+                        min_width=150, scale=1,
+                    )
+                    gr.HTML("", scale=2)
                 rotation_status = gr.Markdown("")
 
                 with gr.Row():
@@ -5941,6 +6087,24 @@ def build_dynamic_demo() -> gr.Blocks:
         apply_rotation_button.click(
             fn=apply_shape_z_rotation,
             inputs=[shape_records, selected_shape, shape_settings, rotate_input],
+            outputs=[shape_records, shape_settings, rotation_status],
+        ).then(
+            fn=show_selected_model,
+            inputs=preview_inputs,
+            outputs=[model_viewer, model_details],
+        ).then(
+            fn=update_layer_preview,
+            inputs=layer_preview_inputs,
+            outputs=layer_preview_outputs,
+        ).then(
+            fn=check_gcode_staleness,
+            inputs=stale_inputs,
+            outputs=[gcode_stale_banner],
+            queue=False,
+        )
+        rotate_all_button.click(
+            fn=apply_all_shapes_z_rotation,
+            inputs=[shape_records, shape_settings, rotate_input],
             outputs=[shape_records, shape_settings, rotation_status],
         ).then(
             fn=show_selected_model,

@@ -1249,6 +1249,46 @@ def test_keep_proportions_is_stale_echo_proof() -> None:
     assert updated3[0]["target_z"] == 43.3
 
 
+def test_keep_proportions_preserves_the_entered_value_despite_rounding() -> None:
+    # User scenario: a round shape whose X/Y originals are EQUAL and whose
+    # small axis rounds back onto its own original (12.4 * 25/25.1 -> 12.4).
+    # On the echo round the odd-one-out heuristic then saw X/Y agreeing and
+    # anchored on the small axis (ratio 1.0), rewriting the typed 25 back to
+    # 25.1. A fresh edit must anchor on the edited axis, and the echo must
+    # recognize the row as converged (recomputes to itself from its anchor).
+    def _record() -> dict:
+        return {
+            "idx": 1, "name": "sphere", "stl_path": "sphere.stl",
+            "original_x": 25.1, "original_y": 25.1, "original_z": 12.4,
+            "target_x": 25.1, "target_y": 25.1, "target_z": 12.4,
+            "pressure": 25.0, "valve": 4, "nozzle": 1, "port": 1,
+            "color": "#111111", "last_scaled_axis": "target_x",
+        }
+
+    records = [_record()]
+    rows = _shape_settings_rows(records)
+    rows[0][2] = 25.0  # the user types 25 into X
+    updated, table_out = normalize_shape_dimensions_for_mode(
+        records, rows, SCALE_MODE_UNIFORM_FACTOR
+    )
+    assert (updated[0]["target_x"], updated[0]["target_y"], updated[0]["target_z"]) == (
+        25.0, 25.0, 12.4,
+    )
+    assert isinstance(table_out, list)
+
+    # The echo of our own write-back must be a converged no-op — the typed
+    # value stays 25.0 forever, on every echo.
+    for _ in range(3):
+        echo_rows = _shape_settings_rows(updated)
+        updated, table_out = normalize_shape_dimensions_for_mode(
+            updated, echo_rows, SCALE_MODE_UNIFORM_FACTOR
+        )
+        assert (updated[0]["target_x"], updated[0]["target_y"], updated[0]["target_z"]) == (
+            25.0, 25.0, 12.4,
+        )
+        assert not isinstance(table_out, list)
+
+
 def _mm_member(idx: int, nozzle: int, ox: float, oy: float, oz: float) -> dict:
     return {
         "idx": idx, "name": f"part{idx}", "stl_path": f"part{idx}.stl",
@@ -1806,6 +1846,58 @@ def test_apply_shape_rotation_updates_dims_and_reslices(tmp_path) -> None:
     assert "90°" in spun_status and "X " not in spun_status.split(".")[0]
     assert (spun[0]["target_x"], spun[0]["target_y"], spun[0]["target_z"]) == (4.0, 10.0, 2.0)
     assert selected_shape_z_rotation(spun, None) == 90.0
+
+    # CUSTOM dimensions survive rotation: scale the spun bar to 8 x 20 x 4,
+    # rotate back to 0° — the dims follow the spin to 20 x 8 x 4 instead of
+    # snapping back to the natural 10 x 4 x 2 (originals stay natural, they
+    # are the Keep Proportions ratio basis).
+    spun[0]["target_x"], spun[0]["target_y"], spun[0]["target_z"] = 8.0, 20.0, 4.0
+    unspun, _rows, _unspun_status = apply_shape_z_rotation(spun, None, None, 0)
+    assert (unspun[0]["target_x"], unspun[0]["target_y"], unspun[0]["target_z"]) == (20.0, 8.0, 4.0)
+    assert (unspun[0]["original_x"], unspun[0]["original_y"], unspun[0]["original_z"]) == (10.0, 4.0, 2.0)
+    respun, _rows, _respun_status = apply_shape_z_rotation(unspun, None, None, 90)
+    assert (respun[0]["target_x"], respun[0]["target_y"], respun[0]["target_z"]) == (8.0, 20.0, 4.0)
+    assert (respun[0]["original_x"], respun[0]["original_y"], respun[0]["original_z"]) == (4.0, 10.0, 2.0)
+
+
+def test_rotate_all_shapes_at_once(tmp_path) -> None:
+    import trimesh
+
+    from app import apply_all_shapes_z_rotation
+
+    for name, extents in (("bar", (10.0, 4.0, 2.0)), ("slab", (6.0, 2.0, 1.0))):
+        trimesh.creation.box(extents=extents).export(tmp_path / f"{name}.stl")
+
+    records = _records_from_files(
+        [str(tmp_path / "bar.stl"), str(tmp_path / "slab.stl")], None
+    )
+    # The bar carries custom dimensions; the slab stays natural. A split
+    # piece (no stl_path) rides along and must be skipped.
+    records[0]["target_x"], records[0]["target_y"] = 20.0, 8.0
+    records.append({
+        "idx": 3, "name": "piece", "stl_path": None, "nozzle": 3,
+        "split_group_id": "split-a", "split_index": 0,
+        "target_x": 5.0, "target_y": 5.0, "target_z": 2.0,
+    })
+
+    updated, rows, status = apply_all_shapes_z_rotation(records, None, 90)
+
+    assert "Rotated 2 shape(s) to 90°" in status
+    assert "1 split piece(s) skipped" in status
+    assert updated[0]["rotation"] == (0.0, 0.0, 90.0)
+    assert updated[1]["rotation"] == (0.0, 0.0, 90.0)
+    # Custom dims follow the spin; natural dims swap to the rotated bbox.
+    assert (updated[0]["target_x"], updated[0]["target_y"], updated[0]["target_z"]) == (8.0, 20.0, 2.0)
+    assert (updated[1]["target_x"], updated[1]["target_y"], updated[1]["target_z"]) == (2.0, 6.0, 1.0)
+    # The split piece is untouched.
+    assert updated[2].get("rotation") is None
+    assert updated[2]["target_x"] == 5.0
+
+    # Clearing restores every shape's configured dims.
+    cleared, _rows, cleared_status = apply_all_shapes_z_rotation(updated, None, 0)
+    assert "Rotation cleared for 2 shape(s)" in cleared_status
+    assert (cleared[0]["target_x"], cleared[0]["target_y"]) == (20.0, 8.0)
+    assert (cleared[1]["target_x"], cleared[1]["target_y"]) == (6.0, 2.0)
 
 
 def test_project_settings_export_import_round_trip(tmp_path) -> None:
