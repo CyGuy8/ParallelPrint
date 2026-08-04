@@ -634,7 +634,23 @@ APP_HEAD = """
         return isNaN(value) ? null : Math.round(value);
     }
     function cellName(td) {
-        return ((td && td.textContent) || '').replace(/\\u22ee/g, '').trim();
+        // Strip the cell-menu glyph and the display-only leading rotation
+        // marker ("↻90° name").
+        return ((td && td.textContent) || '').replace(/\\u22ee/g, '').trim().replace(/^\\u21bb\\S*\\s*/, '');
+    }
+    function hideStaleCopies(containerId) {
+        // Gradio renders each dataframe TWICE (a button-wrapped live copy
+        // plus an outer copy that can hold stale leftover rows). When ANY
+        // live rows exist, every outer row is a render leftover — hide it.
+        var container = document.getElementById(containerId);
+        if (!container) return;
+        var rows = Array.prototype.slice.call(container.querySelectorAll('table tbody tr'));
+        var anyLive = rows.some(function (tr) { return tr.querySelector('td') && tr.closest('button'); });
+        rows.forEach(function (tr) {
+            if (!tr.querySelector('td')) return;
+            var live = !!tr.closest('button');
+            tr.style.display = (anyLive && !live) ? 'none' : '';
+        });
     }
     function refresh() {
         var container = document.getElementById('shape-settings-table');
@@ -685,16 +701,19 @@ APP_HEAD = """
             }
             entry.copies.push({tr: tr, tds: tds, live: fromLive});
         });
-        // Ghost pass: when a Shape number has a LIVE row, any stale copy of
-        // it in the outer table is a render leftover — hide it; every other
-        // recognized row is explicitly shown (it may have been a ghost in a
-        // previous render). Unrecognized rows keep their current state.
+        // Ghost pass: when the table has ANY live (button-wrapped) rows,
+        // every outer copy is a render leftover — including stale rows
+        // whose Shape number no longer exists. Only when NO live rows
+        // rendered at all does the outer table stand on its own.
+        var anyLive = entries.some(function (entry) { return entry.fromLive; });
         entries.forEach(function (entry) {
             entry.copies.forEach(function (copy) {
-                var hide = entry.fromLive && !copy.live;
-                copy.tr.style.display = hide ? 'none' : '';
+                copy.tr.style.display = (anyLive && !copy.live) ? 'none' : '';
             });
         });
+        // The Advanced Grid Spacing table has the same double render (and
+        // showed stale self-paired rows); same rule, no styling needed.
+        hideStaleCopies('nozzle-grid-spacing-table');
         var byNozzle = {}, byValve = {}, byPort = {};
         entries.forEach(function (entry) {
             if (entry.nozzle !== null) (byNozzle[entry.nozzle] = byNozzle[entry.nozzle] || []).push(entry);
@@ -2196,11 +2215,61 @@ def _round_targets_to_tenths(record: dict) -> dict:
     return record
 
 
+def _display_shape_name(record: dict) -> str:
+    """The STL cell text: a leading rotation marker (a single compact token,
+    e.g. "↻90°") in front of the name, so a rotated shape is recognizable at
+    a glance straight from the table."""
+    name = str(record.get("name") or "")
+    rotation = _record_rotation(record)
+    if not any(rotation):
+        return name
+    if rotation[0] or rotation[1]:
+        marker = f"↻X{rotation[0]:g}°Y{rotation[1]:g}°Z{rotation[2]:g}°"
+    else:
+        marker = f"↻{rotation[2]:g}°"
+    return f"{marker} {name}"
+
+
+def _strip_rotation_marker(name: str) -> str:
+    """Remove the display-only leading rotation marker before storing a name."""
+    text = name.strip()
+    if text.startswith("↻"):
+        parts = text.split(None, 1)
+        if len(parts) == 2:
+            return parts[1]
+    return name
+
+
+def _split_numbering_defaults(records: list[dict] | None) -> tuple[dict, dict]:
+    """Collision-free Starting Nozzle / Starting Valve for the split panel.
+
+    Splitting assigns a RUN of sequential numbers from the starting values,
+    so the defaults sit past every number in use — otherwise a default
+    split silently lands pieces on other shapes' nozzles (accidentally
+    forming multi-material assemblies) and reuses their valves.
+    """
+    records = records or []
+    nozzles = [
+        _record_nozzle_number(record, int(record.get("idx", position) or position))
+        for position, record in enumerate(records, start=1)
+    ]
+    valves = [_coerce_int(record.get("valve"), 0) for record in records]
+    next_nozzle = (max(nozzles) + 1) if nozzles else 1
+    next_valve = max([valve for valve in valves if valve > 0] + [3]) + 1
+    return gr.update(value=next_nozzle), gr.update(value=next_valve)
+
+
+def refresh_split_sources(records: list[dict] | None) -> tuple:
+    """Split panel refresh: source dropdown + collision-free numbering."""
+    nozzle_update, valve_update = _split_numbering_defaults(records)
+    return _dropdown_update(records), nozzle_update, valve_update
+
+
 def _shape_settings_rows(records: list[dict]) -> list[list[Any]]:
     return [
         [
             record["idx"],
-            record["name"],
+            _display_shape_name(record),
             round(_coerce_float(record.get("target_x"), DEFAULT_TARGET_EXTENTS[0]), 1),
             round(_coerce_float(record.get("target_y"), DEFAULT_TARGET_EXTENTS[1]), 1),
             round(_coerce_float(record.get("target_z"), DEFAULT_TARGET_EXTENTS[2]), 1),
@@ -2233,7 +2302,7 @@ def _apply_shape_settings(records: list[dict], settings_table: Any) -> list[dict
         copy = dict(record)
         row = by_idx.get(int(copy.get("idx", 0)))
         if row:
-            copy["name"] = str(row[1] or copy["name"])
+            copy["name"] = _strip_rotation_marker(str(row[1] or copy["name"]))
             if "original_x" not in copy or "original_y" not in copy or "original_z" not in copy:
                 original_x, original_y, original_z = _default_target_extents_for_stl(str(copy.get("stl_path", "")))
                 copy.setdefault("original_x", original_x)
@@ -4767,6 +4836,12 @@ def export_project_settings(
     lead_in_orientation: str | None,
     nozzle_speed: Any,
     contour_order: str | None = None,
+    split_columns: Any = None,
+    split_rows: Any = None,
+    split_overlapping_layers: Any = None,
+    split_overlapping_rows: Any = None,
+    split_row_overlap_direction: str | None = None,
+    split_overlap: Any = None,
 ) -> tuple[str | None, str]:
     """Write the session's settings to a small JSON file, keyed by STL name.
 
@@ -4804,6 +4879,14 @@ def export_project_settings(
             "lead_in_orientation": str(lead_in_orientation or LEAD_IN_LINE_AUTO),
             "nozzle_speed": _coerce_float(nozzle_speed, 10.0),
             "contour_order": str(contour_order or CONTOUR_ORDER_LAST),
+            "split_columns": max(1, _coerce_int(split_columns, 2)),
+            "split_rows": max(1, _coerce_int(split_rows, 1)),
+            "split_overlapping_layers": bool(split_overlapping_layers),
+            "split_overlapping_rows": bool(split_overlapping_rows),
+            "split_row_overlap_direction": str(
+                split_row_overlap_direction or ROW_OVERLAP_AXES_CHOICES[0]
+            ),
+            "split_overlap": _coerce_float(split_overlap, 0.8),
         },
     }
     settings_path = Path(tempfile.mkdtemp(prefix="pp_settings_")) / "parallelprint_settings.json"
@@ -4827,7 +4910,7 @@ def import_project_settings(
     """
 
     def _skip_options() -> tuple:
-        return tuple(gr.skip() for _ in range(13))
+        return tuple(gr.skip() for _ in range(19))
 
     paths = _uploaded_file_paths(settings_upload)
     if not paths:
@@ -4890,6 +4973,12 @@ def import_project_settings(
         option("scale_mode"),
         option("nozzle_speed"),
         option("contour_order"),
+        option("split_columns"),
+        option("split_rows"),
+        option("split_overlapping_layers"),
+        option("split_overlapping_rows"),
+        option("split_row_overlap_direction"),
+        option("split_overlap"),
     )
 
 
@@ -5808,9 +5897,9 @@ def build_dynamic_demo() -> gr.Blocks:
 
         shape_sync_outputs = [shape_records, shape_settings, selected_shape, gcode_text_source, gcode_source, gcode_downloads, gcode_download_all]
         stl_upload.change(fn=sync_uploaded_shapes, inputs=[stl_upload, shape_records, shape_settings], outputs=shape_sync_outputs).then(
-            fn=lambda records: _dropdown_update(records),
+            fn=refresh_split_sources,
             inputs=[shape_records],
-            outputs=[split_source],
+            outputs=[split_source, split_start_nozzle, split_start_valve],
             queue=False,
         ).then(
             fn=_grid_spacing_table_update,
@@ -5819,9 +5908,9 @@ def build_dynamic_demo() -> gr.Blocks:
             queue=False,
         )
         sync_uploads_button.click(fn=sync_uploaded_shapes, inputs=[stl_upload, shape_records, shape_settings], outputs=shape_sync_outputs).then(
-            fn=lambda records: _dropdown_update(records),
+            fn=refresh_split_sources,
             inputs=[shape_records],
-            outputs=[split_source],
+            outputs=[split_source, split_start_nozzle, split_start_valve],
             queue=False,
         ).then(
             fn=_grid_spacing_table_update,
@@ -5830,9 +5919,9 @@ def build_dynamic_demo() -> gr.Blocks:
             queue=False,
         )
         load_samples_button.click(fn=load_sample_shapes, inputs=[stl_upload, shape_records, shape_settings, sample_set_selector], outputs=[stl_upload, *shape_sync_outputs]).then(
-            fn=lambda records: _dropdown_update(records),
+            fn=refresh_split_sources,
             inputs=[shape_records],
-            outputs=[split_source],
+            outputs=[split_source, split_start_nozzle, split_start_valve],
             queue=False,
         ).then(
             fn=_grid_spacing_table_update,
@@ -5858,9 +5947,9 @@ def build_dynamic_demo() -> gr.Blocks:
             outputs=[stl_upload, *shape_sync_outputs, last_shape_delete_at],
             queue=False,
         ).then(
-            fn=lambda records: _dropdown_update(records),
+            fn=refresh_split_sources,
             inputs=[shape_records],
-            outputs=[split_source],
+            outputs=[split_source, split_start_nozzle, split_start_valve],
             queue=False,
         ).then(
             fn=_grid_spacing_table_update,
@@ -5916,7 +6005,7 @@ def build_dynamic_demo() -> gr.Blocks:
             outputs=[model_viewer, model_details],
         )
 
-        split_refresh_sources.click(fn=lambda records: _dropdown_update(records), inputs=[shape_records], outputs=[split_source], queue=False)
+        split_refresh_sources.click(fn=refresh_split_sources, inputs=[shape_records], outputs=[split_source, split_start_nozzle, split_start_valve], queue=False)
         # .input (user selections only): programmatic dropdown refills after a
         # split must not overwrite the split result message.
         split_source.input(
@@ -5969,6 +6058,13 @@ def build_dynamic_demo() -> gr.Blocks:
             inputs=grid_spacing_refresh_inputs,
             outputs=[nozzle_grid_spacing_table],
             queue=False,
+        ).then(
+            # Fresh pieces claimed a run of nozzles/valves: bump the split
+            # defaults past them so a SECOND split cannot collide either.
+            fn=lambda records: _split_numbering_defaults(records),
+            inputs=[shape_records],
+            outputs=[split_start_nozzle, split_start_valve],
+            queue=False,
         )
         split_undo_button.click(
             fn=undo_last_split,
@@ -5998,6 +6094,11 @@ def build_dynamic_demo() -> gr.Blocks:
             inputs=grid_spacing_refresh_inputs,
             outputs=[nozzle_grid_spacing_table],
             queue=False,
+        ).then(
+            fn=lambda records: _split_numbering_defaults(records),
+            inputs=[shape_records],
+            outputs=[split_start_nozzle, split_start_valve],
+            queue=False,
         )
         assign_valves_button.click(
             fn=assign_unique_valves,
@@ -6023,6 +6124,12 @@ def build_dynamic_demo() -> gr.Blocks:
                 gcode_lead_in_orientation,
                 viz_nozzle_speed,
                 gcode_contour_order,
+                split_columns,
+                split_rows,
+                split_overlapping_layers,
+                split_overlapping_rows,
+                split_row_overlap_direction,
+                split_overlap,
             ],
             outputs=[settings_export_file, settings_status],
             queue=False,
@@ -6047,6 +6154,12 @@ def build_dynamic_demo() -> gr.Blocks:
                 scale_mode,
                 viz_nozzle_speed,
                 gcode_contour_order,
+                split_columns,
+                split_rows,
+                split_overlapping_layers,
+                split_overlapping_rows,
+                split_row_overlap_direction,
+                split_overlap,
             ],
         )
 
@@ -6190,9 +6303,9 @@ def build_dynamic_demo() -> gr.Blocks:
             inputs=layer_preview_inputs,
             outputs=layer_preview_outputs,
         ).then(
-            fn=lambda records: _dropdown_update(records),
+            fn=refresh_split_sources,
             inputs=[shape_records],
-            outputs=[split_source],
+            outputs=[split_source, split_start_nozzle, split_start_valve],
             queue=False,
         ).then(
             fn=check_gcode_staleness,

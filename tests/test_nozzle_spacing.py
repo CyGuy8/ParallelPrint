@@ -1860,6 +1860,50 @@ def test_apply_shape_rotation_updates_dims_and_reslices(tmp_path) -> None:
     assert (respun[0]["original_x"], respun[0]["original_y"], respun[0]["original_z"]) == (4.0, 10.0, 2.0)
 
 
+def test_split_numbering_defaults_avoid_collisions() -> None:
+    from app import _split_numbering_defaults
+
+    # Shapes on nozzles 5/2/3 with valves 4/9: the split defaults must sit
+    # PAST every number in use (splits assign sequential runs), otherwise a
+    # default split lands pieces on other shapes' nozzles - silently forming
+    # multi-material assemblies - and reuses their valves.
+    records = [
+        {"idx": 1, "name": "a", "nozzle": 5, "valve": 4},
+        {"idx": 2, "name": "b", "nozzle": 2, "valve": 9},
+        {"idx": 3, "name": "c", "nozzle": 3, "valve": 0},
+    ]
+    nozzle_update, valve_update = _split_numbering_defaults(records)
+    assert nozzle_update["value"] == 6
+    assert valve_update["value"] == 10
+
+    # Empty table: the historical defaults.
+    nozzle_update, valve_update = _split_numbering_defaults([])
+    assert nozzle_update["value"] == 1
+    assert valve_update["value"] == 4
+
+
+def test_rotation_marker_shows_in_table_and_strips_on_read() -> None:
+    from app import _apply_shape_settings, _display_shape_name
+
+    record = {
+        "idx": 1, "name": "bar", "stl_path": "bar.stl",
+        "original_x": 10.0, "original_y": 4.0, "original_z": 2.0,
+        "target_x": 10.0, "target_y": 4.0, "target_z": 2.0,
+        "pressure": 25.0, "valve": 4, "nozzle": 1, "port": 1,
+        "color": "#111111", "rotation": (0.0, 0.0, 90.0),
+    }
+    # The STL cell carries a visible LEADING rotation marker...
+    assert _display_shape_name(record) == "↻90° bar"
+    rows = _shape_settings_rows([record])
+    assert rows[0][1] == "↻90° bar"
+    # ...which is display-only: reading the table back stores the clean name.
+    updated = _apply_shape_settings([record], rows)
+    assert updated[0]["name"] == "bar"
+    # Unrotated shapes show the plain name.
+    record["rotation"] = None
+    assert _display_shape_name(record) == "bar"
+
+
 def test_rotate_all_shapes_at_once(tmp_path) -> None:
     import trimesh
 
@@ -1910,6 +1954,8 @@ def test_project_settings_export_import_round_trip(tmp_path) -> None:
     settings_path, status = export_project_settings(
         records, None, 0.4, 0.4, None, "Circle Spiral raster", False, 1.2,
         6.0, 7.0, 4, "Down", "Horizontal", 15.0,
+        split_columns=3, split_rows=2, split_overlapping_rows=True,
+        split_overlap=1.5,
     )
     assert settings_path and "2 shape(s)" in status
 
@@ -1930,6 +1976,10 @@ def test_project_settings_export_import_round_trip(tmp_path) -> None:
     assert option_updates[2]["value"] == 1.2
     assert option_updates[8]["value"] == 0.4  # layer height
     assert option_updates[11]["value"] == 15.0  # nozzle speed
+    assert option_updates[13]["value"] == 3  # split columns
+    assert option_updates[14]["value"] == 2  # split rows
+    assert option_updates[16]["value"] is True  # overlapping rows
+    assert option_updates[18]["value"] == 1.5  # overlap mm
 
     # A file listed in the export but not loaded is reported.
     partial = import_project_settings([settings_path], _records_from_files(["egg_inside.stl"], None), None)
