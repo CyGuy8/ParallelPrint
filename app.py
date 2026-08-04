@@ -3033,13 +3033,14 @@ def _shape_select_noop() -> tuple:
     lands late); echoing records/rows here raced the dimension normalizer's
     write-back — the stale echo clobbered the recomputed proportions on the
     first Keep Proportions edit and re-rendered the table mid-typing."""
-    return tuple(gr.skip() for _ in range(9))
+    return tuple(gr.skip() for _ in range(10))
 
 
 def delete_shape_from_settings(
     records: list[dict] | None,
     settings_table: Any | None,
     last_delete_at: float | None,
+    undo_stack: list[list[dict]] | None,
     evt: gr.SelectData,
 ) -> tuple:
     now = time.monotonic()
@@ -3067,11 +3068,35 @@ def delete_shape_from_settings(
     next_records = _reindex_shape_records([
         record for record in current_records if int(record.get("idx", 0)) != delete_idx
     ])
+    if len(next_records) == len(current_records):
+        return _shape_select_noop()
+    # Undo stack: every delete pushes the pre-delete records (settings,
+    # slices, and G-code included), capped to the last 10 deletes.
+    next_undo_stack = [
+        *(undo_stack or []),
+        [dict(record) for record in current_records],
+    ][-10:]
     upload_paths = [record.get("stl_path") for record in next_records if record.get("stl_path")]
-    return _shape_delete_outputs(
-        next_records,
-        now,
-        gr.update(value=upload_paths),
+    return (
+        *_shape_delete_outputs(
+            next_records,
+            now,
+            gr.update(value=upload_paths),
+        ),
+        next_undo_stack,
+    )
+
+
+def undo_last_delete(undo_stack: list[list[dict]] | None) -> tuple:
+    """Restore the records from before the most recent delete."""
+    stack = list(undo_stack or [])
+    if not stack:
+        return _shape_select_noop()
+    restored = [dict(record) for record in stack.pop()]
+    upload_paths = [record.get("stl_path") for record in restored if record.get("stl_path")]
+    return (
+        *_shape_delete_outputs(restored, None, gr.update(value=upload_paths)),
+        stack,
     )
 
 
@@ -3655,6 +3680,14 @@ def apply_shape_rotation(
         )
     else:
         status = f"Rotation cleared for {name}; dimensions follow back to {dims} mm."
+    nozzle = _record_nozzle_number(record, int(record.get("idx", pos + 1) or (pos + 1)))
+    group_members = _multi_material_groups(records).get(nozzle)
+    if group_members and len(group_members) > 1:
+        status += (
+            f"  \n{name} is part of the nozzle {nozzle} multi-material assembly: "
+            "rotations turn about the group's combined center, so apply the SAME "
+            "angle to every part to turn the whole assembly as one unit."
+        )
     return records, _shape_settings_rows(records), status
 
 
@@ -3778,6 +3811,40 @@ def apply_all_shapes_z_rotation(
     return apply_all_shapes_rotation(records, settings_table, 0.0, 0.0, angle)
 
 
+def slice_selected_shape_for_preview(
+    records: list[dict] | None,
+    selected: str | None,
+    settings_table: Any,
+    layer_height: float,
+    scale_mode: str | None,
+    progress: gr.Progress = gr.Progress(),
+) -> list[dict]:
+    """Regenerate Preview slices the SELECTED shape on demand (plus its
+    nozzle-group assembly mates, which must share one Z grid) — the layer
+    preview works before any G-code has been generated."""
+    records = _apply_shape_settings(records or [], settings_table)
+    pos = _selected_record_index(records, selected)
+    if pos < 0:
+        return records
+    record = records[pos]
+    if not record.get("stl_path"):
+        return records
+    nozzle = _record_nozzle_number(record, int(record.get("idx", pos + 1) or (pos + 1)))
+    group = _multi_material_groups(records).get(nozzle) or [record]
+    messages: list[str] = []
+    progress(0.1, desc="Slicing for preview…")
+    _ensure_records_sliced(
+        group,
+        float(layer_height or 0.8),
+        scale_mode,
+        messages,
+        progress_callback=lambda done, total, name: progress(
+            0.1 + 0.8 * done / max(1, total), desc=f"Slicing {name}…"
+        ),
+    )
+    return records
+
+
 def apply_shape_z_rotation(
     records: list[dict] | None,
     selected: str | None,
@@ -3857,7 +3924,10 @@ def update_layer_preview(
     if stack is None or not getattr(stack, "layers", None):
         return (
             gr.update(maximum=1, value=1),
-            _layer_preview_message("Generate G-Code (or split) to slice this shape and see its layer outlines."),
+            _layer_preview_message(
+                "Press Regenerate Preview to slice this shape and see its layer "
+                "outlines. (Generate G-Code and splits slice automatically too.)"
+            ),
         )
 
     layer_count = len(stack.layers)
@@ -4440,6 +4510,7 @@ def split_selected_shape_for_grid(
     overlapping_rows: bool = False,
     overlap_size: float | None = None,
     row_overlap_direction: str | None = None,
+    progress: gr.Progress = gr.Progress(),
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
     # Overlap depth for both interlock styles; blank/zero falls back to one
@@ -4453,7 +4524,17 @@ def split_selected_shape_for_grid(
     # separate slicing step.
     slice_messages: list[str] = []
     if records:
-        _ensure_records_sliced(records, float(layer_height or 0.8), scale_mode, slice_messages)
+        progress(0.02, desc="Checking slices…")
+        _ensure_records_sliced(
+            records,
+            float(layer_height or 0.8),
+            scale_mode,
+            slice_messages,
+            progress_callback=lambda done, total, name: progress(
+                0.05 + 0.7 * done / max(1, total), desc=f"Slicing {name}…"
+            ),
+        )
+        progress(0.8, desc="Splitting into grid pieces…")
     # Undo stack: each split PUSHES its pre-split records (sliced), and Undo
     # Split pops them one at a time (capped to the last 10 splits). Pushed
     # only when a split actually happened — every failure path returns the
@@ -4602,10 +4683,13 @@ def _ensure_records_sliced(
     layer_height: float,
     scale_mode: str | None,
     messages: list[str],
+    progress_callback=None,
 ) -> bool:
-    """Re-slice records whose layers are missing or stale for the current settings."""
+    """Re-slice records whose layers are missing or stale for the current
+    settings. `progress_callback(done, total, name)` is called before each
+    actual re-slice so callers can show per-shape progress."""
     plan_by_record = _group_z_levels_by_record(records, layer_height, scale_mode)
-    resliced = False
+    stale: list[tuple[dict, tuple | None]] = []
     for record in records:
         stl_path = record.get("stl_path")
         if not stl_path:
@@ -4614,6 +4698,14 @@ def _ensure_records_sliced(
         current = _slice_params_snapshot(record, layer_height, scale_mode, slice_plan)
         if record.get("layer_stack") is not None and record.get("slice_params") == current:
             continue
+        stale.append((record, slice_plan))
+    for position, (record, slice_plan) in enumerate(stale):
+        if progress_callback is not None:
+            progress_callback(
+                position,
+                len(stale),
+                str(record.get("name") or f"Shape {record.get('idx')}"),
+            )
         try:
             stack = _slice_record(record, layer_height, scale_mode, None, slice_plan)
             messages.append(
@@ -4622,8 +4714,7 @@ def _ensure_records_sliced(
         except Exception as exc:
             record["layer_stack"] = None
             messages.append(f"Shape {record['idx']}: slicing failed ({exc}).")
-        resliced = True
-    return resliced
+    return bool(stale)
 
 
 def _lead_in_assembly_extension(records: list[dict], direction: str | None) -> float:
@@ -5025,7 +5116,15 @@ def generate_dynamic_gcode(
     records = _apply_shape_settings(records or [], settings_table)
     messages: list[str] = []
     progress(0.02, desc="Slicing shapes…")
-    _ensure_records_sliced(records, layer_height, scale_mode, messages)
+    _ensure_records_sliced(
+        records,
+        layer_height,
+        scale_mode,
+        messages,
+        progress_callback=lambda done, total, name: progress(
+            0.02 + 0.09 * done / max(1, total), desc=f"Slicing {name}…"
+        ),
+    )
     # Shared reference motion is always on: every head traces the combined
     # outline and dispenses only its own geometry. Rebuilt with the CURRENT
     # fil width so the alignment snap grid matches this generation.
@@ -5491,6 +5590,7 @@ def build_dynamic_demo() -> gr.Blocks:
     with gr.Blocks(title="ParallelPrint: STL to G-Code", css=APP_CSS, head=APP_HEAD + TOOLPATH_ANIM_HEAD + PARALLEL_ANIM_HEAD) as demo:
         shape_records = gr.State([])
         last_shape_delete_at = gr.State(0.0)
+        delete_undo = gr.State(None)
         ref_layers = gr.State(None)
 
         with gr.Tab("Shapes & G-Code"):
@@ -5517,9 +5617,8 @@ def build_dynamic_demo() -> gr.Blocks:
                         label="Sample Set",
                         container=False,
                     )
-                    sync_uploads_button = gr.Button("Sync Uploaded STLs", variant="secondary", size="sm")
                     reset_dimensions_button = gr.Button("Reset Dimensions", variant="secondary", size="sm")
-                    assign_valves_button = gr.Button("Assign Unique Valves", variant="secondary", size="sm")
+                    undo_delete_button = gr.Button("Undo Delete", variant="secondary", size="sm")
                     scale_mode = gr.Radio(
                         choices=[SCALE_MODE_TARGET_DIMENSIONS, SCALE_MODE_UNIFORM_FACTOR],
                         value=SCALE_MODE_TARGET_DIMENSIONS,
@@ -5907,17 +6006,6 @@ def build_dynamic_demo() -> gr.Blocks:
             outputs=[nozzle_grid_spacing_table],
             queue=False,
         )
-        sync_uploads_button.click(fn=sync_uploaded_shapes, inputs=[stl_upload, shape_records, shape_settings], outputs=shape_sync_outputs).then(
-            fn=refresh_split_sources,
-            inputs=[shape_records],
-            outputs=[split_source, split_start_nozzle, split_start_valve],
-            queue=False,
-        ).then(
-            fn=_grid_spacing_table_update,
-            inputs=grid_spacing_refresh_inputs,
-            outputs=[nozzle_grid_spacing_table],
-            queue=False,
-        )
         load_samples_button.click(fn=load_sample_shapes, inputs=[stl_upload, shape_records, shape_settings, sample_set_selector], outputs=[stl_upload, *shape_sync_outputs]).then(
             fn=refresh_split_sources,
             inputs=[shape_records],
@@ -5943,9 +6031,24 @@ def build_dynamic_demo() -> gr.Blocks:
         )
         shape_settings.select(
             fn=delete_shape_from_settings,
-            inputs=[shape_records, shape_settings, last_shape_delete_at],
-            outputs=[stl_upload, *shape_sync_outputs, last_shape_delete_at],
+            inputs=[shape_records, shape_settings, last_shape_delete_at, delete_undo],
+            outputs=[stl_upload, *shape_sync_outputs, last_shape_delete_at, delete_undo],
             queue=False,
+        ).then(
+            fn=refresh_split_sources,
+            inputs=[shape_records],
+            outputs=[split_source, split_start_nozzle, split_start_valve],
+            queue=False,
+        ).then(
+            fn=_grid_spacing_table_update,
+            inputs=grid_spacing_refresh_inputs,
+            outputs=[nozzle_grid_spacing_table],
+            queue=False,
+        )
+        undo_delete_button.click(
+            fn=undo_last_delete,
+            inputs=[delete_undo],
+            outputs=[stl_upload, *shape_sync_outputs, last_shape_delete_at, delete_undo],
         ).then(
             fn=refresh_split_sources,
             inputs=[shape_records],
@@ -5976,14 +6079,27 @@ def build_dynamic_demo() -> gr.Blocks:
             queue=False,
         )
         selected_shape.change(fn=show_selected_model, inputs=preview_inputs, outputs=[model_viewer, model_details])
-        refresh_preview_button.click(fn=show_selected_model, inputs=preview_inputs, outputs=[model_viewer, model_details])
         # Sliced-layer preview. The slider uses .release only: the handler
         # writes the slider back (clamped max/value), and a .change wiring
         # would re-fire on that programmatic write.
         layer_preview_inputs = [shape_records, selected_shape, shape_settings, layer_preview_slider]
         layer_preview_outputs = [layer_preview_slider, layer_preview_plot]
         selected_shape.change(fn=update_layer_preview, inputs=layer_preview_inputs, outputs=layer_preview_outputs)
-        refresh_preview_button.click(fn=update_layer_preview, inputs=layer_preview_inputs, outputs=layer_preview_outputs)
+        # Regenerate Preview slices the selected shape on demand first, so
+        # the layer preview works before any G-code has been generated.
+        refresh_preview_button.click(
+            fn=slice_selected_shape_for_preview,
+            inputs=[shape_records, selected_shape, shape_settings, layer_height, scale_mode],
+            outputs=[shape_records],
+        ).then(
+            fn=show_selected_model,
+            inputs=preview_inputs,
+            outputs=[model_viewer, model_details],
+        ).then(
+            fn=update_layer_preview,
+            inputs=layer_preview_inputs,
+            outputs=layer_preview_outputs,
+        )
         layer_preview_slider.release(fn=update_layer_preview, inputs=layer_preview_inputs, outputs=layer_preview_outputs)
         scale_mode.change(
             fn=normalize_shape_dimensions_for_mode,
@@ -6098,12 +6214,6 @@ def build_dynamic_demo() -> gr.Blocks:
             fn=lambda records: _split_numbering_defaults(records),
             inputs=[shape_records],
             outputs=[split_start_nozzle, split_start_valve],
-            queue=False,
-        )
-        assign_valves_button.click(
-            fn=assign_unique_valves,
-            inputs=[shape_records, shape_settings],
-            outputs=[shape_records, shape_settings],
             queue=False,
         )
         export_settings_button.click(

@@ -975,7 +975,7 @@ def test_delete_shape_reindexes_without_losing_shape_data() -> None:
         {"idx": 3, "name": "last", "stl_path": "last.stl", "target_x": 30.0, "target_y": 31.0, "target_z": 32.0, "pressure": 35, "valve": 6, "port": 3, "color": "#333333"},
     ]
 
-    outputs = delete_shape_from_settings(records, _shape_settings_rows(records), 0.0, Event())
+    outputs = delete_shape_from_settings(records, _shape_settings_rows(records), 0.0, None, Event())
     updated_records = outputs[1]
     updated_settings = outputs[2]
 
@@ -985,6 +985,21 @@ def test_delete_shape_reindexes_without_losing_shape_data() -> None:
     assert updated_settings[1][0] == 2
     assert updated_settings[1][1] == "last"
     assert updated_settings[1][2:5] == [30.0, 31.0, 32.0]
+
+    # The delete pushed an undo snapshot; Undo Delete restores everything.
+    from app import undo_last_delete
+
+    undo_stack = outputs[-1]
+    assert isinstance(undo_stack, list) and len(undo_stack) == 1
+    restored_outputs = undo_last_delete(undo_stack)
+    restored = restored_outputs[1]
+    assert [record["name"] for record in restored] == ["first", "middle", "last"]
+    assert restored[1]["pressure"] == 30
+    assert restored_outputs[-1] == []  # stack popped
+
+    # Undo with an empty stack touches nothing.
+    empty = undo_last_delete([])
+    assert not isinstance(empty[1], list)
 
 
 def test_delete_shape_cooldown_blocks_immediate_second_delete() -> None:
@@ -997,12 +1012,13 @@ def test_delete_shape_cooldown_blocks_immediate_second_delete() -> None:
         {"idx": 3, "name": "last", "stl_path": "last.stl", "target_x": 30.0, "target_y": 31.0, "target_z": 32.0, "pressure": 35, "valve": 6, "port": 3, "color": "#333333"},
     ]
 
-    first_outputs = delete_shape_from_settings(records, _shape_settings_rows(records), 0.0, Event())
+    first_outputs = delete_shape_from_settings(records, _shape_settings_rows(records), 0.0, None, Event())
     assert [record["name"] for record in first_outputs[1]] == ["first", "last"]
 
     second_outputs = delete_shape_from_settings(
         first_outputs[1],
         first_outputs[2],
+        first_outputs[-2],  # last_delete_at (the undo stack is now last)
         first_outputs[-1],
         Event(),
     )
@@ -1022,9 +1038,9 @@ def test_non_delete_cell_selection_touches_nothing() -> None:
         {"idx": 1, "name": "first", "stl_path": "first.stl", "target_x": 10.0, "target_y": 11.0, "target_z": 12.0, "pressure": 25, "valve": 4, "port": 1, "color": "#111111"},
     ]
 
-    outputs = delete_shape_from_settings(records, _shape_settings_rows(records), 0.0, Event())
+    outputs = delete_shape_from_settings(records, _shape_settings_rows(records), 0.0, None, Event())
 
-    assert len(outputs) == 9
+    assert len(outputs) == 10
     assert all(not isinstance(value, list) for value in outputs)
     assert not isinstance(outputs[1], list)  # records State untouched
 
@@ -1902,6 +1918,47 @@ def test_rotation_marker_shows_in_table_and_strips_on_read() -> None:
     # Unrotated shapes show the plain name.
     record["rotation"] = None
     assert _display_shape_name(record) == "bar"
+
+
+def test_regenerate_preview_slices_the_selected_shape_on_demand(tmp_path) -> None:
+    import trimesh
+
+    from app import slice_selected_shape_for_preview
+
+    trimesh.creation.box(extents=(4.0, 4.0, 2.0)).export(tmp_path / "cube.stl")
+    records = _records_from_files([str(tmp_path / "cube.stl")], None)
+    assert records[0].get("layer_stack") is None
+
+    updated = slice_selected_shape_for_preview(records, None, None, 1.0, None)
+    stack = updated[0].get("layer_stack")
+    assert stack is not None and len(stack.layers) == 2
+
+    # Split pieces (no STL) are a no-op.
+    piece = [{"idx": 1, "name": "piece", "stl_path": None, "split_group_id": "s"}]
+    assert slice_selected_shape_for_preview(piece, None, None, 1.0, None) == piece
+
+
+def test_rotation_status_notes_assembly_membership(tmp_path) -> None:
+    import trimesh
+
+    from app import apply_shape_z_rotation
+
+    for name in ("inner", "outer"):
+        trimesh.creation.box(extents=(4.0, 4.0, 2.0)).export(tmp_path / f"{name}.stl")
+    records = _records_from_files(
+        [str(tmp_path / "inner.stl"), str(tmp_path / "outer.stl")], None
+    )
+    # Same nozzle -> a multi-material assembly.
+    records[0]["nozzle"] = records[1]["nozzle"] = 1
+
+    _updated, _rows, status = apply_shape_z_rotation(records, None, None, 90)
+    assert "multi-material assembly" in status
+    assert "SAME angle" in status
+
+    # A solo shape gets no assembly note.
+    solo = _records_from_files([str(tmp_path / "inner.stl")], None)
+    _updated, _rows, solo_status = apply_shape_z_rotation(solo, None, None, 90)
+    assert "assembly" not in solo_status
 
 
 def test_rotate_all_shapes_at_once(tmp_path) -> None:
