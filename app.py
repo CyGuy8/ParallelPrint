@@ -4806,6 +4806,7 @@ def _gcode_settings_snapshot(
     sweep_buffer: float = 0.8,
     lead_in_orientation: str | None = None,
     contour_order: str | None = None,
+    pressure_variable: bool = True,
 ) -> dict:
     """Fingerprint of every setting that shapes this record's G-code.
 
@@ -4839,6 +4840,7 @@ def _gcode_settings_snapshot(
         "scale_mode": _normalize_scale_mode(scale_mode),
         "sweep_buffer": round(_coerce_float(sweep_buffer, 0.8), 6),
         "contour_order": str(contour_order or CONTOUR_ORDER_LAST),
+        "pressure_variable": bool(pressure_variable),
     }
 
 
@@ -4863,6 +4865,7 @@ def check_gcode_staleness(
     sweep_buffer: float = 0.8,
     lead_in_orientation: str | None = None,
     contour_order: str | None = None,
+    pressure_variable: bool = True,
 ) -> str:
     """Warning banner text when generated G-code no longer matches the settings."""
     records = _apply_shape_settings(records or [], settings_table)
@@ -4881,6 +4884,7 @@ def check_gcode_staleness(
         sweep_buffer,
         lead_in_orientation,
         contour_order,
+        pressure_variable,
     )
     for record in records:
         if not record.get("gcode_path"):
@@ -4927,6 +4931,7 @@ def export_project_settings(
     lead_in_orientation: str | None,
     nozzle_speed: Any,
     contour_order: str | None = None,
+    pressure_variable: bool = True,
     split_columns: Any = None,
     split_rows: Any = None,
     split_overlapping_layers: Any = None,
@@ -4970,6 +4975,7 @@ def export_project_settings(
             "lead_in_orientation": str(lead_in_orientation or LEAD_IN_LINE_AUTO),
             "nozzle_speed": _coerce_float(nozzle_speed, 10.0),
             "contour_order": str(contour_order or CONTOUR_ORDER_LAST),
+            "pressure_variable": bool(pressure_variable),
             "split_columns": max(1, _coerce_int(split_columns, 2)),
             "split_rows": max(1, _coerce_int(split_rows, 1)),
             "split_overlapping_layers": bool(split_overlapping_layers),
@@ -5001,7 +5007,7 @@ def import_project_settings(
     """
 
     def _skip_options() -> tuple:
-        return tuple(gr.skip() for _ in range(19))
+        return tuple(gr.skip() for _ in range(20))
 
     paths = _uploaded_file_paths(settings_upload)
     if not paths:
@@ -5064,6 +5070,7 @@ def import_project_settings(
         option("scale_mode"),
         option("nozzle_speed"),
         option("contour_order"),
+        option("pressure_variable"),
         option("split_columns"),
         option("split_rows"),
         option("split_overlapping_layers"),
@@ -5111,6 +5118,7 @@ def generate_dynamic_gcode(
     sweep_buffer: float = 0.8,
     lead_in_orientation: str | None = None,
     contour_order: str | None = None,
+    pressure_variable: bool = True,
     progress: gr.Progress = gr.Progress(),
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
@@ -5217,6 +5225,7 @@ def generate_dynamic_gcode(
                 infill=_coerce_float(record.get("infill", 100.0), 100.0) / 100.0,
                 motion_infill_fractions=motion_infill_fractions,
                 emit_pressure_commands=owns_port_pressure,
+                pressure_variable=bool(pressure_variable),
                 # Same buffer for every shape: the shared motion must match.
                 sweep_buffer=max(0.0, _coerce_float(sweep_buffer, 0.8)),
                 lead_in_enabled=bool(lead_in_enabled),
@@ -5250,6 +5259,7 @@ def generate_dynamic_gcode(
                 sweep_buffer,
                 lead_in_orientation,
                 contour_order,
+                pressure_variable,
             )
             messages.append(f"Shape {record['idx']}: wrote `{gcode_path.name}`.")
         except Exception as exc:
@@ -5799,6 +5809,16 @@ def build_dynamic_demo() -> gr.Blocks:
                 """
             )
             gcode_pressure_ramp_enabled = gr.Checkbox(label="Increase Pressure Each Layer", value=True)
+            gcode_pressure_variable = gr.Checkbox(
+                label="Editable Pressure Variable",
+                value=True,
+                info=(
+                    "Start each pressure-owning file with a pressureN variable that every "
+                    "pressure command references, so the print pressure can be changed by "
+                    "editing one number in the file — no regeneration needed. Uncheck to "
+                    "write plain numeric pressure commands instead."
+                ),
+            )
             with gr.Row(elem_id="gcode-raster-row"):
                 gcode_raster_pattern = gr.Dropdown(
                     label="Raster Pattern",
@@ -6234,6 +6254,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 gcode_lead_in_orientation,
                 viz_nozzle_speed,
                 gcode_contour_order,
+                gcode_pressure_variable,
                 split_columns,
                 split_rows,
                 split_overlapping_layers,
@@ -6264,6 +6285,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 scale_mode,
                 viz_nozzle_speed,
                 gcode_contour_order,
+                gcode_pressure_variable,
                 split_columns,
                 split_rows,
                 split_overlapping_layers,
@@ -6291,6 +6313,7 @@ def build_dynamic_demo() -> gr.Blocks:
             gcode_sweep_buffer,
             gcode_lead_in_orientation,
             gcode_contour_order,
+            gcode_pressure_variable,
         ]
         shape_settings.change(
             fn=check_gcode_staleness,
@@ -6311,6 +6334,7 @@ def build_dynamic_demo() -> gr.Blocks:
             gcode_sweep_buffer,
             gcode_lead_in_orientation,
             gcode_contour_order,
+            gcode_pressure_variable,
         ):
             stale_control.change(
                 fn=check_gcode_staleness,
@@ -6400,6 +6424,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 gcode_sweep_buffer,
                 gcode_lead_in_orientation,
                 gcode_contour_order,
+                gcode_pressure_variable,
             ],
             outputs=[shape_records, ref_layers, gcode_downloads, gcode_status, gcode_text_source, gcode_source, gcode_download_all],
         ).then(

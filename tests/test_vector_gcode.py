@@ -209,16 +209,23 @@ def test_gcode_header_writes_presets_before_initial_aux_commands(tmp_path) -> No
         if line.strip()
     ]
 
-    assert lines[0] == "G91"
+    # The hand-editable pressure variable leads the file; every pressure
+    # command below references it, so editing this one number retunes the
+    # whole print without regenerating. The odd shape is host-dictated:
+    # {aux_command} routes the line off the motion timeline, and the host
+    # execs presets as one list literal, so the line must be an expression
+    # (a bare `pressure3 = 25` assignment would be a syntax error there).
+    assert lines[0] == "{preset}{aux_command}globals().update(pressure3 = 25)"
+    assert lines[1] == "G91"
     # No metadata comments: the file starts straight with machine commands
     # (the toolpath's world anchor is returned via origin_sink instead).
     assert not any("PathOrigin" in line for line in lines)
-    assert lines[1] == "{aux_command}WAGO_ValveCommands(7, 0)"
+    assert lines[2] == "{aux_command}WAGO_ValveCommands(7, 0)"
     # {preset} marks pressure setup for the Aerotech host runtime.
-    assert lines[2] == "{preset}serialPort3.write(eval(setpress(25)))"
-    assert lines[3] == "{preset}serialPort3.write(eval(togglepress()))"
+    assert lines[3] == "{preset}serialPort3.write(eval(setpress(pressure3)))"
+    assert lines[4] == "{preset}serialPort3.write(eval(togglepress()))"
     # The header ends there: no dummy valve-100 init, no duplicate close.
-    assert lines[4].startswith("G")
+    assert lines[5].startswith("G")
     assert not any("WAGO_ValveCommands(100" in line for line in lines)
 
 
@@ -304,6 +311,36 @@ def test_sweep_buffer_is_adjustable_and_can_be_disabled(tmp_path) -> None:
     assert none[0]["start"] == (0.0, 0.0, 0.0)
 
 
+def _pressure_values(gcode_text: str, override: float | None = None) -> list[float]:
+    """Evaluate every setpress(...) expression the way the print host does.
+
+    The TCode host routes lines containing {aux_command}/serialPort as
+    commands, strips the markers, execs the {preset} commands as ONE list
+    literal in its module namespace, and execs ramp commands individually
+    in that same namespace. This mimics exactly that: the file's own
+    variable line defines `pressureN`, then each setpress argument is
+    evaluated in the shared namespace. `override` simulates the user
+    hand-editing the variable's value before printing.
+    """
+    namespace: dict = {}
+    values = []
+    for line in gcode_text.splitlines():
+        line = line.strip()
+        if "{aux_command}" not in line and "serialPort" not in line:
+            continue  # the host would parse this as a motion line
+        command = line.replace("{aux_command}", "").replace("{preset}", "")
+        if "globals().update(" in command:
+            expr = command.split("globals().update(", 1)[1].rsplit(")", 1)[0]
+            name, value = (part.strip() for part in expr.split("="))
+            namespace[name] = float(value) if override is None else override
+        elif "setpress(" in command:
+            # The command ends `...setpress(EXPR)))` — closing setpress,
+            # eval, and write; the expression itself may contain parens.
+            expr = command.split("setpress(", 1)[1].rsplit(")))", 1)[0]
+            values.append(float(eval(expr, namespace)))
+    return values
+
+
 def test_pressure_ramp_clamps_at_the_regulator_limit(tmp_path) -> None:
     import re
 
@@ -319,11 +356,18 @@ def test_pressure_ramp_clamps_at_the_regulator_limit(tmp_path) -> None:
         pressure_ramp_enabled=True,
         output_dir=tmp_path,
     )
-    values = [
-        float(match) for match in re.findall(r"setpress\(([\d.]+)\)", gcode_path.read_text())
-    ]
+    text = gcode_path.read_text()
+
+    # The file ships with the configured pressure as its variable default.
+    default = re.search(r"globals\(\)\.update\(pressure3 = ([\d.]+)\)", text)
+    assert default is not None and float(default.group(1)) == 99.8
+
     # Preset, then the ramp climbing 0.1/layer but never past 100 psi.
-    assert values == [99.8, 99.9, 100.0, 100.0]
+    assert _pressure_values(text) == [99.8, 99.9, 100.0, 100.0]
+
+    # Hand-editing the variable rebases the ENTIRE ramp — the point of the
+    # feature: no regeneration needed to print the same file at 50 psi.
+    assert _pressure_values(text, override=50.0) == [50.0, 50.1, 50.2, 50.3]
 
 
 def test_port_sharing_files_emit_pressure_commands_once(tmp_path) -> None:
@@ -356,8 +400,73 @@ def test_port_sharing_files_emit_pressure_commands_once(tmp_path) -> None:
     assert "serialPort3" not in follower
     assert _pressure_set_count(follower) == 0
     assert "togglepress" not in follower
+    # The pressure variable lives only in the port-owning file too.
+    assert "globals().update(pressure3 = 25)" in owner
+    assert "globals().update" not in follower
     # Valve control is per shape and unaffected.
     assert follower.count("WAGO_ValveCommands(7, 1)") == owner.count("WAGO_ValveCommands(7, 1)")
+
+
+def test_pressure_variable_is_namespaced_per_port(tmp_path) -> None:
+    # The print host execs every file's commands in ONE shared namespace:
+    # if two port-owning files used the same variable name, each file's
+    # ramp would read whichever file defined it LAST. Naming the variable
+    # by port keeps each regulator on its own knob.
+    layer = box(0.0, 0.0, 2.0, 2.0)
+
+    def _generate(port: int) -> str:
+        path = generate_vector_gcode(
+            _stack(layer, layer),
+            shape_name=f"port{port}",
+            pressure=25,
+            valve=7,
+            port=port,
+            fil_width=1.0,
+            layer_height=1.0,
+            pressure_ramp_enabled=True,
+            output_dir=tmp_path / f"port{port}",
+        )
+        return path.read_text()
+
+    on_port2 = _generate(2)
+    on_port3 = _generate(3)
+
+    assert "globals().update(pressure2 = 25)" in on_port2
+    assert "pressure3" not in on_port2
+    assert "globals().update(pressure3 = 25)" in on_port3
+    assert "pressure2" not in on_port3
+    # Every setpress in each file references its own port's variable.
+    assert "setpress(pressure2)" in on_port2
+    assert "pressure2 + 0.1" in on_port2
+    assert "setpress(pressure3)" in on_port3
+    assert "pressure3 + 0.1" in on_port3
+
+
+def test_pressure_variable_can_be_disabled(tmp_path) -> None:
+    # The "Editable Pressure Variable" checkbox off: files fall back to the
+    # plain numeric format (pre-variable), in case the host chokes on the
+    # variable form.
+    layer = box(0.0, 0.0, 2.0, 2.0)
+    gcode_path = generate_vector_gcode(
+        _stack(layer, layer, layer),
+        shape_name="no_variable",
+        pressure=25,
+        valve=7,
+        port=3,
+        fil_width=1.0,
+        layer_height=1.0,
+        pressure_ramp_enabled=True,
+        pressure_variable=False,
+        output_dir=tmp_path,
+    )
+    text = gcode_path.read_text()
+
+    assert "globals().update" not in text
+    assert "pressure3" not in text
+    assert text.startswith("G91\n")
+    assert "{preset}serialPort3.write(eval(setpress(25)))" in text
+    # Ramp values are baked in, clamped and rounded at generation time.
+    assert _pressure_values(text) == [25.0, 25.1, 25.2]
 
 
 def test_gcode_lead_in_runs_once_before_first_layer(tmp_path) -> None:

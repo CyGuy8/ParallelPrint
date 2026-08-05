@@ -53,19 +53,73 @@ __all__ = [
 ]
 
 
-def _setpress_cmd(port: str, pressure: float, start: bool) -> str:
+def _pressure_variable_name(port: int) -> str:
+    """The hand-editable pressure variable, one per serial port.
+
+    The name carries the port number because the print host execs every
+    file's commands in ONE shared namespace: with several port-owning files
+    in a print, a single shared name would leave every ramp reading the
+    LAST file's base pressure. Pressure is a port property, so `pressureN`
+    is also the natural granularity.
+    """
+    return f"pressure{port}"
+
+
+def _pressure_variable_cmd(port: int, pressure: float) -> str:
+    """The one hand-editable knob: `pressureN = X` on the file's first line.
+
+    The exact form is dictated by how the TCode print host consumes files:
+
+    - Only lines containing `{aux_command}` or `serialPort` are routed as
+      commands; anything else is parsed as a G-code move. The `{aux_command}`
+      marker (stripped by the host) is what keeps this line off the motion
+      timeline.
+    - The host joins all `{preset}` commands into ONE list literal and
+      exec()s it at the controller's START signal, so the line must be a
+      pure EXPRESSION — a bare `pressure = X` assignment would be a syntax
+      error there. `globals().update(pressureN = X)` is an expression that
+      still reads like the assignment, and it lands the name in the host's
+      module globals where the setpress preset (same exec, evaluated next)
+      and the mid-file ramp commands (exec'd individually) can see it.
+
+    Editing this single number retunes every pressure command in the file —
+    no need to regenerate the G-code just to print at a different pressure.
+    """
+    return (
+        f"{{preset}}{{aux_command}}globals().update("
+        f"{_pressure_variable_name(port)} = {pressure:g})"
+    )
+
+
+def _setpress_cmd(port: str, expression: str, start: bool) -> str:
     """Pressure preset in the readable host dialect.
 
     Every pressure command uses the same `eval(setpress(...))` form (the
-    print host defines `setpress`, which builds the serial byte string), so
-    the values are human-readable throughout the file. `start` adds the
-    {preset} marker: the host executes presets at the controller's START
-    signal, before the initial toggles; ramp commands mid-file run at their
-    scheduled times instead.
+    print host defines `setpress`, which builds the serial byte string).
+    `expression` is evaluated by the host — it references the `pressureN`
+    variable declared at the top of the file rather than a baked-in number,
+    so hand-editing that variable retunes the preset and the whole ramp.
+    `start` adds the {preset} marker: the host executes presets at the
+    controller's START signal, before the initial toggles; ramp commands
+    mid-file run at their scheduled times instead.
     """
     if start:
-        return f"\n\r{{preset}}{port}.write(eval(setpress({pressure:g})))"
-    return f"\n\r{port}.write(eval(setpress({pressure:g})))"
+        return f"\n\r{{preset}}{port}.write(eval(setpress({expression})))"
+    return f"\n\r{port}.write(eval(setpress({expression})))"
+
+
+def _ramp_expression(port: int, offset: float) -> str:
+    """Ramp step as an expression of the top-of-file `pressureN` variable.
+
+    The regulator tops out at MAX_PRESSURE_PSI and resolves tenths, so the
+    clamp and rounding travel inside the expression — they must hold for
+    whatever value the user hand-edits the variable to, which rules out
+    pre-computing them here.
+    """
+    return (
+        f"round(min({_pressure_variable_name(port)} + {offset:g}, "
+        f"{MAX_PRESSURE_PSI:g}), 1)"
+    )
 
 
 def _toggle_cmd(port: str, start: bool) -> str:
@@ -102,29 +156,43 @@ def write_gcode_file(
     pressure_ramp_enabled: bool,
     all_g1: bool,
     emit_pressure_commands: bool = True,
+    pressure_variable: bool = True,
 ) -> None:
     """Write the move list as a G-code file.
 
-    `emit_pressure_commands` gates EVERY pressure command (preset, toggle,
-    per-layer ramp, closing toggle): the pressure regulator is a PORT
+    `emit_pressure_commands` gates EVERY pressure command (the top-of-file
+    `pressure` variable, preset, toggle, per-layer ramp, closing toggle):
+    the pressure regulator is a PORT
     device, so when several shapes share a serial port only ONE of their
     files may own it — the print host compiles all files onto one timeline,
     and duplicated toggles would flip the regulator on/off/on at start.
+
+    `pressure_variable` picks the pressure command style: True writes the
+    hand-editable `pressureN` variable on the first line with every
+    setpress referencing it; False writes plain numeric setpress commands
+    (the pre-variable format) with the ramp values baked in.
     """
     off_color = 0
     com_port = f"serialPort{port}"
     color_dict: dict[int, int] = {0: 100, 255: valve}
 
     # The regulator tops out at MAX_PRESSURE_PSI and resolves tenths: clamp
-    # the preset AND the per-layer ramp so no command asks the impossible.
+    # the default the file ships with; the ramp expressions carry their own
+    # clamp so hand-edited values stay legal too.
     pressure = round(min(max(float(pressure), 0.0), MAX_PRESSURE_PSI), 1)
-    setpress_lines = [_setpress_cmd(com_port, pressure, start=True)]
+    preset_expression = (
+        _pressure_variable_name(port) if pressure_variable else f"{pressure:g}"
+    )
+    setpress_lines = [_setpress_cmd(com_port, preset_expression, start=True)]
     pressure_on_lines = [_toggle_cmd(com_port, start=True)]
     pressure_off_lines = [_toggle_cmd(com_port, start=False)]
 
+    ramp_layer = 0
     pressure_cur = float(pressure)
 
     with open(gcode_path, "w") as f:
+        if emit_pressure_commands and pressure_variable:
+            f.write(f"{_pressure_variable_cmd(port, pressure)}\n")
         f.write("G91\n")
         f.write(_valve_cmd(valve, 0))
         if emit_pressure_commands:
@@ -156,10 +224,22 @@ def write_gcode_file(
                     f"Z{_coord(move['Z'])} ; Color {move['Color']}"
                 )
                 if pressure_ramp_enabled and emit_pressure_commands:
-                    pressure_cur = round(
-                        min(pressure_cur + increase_pressure_per_layer, MAX_PRESSURE_PSI), 1
+                    if pressure_variable:
+                        ramp_layer += 1
+                        offset = round(increase_pressure_per_layer * ramp_layer, 6)
+                        ramp_expression = _ramp_expression(port, offset)
+                    else:
+                        pressure_cur = round(
+                            min(
+                                pressure_cur + increase_pressure_per_layer,
+                                MAX_PRESSURE_PSI,
+                            ),
+                            1,
+                        )
+                        ramp_expression = f"{pressure_cur:g}"
+                    pressure_next = _setpress_cmd(
+                        com_port, ramp_expression, start=False
                     )
-                    pressure_next = _setpress_cmd(com_port, pressure_cur, start=False)
                 else:
                     pressure_next = None
             else:
@@ -197,6 +277,7 @@ def generate_vector_gcode(
     infill: float = 1.0,
     motion_infill_fractions: list[float] | None = None,
     emit_pressure_commands: bool = True,
+    pressure_variable: bool = True,
     sweep_buffer: float | None = None,
     increase_pressure_per_layer: float = 0.1,
     pressure_ramp_enabled: bool = True,
@@ -385,5 +466,6 @@ def generate_vector_gcode(
         pressure_ramp_enabled=bool(pressure_ramp_enabled),
         all_g1=bool(all_g1),
         emit_pressure_commands=bool(emit_pressure_commands),
+        pressure_variable=bool(pressure_variable),
     )
     return gcode_path
