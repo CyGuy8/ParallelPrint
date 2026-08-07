@@ -469,6 +469,31 @@ def test_pressure_variable_can_be_disabled(tmp_path) -> None:
     assert _pressure_values(text) == [25.0, 25.1, 25.2]
 
 
+def test_pressure_ramp_increment_is_adjustable(tmp_path) -> None:
+    # The "Pressure Increase Per Layer" option feeds
+    # increase_pressure_per_layer; both pressure formats honor it.
+    layer = box(0.0, 0.0, 2.0, 2.0)
+
+    def _generate(label: str, variable: bool) -> str:
+        path = generate_vector_gcode(
+            _stack(layer, layer, layer),
+            shape_name=label,
+            pressure=25,
+            valve=7,
+            port=3,
+            fil_width=1.0,
+            layer_height=1.0,
+            pressure_ramp_enabled=True,
+            pressure_variable=variable,
+            increase_pressure_per_layer=0.5,
+            output_dir=tmp_path / label,
+        )
+        return path.read_text()
+
+    assert _pressure_values(_generate("with_variable", True)) == [25.0, 25.5, 26.0]
+    assert _pressure_values(_generate("numeric", False)) == [25.0, 25.5, 26.0]
+
+
 def test_gcode_lead_in_runs_once_before_first_layer(tmp_path) -> None:
     gcode_path = generate_vector_gcode(
         _stack(box(0.0, 0.0, 0.5, 0.5), box(0.0, 0.0, 0.5, 0.5)),

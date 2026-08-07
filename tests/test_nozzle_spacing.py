@@ -2001,6 +2001,17 @@ def test_rotate_all_shapes_at_once(tmp_path) -> None:
     assert (cleared[1]["target_x"], cleared[1]["target_y"]) == (6.0, 2.0)
 
 
+def test_pressure_increase_input_snaps_to_tenths() -> None:
+    from app import snap_pressure_increase_to_tenths
+
+    # Finer than tenths snaps in place (the regulator encodes pressure x 10).
+    assert snap_pressure_increase_to_tenths(0.26)["value"] == 0.3
+    assert snap_pressure_increase_to_tenths(-0.4)["value"] == 0.0
+    # Already-legal values are skipped so the corrective update cannot loop.
+    snapped = snap_pressure_increase_to_tenths(0.3)
+    assert not (isinstance(snapped, dict) and "value" in snapped)
+
+
 def test_project_settings_export_import_round_trip(tmp_path) -> None:
     from app import export_project_settings, import_project_settings
 
@@ -2011,7 +2022,7 @@ def test_project_settings_export_import_round_trip(tmp_path) -> None:
     settings_path, status = export_project_settings(
         records, None, 0.4, 0.4, None, "Circle Spiral raster", False, 1.2,
         6.0, 7.0, 4, "Down", "Horizontal", 15.0,
-        pressure_variable=False,
+        pressure_variable=False, pressure_increase=0.3,
         split_columns=3, split_rows=2, split_overlapping_rows=True,
         split_overlap=1.5,
     )
@@ -2035,10 +2046,11 @@ def test_project_settings_export_import_round_trip(tmp_path) -> None:
     assert option_updates[8]["value"] == 0.4  # layer height
     assert option_updates[11]["value"] == 15.0  # nozzle speed
     assert option_updates[13]["value"] is False  # pressure variable off
-    assert option_updates[14]["value"] == 3  # split columns
-    assert option_updates[15]["value"] == 2  # split rows
-    assert option_updates[17]["value"] is True  # overlapping rows
-    assert option_updates[19]["value"] == 1.5  # overlap mm
+    assert option_updates[14]["value"] == 0.3  # pressure increase per layer
+    assert option_updates[15]["value"] == 3  # split columns
+    assert option_updates[16]["value"] == 2  # split rows
+    assert option_updates[18]["value"] is True  # overlapping rows
+    assert option_updates[20]["value"] == 1.5  # overlap mm
 
     # A file listed in the export but not loaded is reported.
     partial = import_project_settings([settings_path], _records_from_files(["egg_inside.stl"], None), None)

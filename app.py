@@ -4807,6 +4807,7 @@ def _gcode_settings_snapshot(
     lead_in_orientation: str | None = None,
     contour_order: str | None = None,
     pressure_variable: bool = True,
+    pressure_increase: float = 0.1,
 ) -> dict:
     """Fingerprint of every setting that shapes this record's G-code.
 
@@ -4841,7 +4842,25 @@ def _gcode_settings_snapshot(
         "sweep_buffer": round(_coerce_float(sweep_buffer, 0.8), 6),
         "contour_order": str(contour_order or CONTOUR_ORDER_LAST),
         "pressure_variable": bool(pressure_variable),
+        # Tenths only: the regulator's serial protocol encodes pressure x 10.
+        "pressure_increase": round(max(0.0, _coerce_float(pressure_increase, 0.1)), 1),
     }
+
+
+def snap_pressure_increase_to_tenths(value: Any):
+    """Snap the Pressure Increase Per Layer input to the tenths place.
+
+    The regulator's serial protocol encodes pressure x 10, so finer steps
+    cannot be printed; generation rounds anyway, but snapping the input in
+    place keeps what the user sees equal to what the files will do.
+    Returns gr.skip() when the value is already legal so the corrective
+    update cannot loop.
+    """
+    typed = _coerce_float(value, 0.1)
+    snapped = round(max(0.0, typed), 1)
+    if abs(snapped - typed) < 1e-9:
+        return gr.skip()
+    return gr.update(value=snapped)
 
 
 GCODE_STALE_MESSAGE = (
@@ -4866,6 +4885,7 @@ def check_gcode_staleness(
     lead_in_orientation: str | None = None,
     contour_order: str | None = None,
     pressure_variable: bool = True,
+    pressure_increase: float = 0.1,
 ) -> str:
     """Warning banner text when generated G-code no longer matches the settings."""
     records = _apply_shape_settings(records or [], settings_table)
@@ -4885,6 +4905,7 @@ def check_gcode_staleness(
         lead_in_orientation,
         contour_order,
         pressure_variable,
+        pressure_increase,
     )
     for record in records:
         if not record.get("gcode_path"):
@@ -4932,6 +4953,7 @@ def export_project_settings(
     nozzle_speed: Any,
     contour_order: str | None = None,
     pressure_variable: bool = True,
+    pressure_increase: float = 0.1,
     split_columns: Any = None,
     split_rows: Any = None,
     split_overlapping_layers: Any = None,
@@ -4976,6 +4998,7 @@ def export_project_settings(
             "nozzle_speed": _coerce_float(nozzle_speed, 10.0),
             "contour_order": str(contour_order or CONTOUR_ORDER_LAST),
             "pressure_variable": bool(pressure_variable),
+            "pressure_increase": round(max(0.0, _coerce_float(pressure_increase, 0.1)), 1),
             "split_columns": max(1, _coerce_int(split_columns, 2)),
             "split_rows": max(1, _coerce_int(split_rows, 1)),
             "split_overlapping_layers": bool(split_overlapping_layers),
@@ -5007,7 +5030,7 @@ def import_project_settings(
     """
 
     def _skip_options() -> tuple:
-        return tuple(gr.skip() for _ in range(20))
+        return tuple(gr.skip() for _ in range(21))
 
     paths = _uploaded_file_paths(settings_upload)
     if not paths:
@@ -5071,6 +5094,7 @@ def import_project_settings(
         option("nozzle_speed"),
         option("contour_order"),
         option("pressure_variable"),
+        option("pressure_increase"),
         option("split_columns"),
         option("split_rows"),
         option("split_overlapping_layers"),
@@ -5119,9 +5143,13 @@ def generate_dynamic_gcode(
     lead_in_orientation: str | None = None,
     contour_order: str | None = None,
     pressure_variable: bool = True,
+    pressure_increase: float = 0.1,
     progress: gr.Progress = gr.Progress(),
 ) -> tuple:
     records = _apply_shape_settings(records or [], settings_table)
+    # Tenths only: the regulator's serial protocol encodes pressure x 10, so
+    # finer ramp steps cannot be printed.
+    pressure_increase = round(max(0.0, _coerce_float(pressure_increase, 0.1)), 1)
     messages: list[str] = []
     progress(0.02, desc="Slicing shapes…")
     _ensure_records_sliced(
@@ -5226,6 +5254,7 @@ def generate_dynamic_gcode(
                 motion_infill_fractions=motion_infill_fractions,
                 emit_pressure_commands=owns_port_pressure,
                 pressure_variable=bool(pressure_variable),
+                increase_pressure_per_layer=pressure_increase,
                 # Same buffer for every shape: the shared motion must match.
                 sweep_buffer=max(0.0, _coerce_float(sweep_buffer, 0.8)),
                 lead_in_enabled=bool(lead_in_enabled),
@@ -5260,14 +5289,16 @@ def generate_dynamic_gcode(
                 lead_in_orientation,
                 contour_order,
                 pressure_variable,
+                pressure_increase,
             )
             messages.append(f"Shape {record['idx']}: wrote `{gcode_path.name}`.")
         except Exception as exc:
             messages.append(f"Shape {record['idx']}: failed ({exc}).")
 
     # Pressure sanity: the regulator tops out at MAX_PRESSURE_PSI, and the
-    # per-layer ramp climbs 0.1 psi per layer — warn when a print would hit
-    # the ceiling (the files clamp there, so later layers hold the maximum).
+    # per-layer ramp climbs pressure_increase psi per layer — warn when a
+    # print would hit the ceiling (the files clamp there, so later layers
+    # hold the maximum).
     if pressure_ramp_enabled and ref_layers is not None and getattr(ref_layers, "layers", None):
         layer_count = len(ref_layers.layers)
         peak_base = max(
@@ -5278,12 +5309,13 @@ def generate_dynamic_gcode(
             ),
             default=0.0,
         )
-        peak = peak_base + 0.1 * max(0, layer_count - 1)
+        peak = peak_base + pressure_increase * max(0, layer_count - 1)
         if peak > MAX_PRESSURE_PSI + 1e-9:
             messages.insert(
                 0,
                 f"&#9888;&#65039; The pressure ramp reaches the {MAX_PRESSURE_PSI:g} psi regulator "
-                f"limit before the last layer (base {peak_base:g} psi + 0.1/layer x {layer_count} "
+                f"limit before the last layer (base {peak_base:g} psi + "
+                f"{pressure_increase:g}/layer x {layer_count} "
                 "layers); the files hold the maximum from there on. Lower the base pressure or "
                 "disable the ramp if that is not intended.",
             )
@@ -5808,17 +5840,33 @@ def build_dynamic_demo() -> gr.Blocks:
                 All shapes share one combined nozzle path (each dispenses only its own geometry), so parallel heads always stay in sync.
                 """
             )
-            gcode_pressure_ramp_enabled = gr.Checkbox(label="Increase Pressure Each Layer", value=True)
-            gcode_pressure_variable = gr.Checkbox(
-                label="Editable Pressure Variable",
-                value=True,
-                info=(
-                    "Start each pressure-owning file with a pressureN variable that every "
-                    "pressure command references, so the print pressure can be changed by "
-                    "editing one number in the file — no regeneration needed. Uncheck to "
-                    "write plain numeric pressure commands instead."
-                ),
-            )
+            with gr.Row():
+                gcode_pressure_ramp_enabled = gr.Checkbox(
+                    label="Increase Pressure Each Layer", value=True, scale=1
+                )
+                gcode_pressure_variable = gr.Checkbox(
+                    label="Editable Pressure Variable",
+                    value=True,
+                    scale=2,
+                    info=(
+                        "Start each pressure-owning file with a pressureN variable that every "
+                        "pressure command references, so the print pressure can be changed by "
+                        "editing one number in the file — no regeneration needed. Uncheck to "
+                        "write plain numeric pressure commands instead."
+                    ),
+                )
+                # No precision= here: Gradio would round BEFORE the change
+                # handler sees the value, so the snap-to-tenths correction
+                # below would never know the display needs rewriting.
+                gcode_pressure_increase = gr.Number(
+                    label="Pressure Increase Per Layer (psi)",
+                    value=0.1,
+                    minimum=0.0,
+                    step=0.1,
+                    scale=1,
+                    min_width=170,
+                    info="Added each layer when Increase Pressure Each Layer is on. Tenths only.",
+                )
             with gr.Row(elem_id="gcode-raster-row"):
                 gcode_raster_pattern = gr.Dropdown(
                     label="Raster Pattern",
@@ -6255,6 +6303,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 viz_nozzle_speed,
                 gcode_contour_order,
                 gcode_pressure_variable,
+                gcode_pressure_increase,
                 split_columns,
                 split_rows,
                 split_overlapping_layers,
@@ -6286,6 +6335,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 viz_nozzle_speed,
                 gcode_contour_order,
                 gcode_pressure_variable,
+                gcode_pressure_increase,
                 split_columns,
                 split_rows,
                 split_overlapping_layers,
@@ -6314,6 +6364,7 @@ def build_dynamic_demo() -> gr.Blocks:
             gcode_lead_in_orientation,
             gcode_contour_order,
             gcode_pressure_variable,
+            gcode_pressure_increase,
         ]
         shape_settings.change(
             fn=check_gcode_staleness,
@@ -6335,6 +6386,7 @@ def build_dynamic_demo() -> gr.Blocks:
             gcode_lead_in_orientation,
             gcode_contour_order,
             gcode_pressure_variable,
+            gcode_pressure_increase,
         ):
             stale_control.change(
                 fn=check_gcode_staleness,
@@ -6342,6 +6394,14 @@ def build_dynamic_demo() -> gr.Blocks:
                 outputs=[gcode_stale_banner],
                 queue=False,
             )
+        # Snap finer-than-tenths ramp steps back in place (the regulator
+        # resolves tenths); skips when already legal so it cannot loop.
+        gcode_pressure_increase.change(
+            fn=snap_pressure_increase_to_tenths,
+            inputs=[gcode_pressure_increase],
+            outputs=[gcode_pressure_increase],
+            queue=False,
+        )
 
         apply_rotation_button.click(
             fn=apply_shape_z_rotation,
@@ -6425,6 +6485,7 @@ def build_dynamic_demo() -> gr.Blocks:
                 gcode_lead_in_orientation,
                 gcode_contour_order,
                 gcode_pressure_variable,
+                gcode_pressure_increase,
             ],
             outputs=[shape_records, ref_layers, gcode_downloads, gcode_status, gcode_text_source, gcode_source, gcode_download_all],
         ).then(
